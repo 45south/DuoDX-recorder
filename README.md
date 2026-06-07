@@ -141,7 +141,7 @@ schedule_2_output_file =
 
 ## Documentation
 
-Full documentation is available in `DuoDX_User_Guide.pdf`, included in each release.
+Full documentation is available in `DuoDX_User_Guide.docx`, included in each release.
 
 ---
 
@@ -151,7 +151,7 @@ DuoDX was inspired by [rsp-recorder](https://github.com/fventuri/rsp-recorder) b
 
 DuoDX was developed with the assistance of [Claude](https://www.anthropic.com) (Anthropic), which contributed substantially to the C programming, debugging, and documentation throughout the project.
 
-WavViewDX is copyright © Reinhard Weiß. Linrad is copyright © Leif Asbrink SM5BSZ
+WavViewDX is copyright © Reinhard Weiß.
 
 SDRplay, RSPduo, RSPdx, and related product names are trademarks of SDRplay Ltd.
 

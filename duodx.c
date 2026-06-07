@@ -40,7 +40,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "1.2.5"
+#define VERSION                 "1.2.6"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -277,11 +277,15 @@ typedef struct {
     volatile int disk_stop;           /* 1 when stopped cleanly due to low disk space */
     volatile LONG64 disk_free_mb;     /* last computed free space, shared with HTTP thread */
     volatile LONG64 frozen_file_mb;   /* file size frozen at end of recording, -1 = not set */
+    volatile double frozen_elapsed_sec; /* elapsed time frozen at end of all recordings */
+    volatile int    session_complete;   /* 1 after all recordings finish */
+    char            frozen_json[4096];  /* pre-built JSON served after session ends */
 } AppState;
 
 static AppState g_state;
 static volatile int g_running = 1;
 static volatile int g_recording = 0; /* 1 during recording: suppress console LOG */
+static volatile int g_http_running = 1; /* controls HTTP accept loop lifetime */
 static int g_vt_enabled = 0;         /* 1 if ANSI/VT escape sequences are usable */
 
 /* =========================================================================
@@ -1809,7 +1813,8 @@ static void sig_handler(int sig)
 {
     (void)sig;
     LOG_INFO("Stop signal received");
-    g_running = 0;
+    g_running      = 0;
+    g_http_running = 0;
 }
 
 /* =========================================================================
@@ -3076,7 +3081,9 @@ static DWORD WINAPI http_worker(LPVOID param)
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     double elapsed = 0.0;
-    if (state->start_time.QuadPart > 0)
+    if (state->session_complete)
+        elapsed = state->frozen_elapsed_sec;
+    else if (state->start_time.QuadPart > 0)
         elapsed = (double)(now.QuadPart - state->start_time.QuadPart)
                   / (double)state->perf_freq.QuadPart;
 
@@ -3113,25 +3120,33 @@ static DWORD WINAPI http_worker(LPVOID param)
     }
 
     if (want_json) {
-        char body[4096];
-        int n = snprintf(body, sizeof(body),
-            "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
-            "\"overflows\":%ld,\"zero_frames\":%lld,"
-            "\"peak_dbfs_a\":%.1f,\"peak_dbfs_b\":%.1f,"
-            "\"overload_a\":%d,\"overload_b\":%d,\"agc_on\":%d,\"dual_channel\":%d,"
-            "\"disk_warn\":%d,\"disk_stop\":%d,\"writer_error\":%d,\"running\":1,"
-            "\"recording\":%d,\"hdr_on\":%d,"
-            "\"samples_rx\":%lld,\"samples_written\":%lld}",
-            elapsed, file_mb, (long long)disk_free, ovf, (long long)zf,
-            (double)pk_a, (double)pk_b, ovl_a, ovl_b, agc_on, dual,
-            dwarn, dstop, werr,
-            state->stream_running,
-            state->cfg.hdr_enable,
-            (long long)samples_rx, (long long)samples_wr);
+        const char *body;
+        char live_body[4096];
+
+        if (state->session_complete) {
+            /* Serve the pre-built frozen JSON - safe after SDRplay cleanup */
+            body = state->frozen_json;
+        } else {
+            snprintf(live_body, sizeof(live_body),
+                "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
+                "\"overflows\":%ld,\"zero_frames\":%lld,"
+                "\"peak_dbfs_a\":%.1f,\"peak_dbfs_b\":%.1f,"
+                "\"overload_a\":%d,\"overload_b\":%d,\"agc_on\":%d,\"dual_channel\":%d,"
+                "\"disk_warn\":%d,\"disk_stop\":%d,\"writer_error\":%d,\"running\":1,"
+                "\"recording\":%d,\"hdr_on\":%d,\"session_complete\":0,"
+                "\"samples_rx\":%lld,\"samples_written\":%lld}",
+                elapsed, file_mb, (long long)disk_free, ovf, (long long)zf,
+                (double)pk_a, (double)pk_b, ovl_a, ovl_b, agc_on, dual,
+                dwarn, dstop, werr,
+                state->stream_running,
+                state->cfg.hdr_enable,
+                (long long)samples_rx, (long long)samples_wr);
+            body = live_body;
+        }
         const char *hdr = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
                           "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
         send(sock, hdr, (int)strlen(hdr), 0);
-        send(sock, body, n, 0);
+        send(sock, body, (int)strlen(body), 0);
     } else {
         const char *html =
 "<!DOCTYPE html><html lang='en'><head>\n"
@@ -3175,8 +3190,12 @@ static DWORD WINAPI http_worker(LPVOID param)
 "function dbfs_col(v){if(v>-6)return'#f44';if(v>-20)return'#fa0';if(v>-60)return'#4af';return'#555';}\n"
 "function poll(){\n"
 "  fetch('/status').then(r=>r.json()).then(d=>{\n"
-"    if(d.recording){\n"
-"      document.getElementById('elapsed').textContent=fmt_elapsed(d.elapsed_sec);\n"
+"    if(d.recording||d.session_complete){\n"
+"      var elEl=document.getElementById('elapsed');\n"
+"      if(d.session_complete)\n"
+"        elEl.innerHTML=fmt_elapsed(d.elapsed_sec)+'<span style=\"color:#ffd700;margin-left:8px;\">FINISHED</span>';\n"
+"      else\n"
+"        elEl.textContent=fmt_elapsed(d.elapsed_sec);\n"
 "      var mb=d.file_mb;\n"
 "      document.getElementById('filesize').textContent=mb>=1024?(mb/1024).toFixed(2)+' GB':mb.toFixed(0)+' MB';\n"
 "    }\n"
@@ -3267,13 +3286,16 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
 
     printf("[HTTP] Status server listening on port %d\n", port); fflush(stdout);
 
-    while (g_running) {
+    while (g_http_running) {
         struct sockaddr_in cli_addr;
         int cli_len = sizeof(cli_addr);
         SOCKET client_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_len);
         if (client_sock == INVALID_SOCKET) {
-            if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                printf("[HTTP] accept() error %d\n", WSAGetLastError()); fflush(stdout);
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                printf("[HTTP] accept() error %d - listen socket may have closed\n", err);
+                fflush(stdout);
+                break;
             }
             Sleep(20); continue;
         }
@@ -4068,7 +4090,39 @@ int main(int argc, char **argv)
         if (GetFileSizeEx(g_state.out_file, &fs))
             g_state.frozen_file_mb = (LONG64)(fs.QuadPart / (1024 * 1024));
     }
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (g_state.start_time.QuadPart > 0 && g_state.perf_freq.QuadPart > 0)
+            g_state.frozen_elapsed_sec =
+                (double)(now.QuadPart - g_state.start_time.QuadPart)
+                / (double)g_state.perf_freq.QuadPart;
+    }
+    g_state.session_complete    = 1;
     g_state.start_time.QuadPart = 0;  /* freeze elapsed on HTTP monitor */
+
+    /* Build the frozen JSON response served after recording ends.
+     * Must be done before ring_free / ReleaseDevice / sdrplay_api_Close
+     * so all state fields are still valid.                            */
+    snprintf(g_state.frozen_json, sizeof(g_state.frozen_json),
+        "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
+        "\"overflows\":%ld,\"zero_frames\":%lld,"
+        "\"peak_dbfs_a\":%.1f,\"peak_dbfs_b\":%.1f,"
+        "\"overload_a\":0,\"overload_b\":0,\"agc_on\":0,\"dual_channel\":%d,"
+        "\"disk_warn\":0,\"disk_stop\":0,\"writer_error\":0,\"running\":1,"
+        "\"recording\":0,\"hdr_on\":%d,\"session_complete\":1,"
+        "\"samples_rx\":%lld,\"samples_written\":%lld}",
+        g_state.frozen_elapsed_sec,
+        (double)g_state.frozen_file_mb,
+        (long long)g_state.disk_free_mb,
+        g_state.overflows,
+        (long long)g_state.zero_frames_written,
+        (double)g_state.peak_dbfs,
+        (double)g_state.peak_dbfs_b,
+        g_state.cfg.dual_channel,
+        g_state.cfg.hdr_enable,
+        (long long)g_state.samples_received,
+        (long long)g_state.samples_written);
     printf("\n");    /* end the status line */
     LOG_INFO("Stopping stream...");
 
@@ -4203,6 +4257,8 @@ int main(int argc, char **argv)
         g_state.writer_error        = 0;
         g_state.disk_stop           = 0;
         g_state.frozen_file_mb      = -1;  /* cleared - new recording starting */
+        g_state.frozen_elapsed_sec  = 0.0;
+        g_state.session_complete    = 0;
         g_state.start_time.QuadPart = 0;   /* reset elapsed for HTTP monitor */
 
         /* Reset ring buffer for reuse - writer thread and sdrplay_api_Init
@@ -4324,6 +4380,7 @@ cleanup_no_api:
 
     /* Stop HTTP server now that user has acknowledged */
     g_running = 0;
+    g_http_running = 0;
     if (http_thread) {
         WaitForSingleObject(http_thread, 2000);
         CloseHandle(http_thread);
