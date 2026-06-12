@@ -207,6 +207,7 @@ typedef struct {
     ScheduleEntry schedule[MAX_SCHEDULE_ENTRIES];
     int           schedule_count;  /* number of entries parsed */
     int           schedule_only;   /* 1 = skip top-level recording, start from schedule_1 */
+    int           schedule_repeat; /* 1 = repeat schedule nightly after all entries finish */
 } Config;
 
 /* =========================================================================
@@ -280,12 +281,14 @@ typedef struct {
     volatile double frozen_elapsed_sec; /* elapsed time frozen at end of all recordings */
     volatile int    session_complete;   /* 1 after all recordings finish */
     char            frozen_json[4096];  /* pre-built JSON served after session ends */
+    char            next_start[16];     /* next schedule start time HH:MM:SS or empty */
 } AppState;
 
 static AppState g_state;
 static volatile int g_running = 1;
 static volatile int g_recording = 0; /* 1 during recording: suppress console LOG */
 static volatile int g_http_running = 1; /* controls HTTP accept loop lifetime */
+static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 static int g_vt_enabled = 0;         /* 1 if ANSI/VT escape sequences are usable */
 
 /* =========================================================================
@@ -1491,7 +1494,8 @@ static void config_set_defaults(Config *cfg)
     cfg->http_port            = 0;
     cfg->http_interval_ms     = 2000;     /* 2 second default refresh */
     memset(cfg->schedule, 0, sizeof(cfg->schedule));
-    cfg->schedule_only = 0;
+    cfg->schedule_only   = 0;
+    cfg->schedule_repeat = 0;
 }
 
 static void trim(char *s)
@@ -1593,6 +1597,7 @@ static void config_load_ini(Config *cfg, const char *path)
                          "using default 2000 ms.", v);
         }
         else if (!strcmp(key, "schedule_only"))      cfg->schedule_only = atoi(val);
+        else if (!strcmp(key, "schedule_repeat"))    cfg->schedule_repeat = atoi(val);
         /* ── Schedule entries: schedule_N_key = value ──────────────────
          * e.g. schedule_1_start_time  = 08:00:00
          *      schedule_1_duration    = 3600
@@ -2705,7 +2710,25 @@ static void apply_notch_filters(AppState *state)
  * Displays a countdown line updated every second.
  * Returns 0 if cancelled (Ctrl+C), 1 if target time reached.
  * ========================================================================= */
-static int wait_until_utc(const char *time_str)
+static int time_already_passed_today(const char *time_str)
+{
+    int target_h, target_m, target_s;
+    if (sscanf(time_str, "%d:%d:%d", &target_h, &target_m, &target_s) != 3)
+        return 0;
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    int now_secs    = st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
+    int target_secs = target_h * 3600 + target_m  * 60 + target_s;
+    return (now_secs > target_secs);
+}
+
+/* wait_until_utc - waits for a UTC time.
+ * between_recordings=0: never start immediately, always wait for tomorrow
+ *                        if the time has passed (used for first scheduled start).
+ * between_recordings=1: start immediately if time passed within 5 minutes
+ *                        (previous recording slightly overran). Otherwise
+ *                        wait until tomorrow.                               */
+static int wait_until_utc(const char *time_str, int between_recordings)
 {
     int target_h, target_m, target_s;
     if (sscanf(time_str, "%d:%d:%d", &target_h, &target_m, &target_s) != 3) {
@@ -2723,9 +2746,14 @@ static int wait_until_utc(const char *time_str)
         target_secs = target_h * 3600 + target_m  * 60 + target_s;
         diff = target_secs - now_secs;
 
-        /* Handle midnight wrap */
-        if (diff < -43200) diff += 86400;  /* target is tomorrow */
-        if (diff >  43200) diff -= 86400;  /* target was yesterday */
+        /* If time has passed: between recordings allow a 5-minute grace
+         * period for slight overruns; otherwise always wait until tomorrow. */
+        if (diff < 0) {
+            if (between_recordings && diff >= -300)
+                diff = 0;       /* slight overrun - start now */
+            else
+                diff += 86400;  /* wait until tomorrow        */
+        }
 
         if (diff <= 0) {
             printf("\n");
@@ -2733,7 +2761,7 @@ static int wait_until_utc(const char *time_str)
             return 1;
         }
 
-        printf("\r  Waiting for scheduled start %02d:%02d:%02dZ - %02d:%02d:%02d remaining   ",
+        printf("\r\x1b[93m  Waiting for scheduled start %02d:%02d:%02dZ - %02d:%02d:%02d remaining  \x1b[0m ",
                target_h, target_m, target_s,
                diff / 3600, (diff % 3600) / 60, diff % 60);
         fflush(stdout);
@@ -3105,7 +3133,7 @@ static DWORD WINAPI http_worker(LPVOID param)
     if (state->out_file != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER fs;
         if (GetFileSizeEx(state->out_file, &fs)) file_bytes = fs.QuadPart;
-    } else if (state->frozen_file_mb >= 0) {
+    } else if (state->frozen_file_mb > 0) {
         file_bytes = state->frozen_file_mb * 1024LL * 1024LL;
     }
     double file_mb = (double)file_bytes / (1024.0 * 1024.0);
@@ -3134,12 +3162,15 @@ static DWORD WINAPI http_worker(LPVOID param)
                 "\"overload_a\":%d,\"overload_b\":%d,\"agc_on\":%d,\"dual_channel\":%d,"
                 "\"disk_warn\":%d,\"disk_stop\":%d,\"writer_error\":%d,\"running\":1,"
                 "\"recording\":%d,\"hdr_on\":%d,\"session_complete\":0,"
+                "\"waiting\":%d,\"next_start\":\"%s\","
                 "\"samples_rx\":%lld,\"samples_written\":%lld}",
                 elapsed, file_mb, (long long)disk_free, ovf, (long long)zf,
                 (double)pk_a, (double)pk_b, ovl_a, ovl_b, agc_on, dual,
                 dwarn, dstop, werr,
                 state->stream_running,
                 state->cfg.hdr_enable,
+                (state->next_start[0] && !state->stream_running) ? 1 : 0,
+                state->next_start,
                 (long long)samples_rx, (long long)samples_wr);
             body = live_body;
         }
@@ -3194,10 +3225,16 @@ static DWORD WINAPI http_worker(LPVOID param)
 "      var elEl=document.getElementById('elapsed');\n"
 "      if(d.session_complete)\n"
 "        elEl.innerHTML=fmt_elapsed(d.elapsed_sec)+'<span style=\"color:#ffd700;margin-left:8px;\">FINISHED</span>';\n"
+"      else if(d.next_start&&d.next_start.length>0){\n"
+"        var t=d.next_start.substring(0,5);\n"
+"        elEl.innerHTML=fmt_elapsed(d.elapsed_sec)+'<span style=\"color:#fa0;margin-left:8px;\">NEXT AT '+t+'Z</span>';}\n"
 "      else\n"
 "        elEl.textContent=fmt_elapsed(d.elapsed_sec);\n"
 "      var mb=d.file_mb;\n"
 "      document.getElementById('filesize').textContent=mb>=1024?(mb/1024).toFixed(2)+' GB':mb.toFixed(0)+' MB';\n"
+"    } else if(d.waiting){\n"
+"      var t=d.next_start.substring(0,5);\n"
+"      document.getElementById('elapsed').innerHTML='--'+'<span style=\"color:#fa0;margin-left:8px;\">NEXT AT '+t+'Z</span>';\n"
 "    }\n"
 "    var df=d.disk_free_mb,dfel=document.getElementById('diskfree');\n"
 "    dfel.textContent=df>=1024?(df/1024).toFixed(1)+' GB':df+' MB';\n"
@@ -3284,7 +3321,9 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
     }
     { u_long nb=1; ioctlsocket(listen_sock, FIONBIO, &nb); }
 
-    printf("[HTTP] Status server listening on port %d\n", port); fflush(stdout);
+    Sleep(100);  /* brief delay so message doesn't interrupt countdown line */
+    printf("\n[HTTP] Status server listening on port %d\n", port); fflush(stdout);
+    g_http_ready = 1;
 
     while (g_http_running) {
         struct sockaddr_in cli_addr;
@@ -3464,6 +3503,14 @@ int main(int argc, char **argv)
         goto cleanup_no_api;
     }
 
+    /* If schedule_only is not set, ignore any schedule entries entirely —
+     * they are only processed when schedule_only = 1.                    */
+    if (!g_state.cfg.schedule_only) {
+        LOG_INFO("schedule_only=0: ignoring %d schedule entries.",
+                 g_state.cfg.schedule_count);
+        g_state.cfg.schedule_count = 0;
+    }
+
     /* If schedule_only is set, copy schedule_1 settings into the top-level
      * config and run normally from sched_idx=0. This avoids calling
      * apply_schedule_entry before the device is initialised, and ensures
@@ -3481,9 +3528,26 @@ int main(int argc, char **argv)
             strncpy(g_state.cfg.output_file, e->output_file, MAX_PATH_LEN-1);
         if (e->antenna[0])
             strncpy(g_state.cfg.antenna, e->antenna, sizeof(g_state.cfg.antenna)-1);
-        if (e->start_time[0])
+        if (e->start_time[0]) {
+            /* If the first scheduled time has already passed today, warn the
+             * user. The wait loop will automatically roll over to tomorrow
+             * via the midnight wrap (diff < -43200 path). We force this by
+             * checking here and logging clearly so it is not confusing.    */
+            if (time_already_passed_today(e->start_time))
+                LOG_INFO("schedule_only: schedule_1 start time %s has passed "
+                         "today - waiting until tomorrow.", e->start_time);
             strncpy(g_state.cfg.start_time_utc, e->start_time,
                     sizeof(g_state.cfg.start_time_utc)-1);
+            /* Pre-populate next_start so the HTTP dashboard shows the
+             * waiting time before the first recording begins.          */
+            strncpy(g_state.next_start, e->start_time,
+                    sizeof(g_state.next_start)-1);
+            LOG_INFO("schedule_only: will wait for start time %s",
+                     g_state.cfg.start_time_utc);
+        } else {
+            LOG_WARN("schedule_only: schedule_1 has no start_time set - "
+                     "recording will start immediately.");
+        }
         /* Remove schedule_1 from the list - remaining entries shift down */
         int i;
         for (i = 0; i < g_state.cfg.schedule_count - 1; i++)
@@ -3689,10 +3753,33 @@ int main(int argc, char **argv)
     }
 
     /* ------------------------------------------------------------------ */
+    /* Start HTTP status server before the recording loop so it is       */
+    /* available during the scheduled wait and all subsequent recordings. */
+    /* ------------------------------------------------------------------ */
+    if (g_state.cfg.http_port > 0) {
+        http_thread = CreateThread(NULL, 0, http_status_thread_func,
+                                   &g_state, 0, NULL);
+        if (!http_thread)
+            LOG_WARN("HTTP: CreateThread failed - status server disabled.");
+        else {
+            LOG_INFO("Open http://<this-pc-ip>:%d/ in a browser to monitor.",
+                     g_state.cfg.http_port);
+            /* Wait for the HTTP thread to finish binding so its listening
+             * message prints before the scheduled countdown begins.     */
+            int wait_ms = 0;
+            while (!g_http_ready && wait_ms < 2000) {
+                Sleep(50);
+                wait_ms += 50;
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
     /* Step 5b: Scheduled start / pre-recording delay + recording loop    */
     /* If [schedule] entries are defined, iterate through them. Otherwise */
     /* run a single recording using the top-level config settings.        */
     /* ------------------------------------------------------------------ */
+repeat_schedule:
     do {
         /* Apply schedule entry if we have one */
         if (g_state.cfg.schedule_count > 0 && sched_idx > 0) {
@@ -3702,15 +3789,16 @@ int main(int argc, char **argv)
             apply_schedule_entry(&g_state, e);
             /* Wait for this entry's start time if specified */
             if (e->start_time[0]) {
-                if (!wait_until_utc(e->start_time)) {
+                if (!wait_until_utc(e->start_time, 1)) {
                     rc = 0;
                     goto cleanup_writer;
                 }
             }
         } else {
-            /* First (or only) recording - use top-level scheduled start */
+            /* First (or only) recording - use top-level scheduled start.
+             * Never start immediately if time has passed (allow_immediate=0). */
             if (g_state.cfg.start_time_utc[0]) {
-                if (!wait_until_utc(g_state.cfg.start_time_utc)) {
+                if (!wait_until_utc(g_state.cfg.start_time_utc, 0)) {
                     rc = 0;
                     goto cleanup_device;
                 }
@@ -4006,6 +4094,7 @@ int main(int argc, char **argv)
     printf("\n");          /* blank line - status bar occupies this line */
     g_recording = 1;  /* suppress console LOG output during recording */
     QueryPerformanceCounter(&g_state.start_time);
+    g_state.next_start[0] = '\0';  /* clear waiting indicator now recording */
 
     /* Apply antenna, Bias-T, Hi-Z notch, then RF/DAB notch filters */
     apply_antenna_and_biast(&g_state);
@@ -4037,16 +4126,6 @@ int main(int argc, char **argv)
             LOG_OK("Named pipe ready: %s", g_state.cfg.pipe_name);
             LOG_INFO("Connect a compatible IQ client to monitor in real time.");
         }
-    }
-
-    if (g_state.cfg.http_port > 0) {
-        http_thread = CreateThread(NULL, 0, http_status_thread_func,
-                                   &g_state, 0, NULL);
-        if (!http_thread)
-            LOG_WARN("HTTP: CreateThread failed - status server disabled.");
-        else
-            LOG_INFO("Open http://<this-pc-ip>:%d/ in a browser to monitor.",
-                     g_state.cfg.http_port);
     }
 
     LOG_INFO("Streaming started. Press Ctrl+C to stop.");
@@ -4098,19 +4177,29 @@ int main(int argc, char **argv)
                 (double)(now.QuadPart - g_state.start_time.QuadPart)
                 / (double)g_state.perf_freq.QuadPart;
     }
-    g_state.session_complete    = 1;
-    g_state.start_time.QuadPart = 0;  /* freeze elapsed on HTTP monitor */
+    /* Only mark session complete if this is the last recording —
+     * i.e. no more schedule entries remain after this one.        */
+    g_state.session_complete = (sched_idx >= g_state.cfg.schedule_count) ? 1 : 0;
 
-    /* Build the frozen JSON response served after recording ends.
-     * Must be done before ring_free / ReleaseDevice / sdrplay_api_Close
-     * so all state fields are still valid.                            */
+    /* Next scheduled start time for dashboard (empty if last recording) */
+    memset(g_state.next_start, 0, sizeof(g_state.next_start));
+    if (sched_idx < g_state.cfg.schedule_count &&
+            g_state.cfg.schedule[sched_idx].start_time[0])
+        strncpy(g_state.next_start,
+                g_state.cfg.schedule[sched_idx].start_time,
+                sizeof(g_state.next_start) - 1);
+    /* Note: start_time is zeroed AFTER the stats block below so the
+     * duration calculation remains correct. frozen_json is built here
+     * before ring_free / ReleaseDevice / sdrplay_api_Close so all
+     * state fields are still valid.                                    */
     snprintf(g_state.frozen_json, sizeof(g_state.frozen_json),
         "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
         "\"overflows\":%ld,\"zero_frames\":%lld,"
         "\"peak_dbfs_a\":%.1f,\"peak_dbfs_b\":%.1f,"
         "\"overload_a\":0,\"overload_b\":0,\"agc_on\":0,\"dual_channel\":%d,"
         "\"disk_warn\":0,\"disk_stop\":0,\"writer_error\":0,\"running\":1,"
-        "\"recording\":0,\"hdr_on\":%d,\"session_complete\":1,"
+        "\"recording\":0,\"hdr_on\":%d,\"session_complete\":%d,"
+        "\"waiting\":0,\"next_start\":\"%s\","
         "\"samples_rx\":%lld,\"samples_written\":%lld}",
         g_state.frozen_elapsed_sec,
         (double)g_state.frozen_file_mb,
@@ -4121,6 +4210,8 @@ int main(int argc, char **argv)
         (double)g_state.peak_dbfs_b,
         g_state.cfg.dual_channel,
         g_state.cfg.hdr_enable,
+        g_state.session_complete,
+        g_state.next_start,
         (long long)g_state.samples_received,
         (long long)g_state.samples_written);
     printf("\n");    /* end the status line */
@@ -4195,6 +4286,9 @@ int main(int argc, char **argv)
             LOG_ERROR("Recording may be incomplete due to write errors.");
     }
 
+    /* Freeze elapsed on HTTP monitor now that stats have been printed */
+    g_state.start_time.QuadPart = 0;
+
     /* ── Between-recording reset ─────────────────────────────────────────
      * If there are more schedule entries and no errors, stop the stream,
      * reset counters, reopen the output file, and restart the stream.   */
@@ -4268,6 +4362,86 @@ int main(int argc, char **argv)
 
     } while (g_running && !g_state.writer_error
              && sched_idx <= g_state.cfg.schedule_count);
+
+    /* ------------------------------------------------------------------ */
+    /* schedule_repeat: if enabled and no errors, reload schedule and      */
+    /* restart from schedule_1 for the next day.                           */
+    /* ------------------------------------------------------------------ */
+    if (g_running && !g_state.writer_error && !g_state.disk_stop
+            && g_state.cfg.schedule_repeat && g_state.cfg.schedule_only) {
+
+        /* Close the current output file and writer thread cleanly */
+        if (g_state.writer_thread && g_state.writer_running) {
+            g_state.writer_running = 0;
+            WaitForSingleObject(g_state.writer_thread, 5000);
+            CloseHandle(g_state.writer_thread);
+            g_state.writer_thread = NULL;
+        }
+        if (g_state.out_file != INVALID_HANDLE_VALUE) {
+            CloseHandle(g_state.out_file);
+            g_state.out_file = INVALID_HANDLE_VALUE;
+        }
+
+        LOG_INFO("schedule_repeat=1: all entries complete, reloading schedule "
+                 "for next day.");
+
+        /* Reload config from INI to restore the original schedule entries */
+        config_set_defaults(&g_state.cfg);
+        config_load_ini(&g_state.cfg, config_file);
+
+        /* Re-apply schedule_only promotion */
+        if (!g_state.cfg.schedule_only)
+            g_state.cfg.schedule_count = 0;
+
+        if (g_state.cfg.schedule_only && g_state.cfg.schedule_count > 0) {
+            ScheduleEntry *e = &g_state.cfg.schedule[0];
+            if (e->frequency_hz > 0.0)
+                g_state.cfg.frequency_hz = e->frequency_hz;
+            if (e->freq_b_hz > 0.0)
+                g_state.cfg.freq_b_hz = e->freq_b_hz;
+            if (e->duration_sec > 0)
+                g_state.cfg.duration_sec = e->duration_sec;
+            if (e->output_file[0])
+                strncpy(g_state.cfg.output_file, e->output_file, MAX_PATH_LEN-1);
+            if (e->antenna[0])
+                strncpy(g_state.cfg.antenna, e->antenna,
+                        sizeof(g_state.cfg.antenna)-1);
+            if (e->start_time[0]) {
+                if (time_already_passed_today(e->start_time))
+                    LOG_INFO("schedule_repeat: waiting until tomorrow for %s",
+                             e->start_time);
+                strncpy(g_state.cfg.start_time_utc, e->start_time,
+                        sizeof(g_state.cfg.start_time_utc)-1);
+                strncpy(g_state.next_start, e->start_time,
+                        sizeof(g_state.next_start)-1);
+            }
+            int ri;
+            for (ri = 0; ri < g_state.cfg.schedule_count - 1; ri++)
+                g_state.cfg.schedule[ri] = g_state.cfg.schedule[ri+1];
+            g_state.cfg.schedule_count--;
+        }
+
+        /* Reset all per-session counters */
+        sched_idx                   = 0;
+        g_state.samples_received    = 0;
+        g_state.samples_written     = 0;
+        g_state.zero_frames_written = 0;
+        g_state.overflows           = 0;
+        g_state.peak_dbfs           = -90.0f;
+        g_state.peak_dbfs_b         = -90.0f;
+        g_state.writer_error        = 0;
+        g_state.disk_stop           = 0;
+        g_state.disk_warn_issued    = 0;
+        g_state.disk_free_mb        = 0;
+        g_state.frozen_file_mb      = -1;
+        g_state.frozen_elapsed_sec  = 0.0;
+        g_state.session_complete    = 0;
+        g_state.start_time.QuadPart = 0;
+        /* next_start already set above - keep it so dashboard shows NEXT AT */
+        ring_reset(&g_state.ring);
+
+        goto repeat_schedule;
+    }
 
 cleanup_writer:
     if (g_state.writer_thread && g_state.writer_running) {
@@ -4364,6 +4538,27 @@ cleanup_no_api:
 
         if (!launched_from_console || rc != 0 || g_state.cfg.http_port > 0) {
             if (g_state.cfg.http_port > 0) {
+                /* All cleanup done - now safe to set session_complete so
+                 * the phone dashboard shows FINISHED.                    */
+                g_state.session_complete = 1;
+                snprintf(g_state.frozen_json, sizeof(g_state.frozen_json),
+                    "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
+                    "\"overflows\":%ld,\"zero_frames\":%lld,"
+                    "\"peak_dbfs_a\":%.1f,\"peak_dbfs_b\":%.1f,"
+                    "\"overload_a\":0,\"overload_b\":0,\"agc_on\":0,\"dual_channel\":0,"
+                    "\"disk_warn\":0,\"disk_stop\":0,\"writer_error\":0,\"running\":1,"
+                    "\"recording\":0,\"hdr_on\":0,\"session_complete\":1,"
+                    "\"waiting\":0,\"next_start\":\"\","
+                    "\"samples_rx\":%lld,\"samples_written\":%lld}",
+                    g_state.frozen_elapsed_sec,
+                    (double)(g_state.frozen_file_mb > 0 ? g_state.frozen_file_mb : 0),
+                    (long long)g_state.disk_free_mb,
+                    g_state.overflows,
+                    (long long)g_state.zero_frames_written,
+                    (double)g_state.peak_dbfs,
+                    (double)g_state.peak_dbfs_b,
+                    (long long)g_state.samples_received,
+                    (long long)g_state.samples_written);
                 fprintf(stderr, "\nRecording finished. HTTP monitor still running.\n");
                 fprintf(stderr, "Press Ctrl+C to close duodx.\n");
             } else {

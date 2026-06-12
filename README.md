@@ -2,7 +2,7 @@
 
 A high-reliability SDR recording application for Windows, optimised for medium wave DXing with SDRplay hardware (RSPdx, RSPdx R2, RSPduo, RSP1A, RSP2).
 
-Records directly to Linrad raw, WavViewDX, SDRuno WAV, or SDR Connect WAV format. Supports single-tuner and RSPduo dual-tuner coherent recording, multi-session overnight scheduling, and browser-based remote monitoring over a local network.
+Records directly to Linrad raw, WavViewDX, SDRuno WAV, or SDR Connect WAV format. Supports single-tuner and RSPduo dual-tuner coherent recording, multi-session overnight scheduling with automatic nightly repeat, and browser-based remote monitoring over a local network.
 
 ---
 
@@ -10,13 +10,12 @@ Records directly to Linrad raw, WavViewDX, SDRuno WAV, or SDR Connect WAV format
 
 - Single and dual-channel (RSPduo) recording
 - Output formats: Linrad raw, WavViewDX, SDRuno WAV, SDR Connect WAV
-- Multi-recording overnight scheduler with `schedule_only` mode
-- HTTP status dashboard — monitor live recordings from a phone or browser on your local network
+- Multi-recording overnight scheduler with `schedule_only` and `schedule_repeat` modes
+- HTTP status dashboard — monitor live recordings from any phone or browser on your local network
 - Ring buffer with overflow detection and zero-fill logging
 - Drive spin-up pre-write to prevent gaps on idle hard disks
 - HDR mode support (RSPdx / RSPdx R2)
 - Named pipe for real-time IQ monitoring by a compatible client
-- Scheduled start time (UTC) with 12-hour window logic
 - Signal level metering (peak dBFS) for both tuners
 - INI file configuration with CLI overrides
 
@@ -48,8 +47,8 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-make
 ### 2. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/duodx.git
-cd duodx
+git clone https://github.com/45south/DuoDX-recorder.git
+cd DuoDX-recorder
 ```
 
 ### 3. Verify the SDRplay API path
@@ -75,12 +74,6 @@ This produces `duodx.exe` in the current directory. For a debug build:
 make debug
 ```
 
-To clean build output:
-
-```bash
-make clean
-```
-
 ---
 
 ## Configuration
@@ -95,7 +88,8 @@ Copy `duodx.ini` to the same directory as `duodx.exe` and edit it to suit your s
 | `antenna` | A | Antenna input: A \| B \| C |
 | `hdr_enable` | 0 | HDR mode (RSPdx only) |
 | `http_port` | 0 | HTTP monitor port. 0 = disabled |
-| `schedule_only` | 0 | 1 = skip to schedule_1, ignore top-level recording |
+| `schedule_only` | 0 | 1 = use schedule entries only, no instant recording |
+| `schedule_repeat` | 0 | 1 = repeat schedule nightly (requires `schedule_only = 1`) |
 
 See the full User Guide for complete documentation.
 
@@ -111,16 +105,17 @@ To allow access from other devices, add a Windows Firewall rule once (run as Adm
 netsh advfirewall firewall add rule name="DuoDX HTTP Status" dir=in action=allow protocol=TCP localport=8080
 ```
 
-Find your PC's IP address with `ipconfig` and look for the IPv4 Address under your active network adapter.
+The dashboard shows elapsed time, file size, disk free, signal levels (dBFS), overflow count, AGC/HDR state, and alerts. It updates every 2 seconds by default (configurable via `http_interval_ms`).
 
 ---
 
 ## Overnight Scheduling
 
-Use `schedule_only = 1` with numbered `schedule_N_*` entries for unattended overnight recordings:
+Use `schedule_only = 1` with numbered `schedule_N_*` entries for unattended overnight recordings. Add `schedule_repeat = 1` to repeat automatically every night:
 
 ```ini
-schedule_only = 1
+schedule_only   = 1
+schedule_repeat = 1
 
 schedule_1_start_time  = 09:00:00
 schedule_1_duration    = 14400
@@ -135,7 +130,7 @@ schedule_2_antenna     = A
 schedule_2_output_file =
 ```
 
-**Note:** Start DuoDX before the first `schedule_1_start_time`. If launched after that time has already passed today, recording will start immediately.
+DuoDX always waits for a scheduled time — it will never start recording immediately when `schedule_only = 1`, regardless of what time you launch it.
 
 ---
 
@@ -151,9 +146,7 @@ DuoDX was inspired by [rsp-recorder](https://github.com/fventuri/rsp-recorder) b
 
 DuoDX was developed with the assistance of [Claude](https://www.anthropic.com) (Anthropic), which contributed substantially to the C programming, debugging, and documentation throughout the project.
 
-WavViewDX is copyright © Reinhard Weiß.
-
-SDRplay, RSPduo, RSPdx, and related product names are trademarks of SDRplay Ltd.
+WavViewDX is copyright © Reinhard Weiß. SDRplay, RSPduo, RSPdx, and related product names are trademarks of SDRplay Ltd.
 
 ---
 
