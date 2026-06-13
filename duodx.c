@@ -23,7 +23,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3740,8 +3739,11 @@ int main(int argc, char **argv)
                                * (num_channels == 2 ? 8 : 4);
         ring_size = bytes_per_sec * (SIZE_T)g_state.cfg.ring_buffer_sec;
 
-        if (ring_size < RING_BUFFER_MIN_BYTES)
+        if (ring_size < RING_BUFFER_MIN_BYTES) {
+            LOG_WARN("ring_buffer_sec too small - clamped to minimum %d MB.",
+                     RING_BUFFER_MIN_BYTES / (1024 * 1024));
             ring_size = RING_BUFFER_MIN_BYTES;
+        }
 
         LOG_INFO("Allocating ring buffer: %zu MB",
                  ring_size / (1024 * 1024));
@@ -4495,48 +4497,11 @@ cleanup_no_api:
      * Detected by checking if the parent process is cmd.exe or
      * powershell.exe via NtQueryInformationProcess + GetProcessImageFileName.
      * Simpler fallback: check if the console was allocated by us (AttachConsole
-     * returns false when a console already existed before we ran).           */
+     * GetConsoleWindow() returns non-NULL if a console is attached,
+     * which is the case when launched from cmd/MSYS2/PowerShell/Terminal.
+     * Returns NULL when launched by double-clicking in Explorer.          */
     {
-        int launched_from_console = 0;
-        /* Try to attach to parent's console. If it succeeds the parent
-         * already had a console open (cmd.exe / PowerShell / Terminal).
-         * FreeConsole first so AttachConsole can try; then reattach.     */
-        DWORD parent_pid = 0;
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap != INVALID_HANDLE_VALUE) {
-            PROCESSENTRY32 pe;
-            pe.dwSize = sizeof(pe);
-            DWORD my_pid = GetCurrentProcessId();
-            if (Process32First(snap, &pe)) {
-                do {
-                    if (pe.th32ProcessID == my_pid) {
-                        parent_pid = pe.th32ParentProcessID;
-                        break;
-                    }
-                } while (Process32Next(snap, &pe));
-            }
-            /* Check parent process name */
-            if (parent_pid) {
-                HANDLE hpar = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                          FALSE, parent_pid);
-                if (hpar) {
-                    char img[MAX_PATH];
-                    DWORD sz = MAX_PATH;
-                    if (QueryFullProcessImageNameA(hpar, 0, img, &sz)) {
-                        /* Case-insensitive check for common console hosts */
-                        CharLowerA(img);
-                        if (strstr(img, "cmd.exe")         ||
-                            strstr(img, "powershell.exe")  ||
-                            strstr(img, "pwsh.exe")        ||
-                            strstr(img, "windowsterminal") ||
-                            strstr(img, "conhost.exe"))
-                            launched_from_console = 1;
-                    }
-                    CloseHandle(hpar);
-                }
-            }
-            CloseHandle(snap);
-        }
+        int launched_from_console = (GetConsoleWindow() != NULL) ? 1 : 0;
 
         if (!launched_from_console || rc != 0 || g_state.cfg.http_port > 0) {
             if (g_state.cfg.http_port > 0) {
