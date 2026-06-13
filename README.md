@@ -107,6 +107,8 @@ netsh advfirewall firewall add rule name="DuoDX HTTP Status" dir=in action=allow
 
 The dashboard shows elapsed time, file size, disk free, signal levels (dBFS), overflow count, AGC/HDR state, and alerts. It updates every 2 seconds by default (configurable via `http_interval_ms`).
 
+Before the first recording starts and between schedule entries, the elapsed card shows **NEXT AT HH:MMZ** in orange. After all recordings finish it shows **FINISHED** in gold.
+
 ---
 
 ## Overnight Scheduling
@@ -131,6 +133,18 @@ schedule_2_output_file =
 ```
 
 DuoDX always waits for a scheduled time — it will never start recording immediately when `schedule_only = 1`, regardless of what time you launch it.
+
+---
+
+## Windows Defender False Positive
+
+Windows Defender may flag `duodx.exe` as `Program:Win32/Wacapew.C!ml`. This is a false positive — only 1 of 70+ antivirus engines detects it, and it is caused by the built-in HTTP monitoring server being flagged by Microsoft's machine learning model.
+
+To resolve:
+- Allow the file manually in Defender (**Virus & threat protection → Protection history → Allow**)
+- Or submit a false positive report to Microsoft: https://www.microsoft.com/en-us/wdsi/filesubmission
+
+The full source code is available in this repository for review.
 
 ---
 
