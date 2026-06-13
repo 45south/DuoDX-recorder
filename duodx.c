@@ -40,7 +40,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "1.2.6"
+#define VERSION                 "1.2.7"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -532,12 +532,14 @@ static void generate_output_filename(Config *cfg, int num_channels)
     GetSystemTime(&st);
 
     if (cfg->output_format == FORMAT_WAVVIEWDX) {
-        /* WavViewDX-raw: all metadata embedded in filename fields */
+        /* WavViewDX-raw: all metadata embedded in filename fields.
+         * Use the output sample rate (after hardware decimation), not the
+         * ADC rate - WavViewDX uses sr to calculate file duration.      */
         snprintf(cfg->output_file, MAX_PATH_LEN,
                  "iq_pcm16_ch%d_cf%lld_sr%lld_dt%04d%02d%02d-%02d%02d%02dz.raw",
                  num_channels,
                  (long long)cfg->frequency_hz,
-                 (long long)cfg->sample_rate_hz,
+                 (long long)cfg->expected_output_rate_hz,
                  st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond);
     } else if (cfg->output_format == FORMAT_SDRUNO) {
@@ -3375,8 +3377,8 @@ int main(int argc, char **argv)
     unsigned int              i;
 
     printf("\n");
-    printf("  DuoDX  v%s  Dave Headland\n", VERSION);
-    printf("  Freeware - free to use and distribute\n");
+    printf("  DuoDX  v%s  (c) 2026 Dave Headland\n", VERSION);
+    printf("  SDR recorder for MW/HF DXing with SDRplay hardware\n");
     printf("========================================\n");
     printf("\n");
 
