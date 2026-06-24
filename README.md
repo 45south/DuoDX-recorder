@@ -6,6 +6,23 @@ Records directly to Linrad raw, WavViewDX, SDRuno WAV, or SDR Connect WAV format
 
 ---
 
+### ⚠️ A Quick Word of Warning: This is an AI-Assisted Project ⚠️
+
+**This project is a personal project for my dx hobby.**
+
+Let's be upfront: a large language model (AI) helped write a significant portion of this code, *if not most.* I guided it, reviewed its output the best I could, and tested the result, but this project didn't evolve through the typical trial-and-error of a human-only endeavor. Even this README you're reading was drafted by the AI based on the source code, then edited and refined by me.
+
+Second, it's worth knowing that this was a learning project for myself. The focus was always on getting a practical, working result, which means some of the solutions are probably not what you'd find in a textbook. 
+
+*What does this mean?*
+
+*   **It's Experimental.** While it works, it hasn't been battle-tested across a wide variety of SDR formats.
+*   **Design choices not stable.** You may see features etc. suddenly appear and disappear. You may also see large commits of lots of changes. **The mainline codebase may also be broken at times due to fast moving code and changes. Releases may be more stable.** 
+*   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. Other issues causing crashes likely exist too. 
+*   **Use with caution!** Check edited and converted files before deleting your original recordings, if they are important to you.
+
+---
+
 ## Features
 
 - Single and dual-channel (RSPduo) recording
