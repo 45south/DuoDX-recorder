@@ -16,10 +16,10 @@ Second, it's worth knowing that this was a learning project for myself. The focu
 
 *What does this mean?*
 
-*   **It's Experimental.** While it works, it hasn't been battle-tested across a wide variety of SDR formats.
+*   **It's Experimental.** While it works, it hasn't been battle-tested across a wide variety of SDR configurations.
 *   **Design choices not stable.** You may see features etc. suddenly appear and disappear. You may also see large commits of lots of changes. **The mainline codebase may also be broken at times due to fast moving code and changes. Releases may be more stable.** 
 *   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. Other issues causing crashes likely exist too. 
-*   **Use with caution!** Check edited and converted files before deleting your original recordings, if they are important to you.
+*   **Use with caution!** 
 
 ---
 
