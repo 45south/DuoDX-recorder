@@ -1,52 +1,52 @@
-# Makefile for DuoDX
-# Targets MinGW-w64 (MSYS2) on Windows.
+# =============================================================================
+# Makefile for DuoDX GUI  (MSYS2 / MinGW-w64)
 #
-# Usage:
-#   make              - build duodx.exe (release)
-#   make debug        - build with debug symbols, no optimisation
-#   make clean        - remove build output
+#   make            Build duodx.exe (optimised, windowed, stripped)
+#   make debug      Build with -g and a console attached for stdout/stderr
+#   make clean      Remove build artefacts
+#   make run        Build then launch
+#
+# Override the SDRplay API location if it is installed elsewhere:
+#   make SDR_API="D:/SDRplay/API"
+# =============================================================================
 
-# ---------------------------------------------------------------------------
-# SDRplay API paths - adjust if your installation differs
-# ---------------------------------------------------------------------------
-SDRPLAY_INC = C:/Program Files/SDRplay/API/inc
-SDRPLAY_LIB = C:/Program Files/SDRplay/API/x64
+CC      := gcc
+TARGET  := duodx.exe
+SRC     := duodx.c
 
-# ---------------------------------------------------------------------------
-# Toolchain
-# ---------------------------------------------------------------------------
-CC      = gcc
-TARGET  = duodx.exe
-SRC     = duodx.c
+# --- SDRplay API v3 location -------------------------------------------------
+# Default install path; override on the command line if needed.
+SDR_API ?= C:/Program Files/SDRplay/API
+SDR_INC := $(SDR_API)/inc
+SDR_LIB := $(SDR_API)/x64
 
-# ---------------------------------------------------------------------------
-# Flags
-# ---------------------------------------------------------------------------
-CFLAGS_COMMON = -Wall -Wextra -mthreads \
-                -I"$(SDRPLAY_INC)"
+# --- Flags -------------------------------------------------------------------
+CFLAGS  := -O2 -Wall -mthreads -I"$(SDR_INC)"
+LDFLAGS := -L"$(SDR_LIB)"
+LIBS    := -lsdrplay_api -lcomctl32 -lgdi32 -lws2_32 -lwinmm
+GUIFLAG := -mwindows
 
-CFLAGS_RELEASE = $(CFLAGS_COMMON) -O2
-CFLAGS_DEBUG   = $(CFLAGS_COMMON) -O0 -g -DDEBUG
+# -----------------------------------------------------------------------------
+.PHONY: all debug clean run strip-target
 
-LDFLAGS = -L"$(SDRPLAY_LIB)" \
-          -lsdrplay_api \
-          -lwinmm \
-          -lws2_32
-
-# ---------------------------------------------------------------------------
-# Targets
-# ---------------------------------------------------------------------------
-.PHONY: all debug clean
-
-all: $(TARGET)
+all: $(TARGET) strip-target
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS_RELEASE) -o $@ $< $(LDFLAGS)
-	@echo Built $@ [release]
+	$(CC) $(CFLAGS) $(GUIFLAG) -o $@ $< $(LDFLAGS) $(LIBS)
 
-debug: $(SRC)
-	$(CC) $(CFLAGS_DEBUG) -o $(TARGET) $< $(LDFLAGS)
-	@echo Built $(TARGET) [debug]
+# Strip only for release builds (the all target).
+.PHONY: strip-target
+strip-target: $(TARGET)
+	strip $(TARGET)
+
+# Debug build: keeps a console window so printf/stderr and the debugger work,
+# and does NOT strip, so -g symbols survive.
+debug: CFLAGS := -O0 -g -Wall -mthreads -I"$(SDR_INC)"
+debug: GUIFLAG :=
+debug: clean $(TARGET)
+
+run: all
+	./$(TARGET)
 
 clean:
-	del /Q $(TARGET) 2>NUL || true
+	-rm -f $(TARGET)

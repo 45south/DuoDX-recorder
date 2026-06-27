@@ -1,36 +1,37 @@
 # Build output
 *.exe
 *.o
+*.obj
 *.a
+*.lib
 *.dll
+*.exp
+*.pdb
+*.ilk
+build/
+bin/
+obj/
 
-# Debug builds
-duodx_debug.exe
-
-# Recording output files
-*.raw
-*.wav
-_duodx_spinup.tmp
-
-# Log files
-*.log
-
-# SDRplay API - not redistributable, must be installed separately
-sdrplay_api.h
-sdrplay_api.dll
-sdrplay_api.lib
-/API/
-
-# Windows
-Thumbs.db
-Desktop.ini
+# MinGW / MSYS2
+*.stackdump
 
 # Editor / IDE
 .vscode/
-.vs/
+.idea/
 *.swp
-*.swo
 *~
+*.code-workspace
 
-# MSYS2 / MinGW build artefacts
-*.d
+# OS cruft
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local config and recordings (do not commit personal settings or captures)
+duodx.ini
+*.raw
+*.wav
+*.log
+
+# Keep the example config in the repo (force-tracked despite duodx.ini rule)
+!duodx.example.ini

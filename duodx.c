@@ -28,10 +28,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
-#include <conio.h>
 #include <time.h>
 #include <math.h>
 #include <signal.h>
+#include <commctrl.h>
+#include <richedit.h>
 
 #include "sdrplay_api.h"
 
@@ -39,7 +40,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "1.2.7"
+#define VERSION                 "2.0.0"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -190,7 +191,7 @@ typedef struct {
 
     /* ── Scheduled recording ─────────────────────────────────────────── */
     /* UTC time string HH:MM:SS. Empty string = start immediately.        */
-    char     start_time_utc[16];
+    char     start_time[16];
 
     /* ── Drive spin-up ───────────────────────────────────────────────── */
     /* Write a small dummy block to wake a spinning disk before recording.
@@ -207,6 +208,13 @@ typedef struct {
     int           schedule_count;  /* number of entries parsed */
     int           schedule_only;   /* 1 = skip top-level recording, start from schedule_1 */
     int           schedule_repeat; /* 1 = repeat schedule nightly after all entries finish */
+
+    int           use_utc;         /* 1=UTC timestamps (default), 0=local time */
+    int           show_clock;      /* 1=show live clock in GUI (default), 0=hide */
+    int           hourly_enable;   /* 1 = enable hourly recording mode */
+    int           hourly_window_min; /* recording window centred on the hour (minutes) */
+    char          hourly_start[8]; /* window open time HH:MM */
+    char          hourly_stop[8];  /* window close time HH:MM */
 } Config;
 
 /* =========================================================================
@@ -278,6 +286,8 @@ typedef struct {
     volatile LONG64 disk_free_mb;     /* last computed free space, shared with HTTP thread */
     volatile LONG64 frozen_file_mb;   /* file size frozen at end of recording, -1 = not set */
     volatile double frozen_elapsed_sec; /* elapsed time frozen at end of all recordings */
+    volatile double last_display_elapsed; /* last completed recording length, for GUI - never reset between entries */
+    volatile LONG64 last_display_file_mb; /* last completed file size, for GUI - never reset between entries */
     volatile int    session_complete;   /* 1 after all recordings finish */
     char            frozen_json[4096];  /* pre-built JSON served after session ends */
     char            next_start[16];     /* next schedule start time HH:MM:SS or empty */
@@ -288,92 +298,167 @@ static volatile int g_running = 1;
 static volatile int g_recording = 0; /* 1 during recording: suppress console LOG */
 static volatile int g_http_running = 1; /* controls HTTP accept loop lifetime */
 static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
-static int g_vt_enabled = 0;         /* 1 if ANSI/VT escape sequences are usable */
 
 /* =========================================================================
  * Logging
  * ========================================================================= */
+/* =========================================================================
+ * GUI front-end globals and helpers
+ *
+ * This block replaces the console front-end (the original log_write,
+ * keyboard thread, console monitor status line, and main()).
+ *
+ * The recording engine below is unchanged. All log output is routed to a
+ * read-only multiline edit control; live statistics are routed to a set of
+ * static labels updated by a GUI monitor thread.
+ * ========================================================================= */
+
+/* Control IDs */
+#define IDC_LOG          1001
+#define IDC_BTN_TOGGLE   1002
+#define IDC_BTN_AGC      1004
+
+/* Private window messages */
+#define WM_APP_LOG       (WM_APP + 1)   /* lParam = char* (heap), append to log  */
+#define WM_APP_DONE      (WM_APP + 3)   /* worker thread finished                */
+
+/* 1-second timer drives the live clock display. */
+#define ID_TIMER_CLOCK   1
+
+/* ---- Theme colours (deep navy / cyan / white) -------------------------- */
+#define COL_BG        RGB(13, 27, 53)     /* window background  - deep navy    */
+#define COL_PANEL     RGB(20, 40, 74)     /* meter/counter panel - lighter navy*/
+#define COL_PANEL_EDGE RGB(45, 80, 130)   /* panel border                      */
+#define COL_TEXT      RGB(232, 240, 255)  /* primary text - near white         */
+#define COL_TEXT_DIM  RGB(150, 175, 210)  /* labels - muted blue-grey          */
+#define COL_ACCENT    RGB(80, 200, 255)   /* cyan accent / values              */
+#define COL_LED_OFF   RGB(60, 40, 40)     /* recording LED when idle           */
+#define COL_LED_ON    RGB(255, 0, 0)      /* recording LED when active         */
+#define COL_BAR_BG    RGB(8, 16, 32)      /* meter track background            */
+#define COL_SEG_GREEN RGB(40, 220, 90)
+#define COL_SEG_AMBER RGB(255, 190, 40)
+#define COL_SEG_RED   RGB(255, 60, 50)
+#define COL_BTN_FACE  RGB(30, 58, 100)
+#define COL_BTN_HOT   RGB(45, 85, 140)
+#define COL_BTN_DIS   RGB(22, 38, 62)
+#define COL_BTN_START RGB(28, 96, 62)    /* green-ish: idle toggle = "Start"  */
+#define COL_BTN_STOP  RGB(140, 44, 44)   /* red-ish:   recording toggle="Stop"*/
+
+/* GUI globals */
+static HWND   g_hwnd        = NULL;
+static HWND   g_hLog        = NULL;
+static HWND   g_hBtnToggle  = NULL;
+static HWND   g_hBtnAgc     = NULL;
+static HFONT  g_hFontLog    = NULL;
+static HFONT  g_hFontUI     = NULL;   /* labels                              */
+static HFONT  g_hFontVal    = NULL;   /* bold values / counters              */
+static HFONT  g_hFontBig    = NULL;   /* big 7-seg-ish counters              */
+static HBRUSH g_hbrBg       = NULL;
+static HBRUSH g_hbrPanel    = NULL;
+
+static HANDLE g_worker_thread  = NULL;   /* recording_worker thread             */
+static HANDLE g_gui_mon_thread = NULL;   /* GUI status monitor thread           */
+static volatile int g_worker_active = 0; /* 1 while a recording session runs    */
+static volatile int g_agc_toggle_req = 0;/* set by AGC button, serviced in engine*/
+/* (LED is static while recording) */
+
+static char   g_config_file[MAX_PATH_LEN] = CONFIG_FILE;
+
+/* Clock display: read from the INI at startup and on each Start, so the GUI
+ * can show a live clock even while idle (before the worker loads config). */
+static volatile int g_clock_show = 1;   /* 1 = show live clock              */
+static volatile int g_clock_utc  = 1;   /* 1 = UTC, 0 = local               */
+
+/* ---- Live UI snapshot ---------------------------------------------------
+ * The GUI monitor thread fills this; WM_PAINT reads it. Plain scalars,
+ * updated/read atomically enough for display purposes.                     */
+typedef struct {
+    int    recording;     /* 1 = stream live                                 */
+    int    finished;      /* 1 = session complete (verification in log)      */
+    int    dual;          /* 1 = dual channel                                */
+    double elapsed_sec;
+    double file_mb;
+    double disk_free_mb;
+    float  peak_a;        /* dBFS, -90 = silence                             */
+    float  peak_b;
+    int    overload_a;
+    int    overload_b;
+    int    agc_on;        /* 1 = AGC currently enabled on tuner A            */
+    int    hdr_on;        /* 1 = HDR mode enabled                            */
+    long   overflows;
+    long long dropped;    /* zero-fill frames                                */
+    float  ring_pct;      /* ring buffer fill 0..100 (percent, one decimal)  */
+    char   state[48];
+    char   next[32];
+    char   freq[48];
+    char   span[64];      /* coverage range, e.g. "150 - 1750 kHz"          */
+    char   sched[96];     /* scheduling status line for the bottom bar       */
+} UiSnapshot;
+
+static UiSnapshot g_ui;   /* zero-initialised                                */
+
+/* Forward declarations for the GUI front-end */
+static DWORD WINAPI recording_worker(LPVOID param);
+static DWORD WINAPI gui_monitor_thread_func(LPVOID param);
+static void  gui_apply_agc_toggle(AppState *state);
+static inline SIZE_T ring_available(const RingBuffer *rb);
+
+/* -------------------------------------------------------------------------
+ * log_write - GUI version. Formats the message and posts a heap-allocated
+ * string to the main window, which appends it to the log edit control on
+ * the UI thread. Also writes to the log file if one is open. Thread-safe.
+ * ------------------------------------------------------------------------- */
 static void log_write(const char *level, const char *fmt, ...)
 {
     char buf[512];
+    char line[640];
     va_list args;
     SYSTEMTIME st;
 
-    GetLocalTime(&st);
+    /* Log clock follows the same UTC/local choice as the scheduler and
+     * filenames (use_utc). With everything on one clock the timestamps in
+     * the log line up with the scheduled times the user entered.          */
+    if (g_state.cfg.use_utc)
+        GetSystemTime(&st);
+    else
+        GetLocalTime(&st);
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    /* During recording, suppress console output so the \r status line
-     * is not scrolled. All messages still go to the log file.         */
-    if (!g_recording) {
-        /* INFO lines show HH:MM:SS only - clean startup listing.
-         * WARN/ERROR keep milliseconds so timing is unambiguous.
-         * WARN prints in orange, ERROR in bright red.                 */
-        int is_info  = (strcmp(level, "INFO ") == 0);
-        int is_warn  = (strcmp(level, "WARN ") == 0);
-        int is_error = (strcmp(level, "ERROR") == 0);
-        int is_ok    = (strcmp(level, "OK   ") == 0);
+    snprintf(line, sizeof(line), "[%02d:%02d:%02d%s] [%s] %s\r\n",
+             st.wHour, st.wMinute, st.wSecond,
+             g_state.cfg.use_utc ? "Z" : "", level, buf);
 
-        if (g_vt_enabled) {
-            /* ANSI path:
-             * OK    - \x1b[92m               bright green
-             * WARN  - \x1b[38;2;255;140;0m  RGB orange
-             * ERROR - \x1b[91m               bright red
-             * INFO  - no colour escape (default terminal colour)      */
-            const char *col = is_ok    ? "\x1b[92m"
-                            : is_warn  ? "\x1b[38;2;255;140;0m"
-                            : is_error ? "\x1b[91m"
-                            :            "";
-            const char *rst = (is_ok || is_warn || is_error) ? "\x1b[0m" : "";
-
-            if (is_info || is_ok)
-                printf("%s[%02d:%02d:%02d] [%s] %s%s\n",
-                       col,
-                       st.wHour, st.wMinute, st.wSecond,
-                       level, buf, rst);
-            else
-                printf("%s[%02d:%02d:%02d] [%s] %s%s\n",
-                       col,
-                       st.wHour, st.wMinute, st.wSecond,
-                       level, buf, rst);
-        } else {
-            /* 16-colour fallback via SetConsoleTextAttribute */
-            HANDLE hcon = GetStdHandle(STD_OUTPUT_HANDLE);
-            CONSOLE_SCREEN_BUFFER_INFO csbi;
-            WORD orig = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
-            if (GetConsoleScreenBufferInfo(hcon, &csbi))
-                orig = csbi.wAttributes;
-
-            if (is_ok)
-                SetConsoleTextAttribute(hcon,
-                    FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-            else if (is_warn)
-                SetConsoleTextAttribute(hcon,
-                    FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-            else if (is_error)
-                SetConsoleTextAttribute(hcon,
-                    FOREGROUND_RED | FOREGROUND_INTENSITY);
-
-            if (is_info || is_ok)
-                printf("[%02d:%02d:%02d] [%s] %s\n",
-                       st.wHour, st.wMinute, st.wSecond,
-                       level, buf);
-            else
-                printf("[%02d:%02d:%02d] [%s] %s\n",
-                       st.wHour, st.wMinute, st.wSecond,
-                       level, buf);
-
-            if (is_ok || is_warn || is_error)
-                SetConsoleTextAttribute(hcon, orig);
+    if (g_hwnd) {
+        /* Choose a colour code for the log window:
+         *   0 = white (default)  1 = green (ok)  2 = orange (warn)  3 = red */
+        int colour = 0;
+        if      (strcmp(level, "ERROR") == 0) colour = 3;
+        else if (strcmp(level, "WARN ") == 0) colour = 2;
+        else if (strcmp(level, "OK   ") == 0) colour = 1;
+        else {
+            /* INFO lines that report a clean result also go green. */
+            if (strstr(buf, "PASSED") || strstr(buf, "Verification") ||
+                strstr(buf, "complete") || strstr(buf, "Session ended"))
+                colour = 1;
         }
-        fflush(stdout);
+
+        size_t n = strlen(line) + 1;
+        char *copy = (char *)malloc(n);
+        if (copy) {
+            memcpy(copy, line, n);
+            /* Posted, not sent: never blocks the engine threads. */
+            if (!PostMessageA(g_hwnd, WM_APP_LOG, (WPARAM)colour, (LPARAM)copy))
+                free(copy);
+        }
     }
 
     if (g_state.log_fp) {
-        fprintf(g_state.log_fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] %s\n",
+        fprintf(g_state.log_fp, "[%04d-%02d-%02d %02d:%02d:%02d.%03d %s] [%s] %s\n",
                 st.wYear, st.wMonth, st.wDay,
                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                g_state.cfg.use_utc ? "UTC" : "local",
                 level, buf);
         fflush(g_state.log_fp);
     }
@@ -383,6 +468,261 @@ static void log_write(const char *level, const char *fmt, ...)
 #define LOG_OK(...)    log_write("OK   ", __VA_ARGS__)
 #define LOG_WARN(...)  log_write("WARN ", __VA_ARGS__)
 #define LOG_ERROR(...) log_write("ERROR", __VA_ARGS__)
+
+/* -------------------------------------------------------------------------
+ * gui_apply_agc_toggle - toggle AGC on the live stream. Extracted from the
+ * original keyboard handler's 'G' key. Called from the engine's main wait
+ * loop when the AGC button has been pressed (g_agc_toggle_req).
+ * ------------------------------------------------------------------------- */
+static void gui_apply_agc_toggle(AppState *state)
+{
+    int is_dual = state->cfg.dual_channel;
+
+    if (state->cfg.hdr_enable) {
+        LOG_INFO("AGC control disabled in HDR mode (fixed gain path).");
+        return;
+    }
+    if (!state->ch_a_params) return;
+
+    int cur_agc = state->ch_a_params->ctrlParams.agc.enable;
+    int new_agc = (cur_agc == sdrplay_api_AGC_DISABLE)
+                  ? sdrplay_api_AGC_CTRL_EN
+                  : sdrplay_api_AGC_DISABLE;
+
+    state->ch_a_params->ctrlParams.agc.enable = new_agc;
+    if (is_dual && state->ch_b_params)
+        state->ch_b_params->ctrlParams.agc.enable = new_agc;
+
+    sdrplay_api_TunerSelectT t = is_dual
+        ? sdrplay_api_Tuner_Both : sdrplay_api_Tuner_A;
+
+    if (new_agc == sdrplay_api_AGC_DISABLE) {
+        int gr_a = state->cfg.gain_reduction;
+        int gr_b = (state->cfg.gain_reduction_b >= 0)
+                   ? state->cfg.gain_reduction_b
+                   : state->cfg.gain_reduction;
+        state->ch_a_params->tunerParams.gain.gRdB = gr_a;
+        if (is_dual && state->ch_b_params)
+            state->ch_b_params->tunerParams.gain.gRdB = gr_b;
+
+        sdrplay_api_ErrT err = sdrplay_api_Update(
+            state->device.dev, t,
+            (sdrplay_api_ReasonForUpdateT)
+                (sdrplay_api_Update_Ctrl_Agc |
+                 sdrplay_api_Update_Tuner_Gr),
+            sdrplay_api_Update_Ext1_None);
+        if (err != sdrplay_api_Success) {
+            /* Transient NotInitialised can occur if a previous update is
+             * still settling; wait briefly and retry once.                 */
+            Sleep(120);
+            err = sdrplay_api_Update(
+                state->device.dev, t,
+                (sdrplay_api_ReasonForUpdateT)
+                    (sdrplay_api_Update_Ctrl_Agc |
+                     sdrplay_api_Update_Tuner_Gr),
+                sdrplay_api_Update_Ext1_None);
+        }
+        if (err == sdrplay_api_Success) {
+            if (is_dual)
+                LOG_INFO("AGC off - T1=%d dB  T2=%d dB", gr_a, gr_b);
+            else
+                LOG_INFO("AGC off - GR=%d dB", gr_a);
+        } else {
+            state->ch_a_params->ctrlParams.agc.enable = cur_agc;
+            if (is_dual && state->ch_b_params)
+                state->ch_b_params->ctrlParams.agc.enable = cur_agc;
+            LOG_WARN("AGC off failed: %s", sdrplay_api_GetErrorString(err));
+        }
+    } else {
+        sdrplay_api_ErrT err = sdrplay_api_Update(
+            state->device.dev, t,
+            sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+        if (err != sdrplay_api_Success) {
+            Sleep(120);
+            err = sdrplay_api_Update(
+                state->device.dev, t,
+                sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
+        }
+        if (err == sdrplay_api_Success) {
+            LOG_INFO(is_dual ? "AGC on (both tuners)" : "AGC on");
+        } else {
+            state->ch_a_params->ctrlParams.agc.enable = cur_agc;
+            if (is_dual && state->ch_b_params)
+                state->ch_b_params->ctrlParams.agc.enable = cur_agc;
+            LOG_WARN("AGC on failed: %s", sdrplay_api_GetErrorString(err));
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * GUI monitor thread - mirrors the engine statistics into the status
+ * labels. Runs for the lifetime of a worker session (g_worker_active).
+ * Uses SetWindowTextA via the UI thread is not required for static labels;
+ * SetWindowText is thread-safe enough for our update rate, but to be safe
+ * we marshal through the message queue is unnecessary here - we update
+ * labels directly at a modest interval.
+ * ------------------------------------------------------------------------- */
+static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
+{
+    AppState *state = (AppState *)param;
+
+    while (g_worker_active) {
+        UiSnapshot s;
+        memset(&s, 0, sizeof(s));
+
+        s.recording = state->stream_running ? 1 : 0;
+        s.finished  = (!state->stream_running && state->session_complete) ? 1 : 0;
+        s.dual      = state->cfg.dual_channel;
+
+        /* Elapsed */
+        if (state->stream_running && state->start_time.QuadPart > 0
+                && state->perf_freq.QuadPart > 0) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            s.elapsed_sec = (double)(now.QuadPart - state->start_time.QuadPart)
+                            / (double)state->perf_freq.QuadPart;
+        } else if (state->last_display_elapsed > 0.0) {
+            /* Not streaming: show the last completed recording's length.
+             * Uses last_display_elapsed (not frozen_elapsed_sec) so it is
+             * not wiped by the between-entry reset.                        */
+            s.elapsed_sec = state->last_display_elapsed;
+        }
+
+        /* File size: compute from samples_written (a live counter the writer
+         * increments), NOT GetFileSizeEx. The OS write cache makes the on-disk
+         * size lag by many MB during recording, which previously made the
+         * display appear stuck. frame = 4 bytes (single) or 8 (dual).        */
+        if (state->stream_running) {
+            int frame_bytes = state->cfg.dual_channel ? 8 : 4;
+            double bytes = (double)state->samples_written * frame_bytes;
+            s.file_mb = bytes / (1024.0 * 1024.0);
+        } else if (state->last_display_file_mb >= 0) {
+            s.file_mb = (double)state->last_display_file_mb;
+        }
+
+        s.disk_free_mb = (double)state->disk_free_mb;
+
+        /* Peak dBFS - read the current peak, then reset to silence so the
+         * next interval captures a fresh peak from the callbacks. The
+         * callback only ever raises the stored value, so this read/reset is
+         * safe for a level display.                                         */
+        s.peak_a = state->peak_dbfs;
+        s.peak_b = state->peak_dbfs_b;
+        state->peak_dbfs   = -90.0f;
+        state->peak_dbfs_b = -90.0f;
+
+        s.overload_a = state->overload_tuner_a;
+        s.overload_b = state->overload_tuner_b;
+        /* Real AGC state read from the live channel-A control params. */
+        s.agc_on = (state->ch_a_params &&
+                    state->ch_a_params->ctrlParams.agc.enable
+                        != sdrplay_api_AGC_DISABLE) ? 1 : 0;
+        s.hdr_on = state->cfg.hdr_enable ? 1 : 0;
+        s.overflows  = state->overflows;
+        s.dropped    = state->zero_frames_written;
+
+        /* Ring buffer fill % */
+        if (state->ring.size > 0) {
+            SIZE_T used = ring_available(&state->ring);
+            s.ring_pct = (float)((100.0 * (double)used) / (double)state->ring.size);
+            if (s.ring_pct > 100.0f) s.ring_pct = 100.0f;
+        }
+
+        /* State text */
+        if (s.finished)
+            strncpy(s.state, "FINISHED", sizeof(s.state) - 1);
+        else if (s.recording)
+            strncpy(s.state, "RECORDING", sizeof(s.state) - 1);
+        else if (state->next_start[0])
+            strncpy(s.state, "WAITING", sizeof(s.state) - 1);
+        else
+            strncpy(s.state, "IDLE", sizeof(s.state) - 1);
+
+        strncpy(s.next, state->next_start, sizeof(s.next) - 1);
+
+        /* Scheduling status for the bottom info line. */
+        if (state->cfg.hourly_enable) {
+            snprintf(s.sched, sizeof(s.sched),
+                     "Hourly %d min%s%s%s",
+                     state->cfg.hourly_window_min,
+                     state->next_start[0] ? "  next " : "",
+                     state->next_start[0] ? state->next_start : "",
+                     state->cfg.schedule_repeat ? "  (repeat)" : "");
+        } else if (state->cfg.schedule_only && state->cfg.schedule_count > 0) {
+            snprintf(s.sched, sizeof(s.sched),
+                     "Schedule: %d entr%s%s%s%s",
+                     state->cfg.schedule_count,
+                     state->cfg.schedule_count == 1 ? "y" : "ies",
+                     state->next_start[0] ? "  next " : "",
+                     state->next_start[0] ? state->next_start : "",
+                     state->cfg.schedule_repeat ? "  (repeat)" : "");
+        } else if (state->next_start[0]) {
+            snprintf(s.sched, sizeof(s.sched), "Start at %s",
+                     state->next_start);
+        } else {
+            s.sched[0] = '\0';
+        }
+
+        if (state->cfg.dual_channel)
+            snprintf(s.freq, sizeof(s.freq), "A %.3f / B %.3f MHz",
+                     state->cfg.frequency_hz / 1e6,
+                     state->cfg.freq_b_hz / 1e6);
+        else
+            snprintf(s.freq, sizeof(s.freq), "%.3f MHz",
+                     state->cfg.frequency_hz / 1e6);
+
+        /* Coverage span = centre frequency +/- half the recorded IQ bandwidth.
+         * The recorded bandwidth equals the output sample rate.            */
+        {
+            double rate = state->cfg.expected_output_rate_hz;
+            if (rate <= 0.0) rate = state->cfg.sample_rate_hz;
+            double half = rate / 2.0;
+            double lo = state->cfg.frequency_hz - half;
+            double hi = state->cfg.frequency_hz + half;
+            if (lo < 0.0) lo = 0.0;
+            /* Show in kHz for MW, MHz once we are above ~3 MHz centre. */
+            if (state->cfg.frequency_hz < 3.0e6)
+                snprintf(s.span, sizeof(s.span), "%.0f - %.0f kHz",
+                         lo / 1e3, hi / 1e3);
+            else
+                snprintf(s.span, sizeof(s.span), "%.3f - %.3f MHz",
+                         lo / 1e6, hi / 1e6);
+        }
+
+        g_ui = s;   /* publish */
+
+        /* Repaint only the dynamic area above the log control, not the whole
+         * window. Painting behind the child log every tick caused a visible
+         * flicker. Also refresh the bottom info line + buttons region.       */
+        if (g_hwnd) {
+            RECT cr, lr;
+            GetClientRect(g_hwnd, &cr);
+            /* top region: from top down to just above the log */
+            if (g_hLog) {
+                GetWindowRect(g_hLog, &lr);
+                POINT tl = { lr.left, lr.top };
+                ScreenToClient(g_hwnd, &tl);
+                RECT top = { 0, 0, cr.right, tl.y };
+                InvalidateRect(g_hwnd, &top, FALSE);
+                /* bottom region: below the log (scheduling text) */
+                RECT bot = { 0, tl.y + (lr.bottom - lr.top), cr.right, cr.bottom };
+                InvalidateRect(g_hwnd, &bot, FALSE);
+            } else {
+                InvalidateRect(g_hwnd, NULL, FALSE);
+            }
+        }
+        /* Keep the AGC button colour in sync with the real AGC state, and
+         * disable it entirely in HDR mode (AGC not available there). */
+        if (g_hBtnAgc) {
+            EnableWindow(g_hBtnAgc, s.recording && !s.hdr_on);
+            InvalidateRect(g_hBtnAgc, NULL, FALSE);
+        }
+
+        Sleep(state->cfg.monitor_interval_ms > 0
+              ? state->cfg.monitor_interval_ms : 250);
+    }
+    return 0;
+}
 
 /* =========================================================================
  * Ring buffer implementation
@@ -525,15 +865,17 @@ static SIZE_T ring_read(RingBuffer *rb, void *dst, SIZE_T len)
  *
  * Both timestamps are UTC.
  * ========================================================================= */
+/* Forward declaration - defined later after g_state is available */
+static void get_timestamp(SYSTEMTIME *st);
+
 static void generate_output_filename(Config *cfg, int num_channels)
 {
     SYSTEMTIME st;
-    GetSystemTime(&st);
+    get_timestamp(&st);
 
     if (cfg->output_format == FORMAT_WAVVIEWDX) {
-        /* WavViewDX-raw: all metadata embedded in filename fields.
-         * Use the output sample rate (after hardware decimation), not the
-         * ADC rate - WavViewDX uses sr to calculate file duration.      */
+        /* WavViewDX parses the filename - lowercase z in dt field is required
+         * by the format specification regardless of use_utc setting.        */
         snprintf(cfg->output_file, MAX_PATH_LEN,
                  "iq_pcm16_ch%d_cf%lld_sr%lld_dt%04d%02d%02d-%02d%02d%02dz.raw",
                  num_channels,
@@ -542,6 +884,7 @@ static void generate_output_filename(Config *cfg, int num_channels)
                  st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond);
     } else if (cfg->output_format == FORMAT_SDRUNO) {
+        /* SDRuno WAV - keep Z regardless of use_utc for compatibility */
         long long freq_khz = (long long)(cfg->frequency_hz / 1000.0 + 0.5);
         char freq_str[32];
         if (fabs(cfg->frequency_hz - (double)(freq_khz * 1000)) < 1.0)
@@ -553,26 +896,26 @@ static void generate_output_filename(Config *cfg, int num_channels)
                  st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond, freq_str);
     } else if (cfg->output_format == FORMAT_SDRCONNECT) {
+        /* SDR Connect WAV - no Z suffix in this format */
         long long freq_hz = (long long)(cfg->frequency_hz + 0.5);
         snprintf(cfg->output_file, MAX_PATH_LEN,
                  "SDRconnect_IQ_%04d%02d%02d_%02d%02d%02d_%lldHZ.wav",
                  st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond, freq_hz);
     } else {
-        /* Linrad / rsp-recorder: YYYYMMDD_HHMMSSZ_<freq>kHz.raw */
+        /* Linrad: Z suffix only when use_utc = 1 */
         long long freq_khz = (long long)(cfg->frequency_hz / 1000.0 + 0.5);
         char freq_str[32];
-
         if (fabs(cfg->frequency_hz - (double)(freq_khz * 1000)) < 1.0)
             snprintf(freq_str, sizeof(freq_str), "%lldkHz", freq_khz);
         else
             snprintf(freq_str, sizeof(freq_str), "%.1fkHz",
                      cfg->frequency_hz / 1000.0);
-
         snprintf(cfg->output_file, MAX_PATH_LEN,
-                 "%04d%02d%02d_%02d%02d%02dZ_%s.raw",
+                 "%04d%02d%02d_%02d%02d%02d%s_%s.raw",
                  st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond,
+                 cfg->use_utc ? "Z" : "",
                  freq_str);
     }
 }
@@ -712,7 +1055,7 @@ typedef struct {
  * ========================================================================= */
 static int write_sdruno_header(HANDLE fh, const Config *cfg)
 {
-    SDRunoHeader hdr; DWORD written; SYSTEMTIME st; GetSystemTime(&st);
+    SDRunoHeader hdr; DWORD written; SYSTEMTIME st; get_timestamp(&st);
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.riff_id, "RIFF", 4);  hdr.riff_size = 0;
     memcpy(hdr.wave_id, "WAVE", 4);
@@ -1487,7 +1830,7 @@ static void config_set_defaults(Config *cfg)
     cfg->notch_rf_b       = -1;
     cfg->notch_dab_b      = -1;
     cfg->tuner_b_settings_set = 0;
-    cfg->start_time_utc[0]    = '\0';
+    cfg->start_time[0]    = '\0';
     cfg->spinup_enable        = 1;
     cfg->spinup_bytes         = 1024 * 1024;
     cfg->pipe_enable          = 0;
@@ -1497,6 +1840,12 @@ static void config_set_defaults(Config *cfg)
     memset(cfg->schedule, 0, sizeof(cfg->schedule));
     cfg->schedule_only   = 0;
     cfg->schedule_repeat = 0;
+    cfg->use_utc         = 1;
+    cfg->show_clock      = 1;
+    cfg->hourly_enable      = 0;
+    cfg->hourly_window_min  = 10;
+    strncpy(cfg->hourly_start, "18:00", 7);
+    strncpy(cfg->hourly_stop,  "06:00", 7);
 }
 
 static void trim(char *s)
@@ -1571,7 +1920,8 @@ static void config_load_ini(Config *cfg, const char *path)
         else if (!strcmp(key, "iq_correct_b"))   { cfg->iq_correct_b  = atoi(val); cfg->tuner_b_settings_set = 1; }
         else if (!strcmp(key, "notch_rf_b"))     { cfg->notch_rf_b    = atoi(val); cfg->tuner_b_settings_set = 1; }
         else if (!strcmp(key, "notch_dab_b"))    { cfg->notch_dab_b   = atoi(val); cfg->tuner_b_settings_set = 1; }
-        else if (!strcmp(key, "start_time_utc")) strncpy(cfg->start_time_utc, val, 15);
+        else if (!strcmp(key, "start_time") ||
+                 !strcmp(key, "start_time_utc")) strncpy(cfg->start_time, val, 15);
         else if (!strcmp(key, "spinup_enable"))        cfg->spinup_enable = atoi(val);
         else if (!strcmp(key, "spinup_bytes")) {
             /* Accept plain integers or values with KB/MB suffix,
@@ -1599,6 +1949,12 @@ static void config_load_ini(Config *cfg, const char *path)
         }
         else if (!strcmp(key, "schedule_only"))      cfg->schedule_only = atoi(val);
         else if (!strcmp(key, "schedule_repeat"))    cfg->schedule_repeat = atoi(val);
+        else if (!strcmp(key, "use_utc"))            cfg->use_utc = atoi(val);
+        else if (!strcmp(key, "show_clock"))         cfg->show_clock = atoi(val);
+        else if (!strcmp(key, "hourly_enable"))      cfg->hourly_enable = atoi(val);
+        else if (!strcmp(key, "hourly_window_min"))  cfg->hourly_window_min = atoi(val);
+        else if (!strcmp(key, "hourly_start")) strncpy(cfg->hourly_start, val, 7);
+        else if (!strcmp(key, "hourly_stop"))  strncpy(cfg->hourly_stop,  val, 7);
         /* ── Schedule entries: schedule_N_key = value ──────────────────
          * e.g. schedule_1_start_time  = 08:00:00
          *      schedule_1_duration    = 3600
@@ -1666,514 +2022,6 @@ static void config_load_ini(Config *cfg, const char *path)
     fclose(fp);
 }
 
-/* =========================================================================
- * Command-line argument parser
- * CLI values override INI config values
- * ========================================================================= */
-static void print_usage(const char *progname)
-{
-    printf(
-        "DuoDX v%s - SDRplay to Linrad raw format\n"
-        "Usage: %s [options]\n\n"
-        "Options:\n"
-        "  -P <path>      Recording path (directory, e.g. E:\\Recordings\\)\n"
-        "  -o <file>      Output file (default: recording.raw)\n"
-        "  -f <hz>        Centre frequency in Hz\n"
-        "  -F <mhz>       Centre frequency in MHz\n"
-        "  -s <hz>        Sample rate in Hz\n"
-        "  -S <msps>      Sample rate in Msps\n"
-        "  -g <db>        Gain reduction in dB (20-59)\n"
-        "  -l <state>     LNA state (0-9, device dependent)\n"
-        "  -b <khz>       IF bandwidth in kHz\n"
-        "  -i <khz>       IF frequency in kHz (0=zero-IF)\n"
-        "  -t <sec>       Recording duration in seconds (0=unlimited)\n"
-        "  -a             Enable AGC\n"
-        "  -d             Disable DC correction\n"
-        "  -q             Disable IQ correction\n"
-        "  -n             Enable RF notch filter\n"
-        "  -N             Enable DAB notch filter\n"
-        "  -2             Enable RSPduo dual channel mode\n"
-        "  -B <hz>        RSPduo Tuner B frequency in Hz (dual mode)\n"
-        "  -G <db>        Tuner B gain reduction dB (default: same as -g)\n"
-        "  -L2 <state>    Tuner B LNA state (default: same as -l)\n"
-        "  -W <HH:MM:SS>  Scheduled start time in UTC (24-hour format)\n"
-        "  -r <sec>       Ring buffer size in seconds (default: 4)\n"
-        "  -c <file>      Config file (default: duodx.ini)\n"
-        "  -L <file>      Log file\n"
-
-        "  -w <khz>       HDR bandwidth in kHz: 200, 500, 1200, or 1700 (default: 1700)\n"
-        "  -A <ant>       Antenna input: RSPdx=A/B/C  RSP2=A/B  RSPduo-T1=Hi-Z/50ohm\n"
-        "  -Z             Enable Bias-T (RSP1A, RSPduo T2, RSPdx, RSPdxR2)\n"
-        "  -M             Enable Hi-Z AM notch (RSPduo Tuner 1 Hi-Z port only)\n"
-        "  -p <ppm>       Frequency correction in PPM (0.0 = no correction)\n"
-        "  -D <serial>    Select device by serial number (default: first found)\n"
-        "  -e <n>         Software decimation factor: 1,2,4,8,16,32 (default: 1)\n"
-        "  -C <hz>        Frequency calibration offset in Hz (default: 0.0)\n"
-        "  -T <format>    Output format: linrad (default), wavviewdx, sdruno, sdrconnect\n"
-        "  -v             Verbose output\n"
-        "  -h             Show this help\n\n"
-        "Config file: INI format, key=value pairs.\n"
-        "CLI arguments override config file values.\n\n"
-        "Examples:\n"
-        "  %s -F 1.0 -S 2.0 -t 300 -o mw_recording.raw\n"
-        "  %s -F 0.702 -F 1.296 -2 -S 2.0 -o rspduo_dual.raw\n\n",
-        VERSION, progname, progname, progname);
-}
-
-static void parse_args(int argc, char **argv, Config *cfg, char *config_file)
-{
-    int i;
-    for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            print_usage(argv[0]);
-            exit(0);
-        }
-        else if (!strcmp(argv[i], "-P") && i+1 < argc)
-            strncpy(cfg->recording_path, argv[++i], MAX_PATH_LEN-1);
-        else if (!strcmp(argv[i], "-o") && i+1 < argc)
-            strncpy(cfg->output_file, argv[++i], MAX_PATH_LEN-1);
-        else if (!strcmp(argv[i], "-f") && i+1 < argc)
-            cfg->frequency_hz = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-F") && i+1 < argc)
-            cfg->frequency_hz = atof(argv[++i]) * 1e6;
-        else if (!strcmp(argv[i], "-s") && i+1 < argc)
-            cfg->sample_rate_hz = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-S") && i+1 < argc)
-            cfg->sample_rate_hz = atof(argv[++i]) * 1e6;
-        else if (!strcmp(argv[i], "-g") && i+1 < argc)
-            cfg->gain_reduction = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-l") && i+1 < argc)
-            cfg->lna_state = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-b") && i+1 < argc)
-            cfg->bw_khz = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-i") && i+1 < argc)
-            cfg->if_khz = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-t") && i+1 < argc)
-            cfg->duration_sec = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-a"))
-            cfg->agc_enable = 1;
-        else if (!strcmp(argv[i], "-d"))
-            cfg->dc_correct = 0;
-        else if (!strcmp(argv[i], "-q"))
-            cfg->iq_correct = 0;
-        else if (!strcmp(argv[i], "-n"))
-            cfg->notch_rf = 1;
-        else if (!strcmp(argv[i], "-N"))
-            cfg->notch_dab = 1;
-        else if (!strcmp(argv[i], "-2"))
-            cfg->dual_channel = 1;
-        else if (!strcmp(argv[i], "-B") && i+1 < argc)
-            cfg->freq_b_hz = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-G") && i+1 < argc)
-            { cfg->gain_reduction_b = atoi(argv[++i]); cfg->tuner_b_settings_set = 1; }
-        else if (!strcmp(argv[i], "-L2") && i+1 < argc)
-            { cfg->lna_state_b = atoi(argv[++i]); cfg->tuner_b_settings_set = 1; }
-        else if (!strcmp(argv[i], "-W") && i+1 < argc)
-            { strncpy(cfg->start_time_utc, argv[++i], 15); }
-        else if (!strcmp(argv[i], "-r") && i+1 < argc)
-            cfg->ring_buffer_sec = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-c") && i+1 < argc)
-            strncpy(config_file, argv[++i], MAX_PATH_LEN-1);
-        else if (!strcmp(argv[i], "-L") && i+1 < argc)
-            strncpy(cfg->log_file, argv[++i], MAX_PATH_LEN-1);
-        else if (!strcmp(argv[i], "-v"))
-            cfg->verbose = 1;
-        else if (!strcmp(argv[i], "-H"))
-            cfg->hdr_enable = 1;
-        else if (!strcmp(argv[i], "-b") && i+1 < argc)
-            cfg->hdr_bw_khz = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-w") && i+1 < argc)
-            strncpy(cfg->start_time_utc, argv[++i], 15);
-        else if (!strcmp(argv[i], "-A") && i+1 < argc)
-            strncpy(cfg->antenna, argv[++i], 7);
-        else if (!strcmp(argv[i], "-Z"))
-            cfg->bias_t = 1;
-        else if (!strcmp(argv[i], "-M"))
-            cfg->hiz_notch = 1;
-        else if (!strcmp(argv[i], "-p") && i+1 < argc)
-            cfg->ppm = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-D") && i+1 < argc)
-            strncpy(cfg->device_serial, argv[++i], 63);
-        else if (!strcmp(argv[i], "-e") && i+1 < argc)
-            cfg->decimation = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-T") && i+1 < argc) {
-            ++i;
-            if (!strcmp(argv[i], "wavviewdx") || !strcmp(argv[i], "WavViewDX"))
-                cfg->output_format = FORMAT_WAVVIEWDX;
-            else if (!strcmp(argv[i], "sdruno") || !strcmp(argv[i], "SDRuno"))
-                cfg->output_format = FORMAT_SDRUNO;
-            else if (!strcmp(argv[i], "sdrconnect") || !strcmp(argv[i], "SDRConnect"))
-                cfg->output_format = FORMAT_SDRCONNECT;
-            else
-                cfg->output_format = FORMAT_LINRAD;
-        }
-        else
-            LOG_WARN("Unknown argument: %s (ignored)", argv[i]);
-    }
-}
-
-/* =========================================================================
- * Signal handler
- * ========================================================================= */
-static void sig_handler(int sig)
-{
-    (void)sig;
-    LOG_INFO("Stop signal received");
-    g_running      = 0;
-    g_http_running = 0;
-}
-
-/* =========================================================================
- * Monitor thread
- *
- * Prints a single in-place status line updated every monitor_interval_ms.
- * Uses actual measured interval between updates for accurate rate display
- * (avoids showing 0.000 Msps when OS scheduling delays the thread).
- *
- * Also measures actual output sample rate over the first 4 seconds and
- * patches the Linrad header silently. All log output to the log file only
- * during recording - no LOG_INFO/LOG_WARN here to avoid scrolling the
- * status line.
- * ========================================================================= */
-static DWORD WINAPI monitor_thread_func(LPVOID param)
-{
-    AppState *state = (AppState *)param;
-
-    /* Rate measurement state */
-    LARGE_INTEGER prev_tick, now_tick;
-    LONG64 prev_received = 0, prev_written = 0;
-    LONG64 cur_received,  cur_written;
-    double rate_rx = 0.0, rate_wr = 0.0;
-    double interval_sec;
-    double elapsed;
-    double ring_fill_pct;
-    int    overflows;
-
-    /* No-signal tracking removed - dBFS colour on status bar is sufficient */
-
-    /* Sample-rate measurement window */
-    LARGE_INTEGER meas_start;
-    LONG64        meas_start_samples = 0;
-    int           meas_started = 0;
-    int           meas_done    = 0;   /* set once we have a stable measurement */
-
-    QueryPerformanceCounter(&prev_tick);
-
-    while (state->stream_running) {
-        Sleep(state->cfg.monitor_interval_ms);
-
-        if (!state->stream_running) break;
-
-        QueryPerformanceCounter(&now_tick);
-
-        /* Actual time since last update - use this for rate calculation
-         * so a delayed wake-up doesn't give a falsely low rate.         */
-        interval_sec = (double)(now_tick.QuadPart - prev_tick.QuadPart)
-                       / (double)state->perf_freq.QuadPart;
-        prev_tick = now_tick;
-
-        /* Guard against zero or absurdly short intervals */
-        if (interval_sec < 0.01) interval_sec = 0.01;
-
-        elapsed = (double)(now_tick.QuadPart - state->start_time.QuadPart)
-                  / (double)state->perf_freq.QuadPart;
-
-        cur_received = state->samples_received;
-        cur_written  = state->samples_written;
-        overflows    = state->overflows;
-
-        /* Rates based on actual elapsed interval */
-        rate_rx = (double)(cur_received - prev_received) / interval_sec / 1e6;
-        rate_wr = (double)(cur_written  - prev_written)  / interval_sec / 1e6;
-
-        prev_received = cur_received;
-        prev_written  = cur_written;
-
-        ring_fill_pct = 100.0 * (double)ring_available(&state->ring)
-                        / (double)state->ring.size;
-
-        /* ── Sanity check: log actual vs expected rate after 5s ──────────
-         * The header was written with expected_output_rate_hz at startup,
-         * so no patching is needed. We just log the measured rate once. */
-        if (!meas_done && elapsed >= 5.0 && meas_started) {
-            double meas_elapsed = (double)(now_tick.QuadPart - meas_start.QuadPart)
-                                  / (double)state->perf_freq.QuadPart;
-            if (meas_elapsed > 0.5) {
-                double measured = (double)(state->samples_received - meas_start_samples)
-                                  / meas_elapsed;
-                meas_done = 1;
-                state->actual_sample_rate   = measured;
-                state->sample_rate_measured = 1;
-                if (state->log_fp)
-                    fprintf(state->log_fp,
-                            "[INFO ] Actual output rate: %.0f sps  "
-                            "Expected: %.0f sps  ADC: %.0f sps\n",
-                            measured,
-                            state->cfg.expected_output_rate_hz,
-                            state->cfg.sample_rate_hz);
-            }
-        }
-        if (!meas_started && elapsed >= 1.0) {
-            QueryPerformanceCounter(&meas_start);
-            meas_start_samples = state->samples_received;
-            meas_started = 1;
-        }
-
-        /* ── Build and print the static status line ──────────────────────
-         * Query the console width each iteration so we never exceed it.
-         * Exceeding the console width causes Windows to auto-wrap, which
-         * breaks the \r in-place update and causes scrolling.           */
-        {
-            char status[256];
-            char extra[48] = "";
-            LONG64 zf = state->zero_frames_written;
-
-            /* Simple flag read - matches sdr_recorder approach */
-            int oa = state->overload_tuner_a;
-            int ob = state->overload_tuner_b;
-
-            int con_width = 79;  /* safe default for 80-col console */
-            int len, pad;
-
-            /* Get actual console width */
-            {
-                CONSOLE_SCREEN_BUFFER_INFO csbi;
-                if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE),
-                                               &csbi))
-                    con_width = csbi.dwSize.X - 1;
-                if (con_width < 40) con_width = 40;
-                if (con_width > 255) con_width = 255;
-            }
-
-            /* Read AGC state from the master channel (Tuner A).
-             * In RSPduo dual-tuner mode AGC is a device-level control and
-             * applies to both tuners together; the ch_b_params agc field
-             * mirrors ch_a_params because G keeps them in sync.
-             * We read only ch_a_params here to get the single authoritative
-             * state and avoid displaying contradictory T1/T2 indicators.  */
-            int agc_a = state->ch_a_params &&
-                        (state->ch_a_params->ctrlParams.agc.enable
-                         != sdrplay_api_AGC_DISABLE);
-            int agc_b = 0;  /* not used: AGC is device-level in dual mode */
-            (void)agc_b;
-
-            /* Build extra flags:
-             *   ZF (plain text) -> AGC:ON/OFF (coloured) -> OVL (coloured)
-             * AGC and OVL use separate ANSI-coloured strings rendered inside
-             * the printf calls below. GR level no longer shown on status bar.*/
-
-            if (zf > 0)
-                snprintf(extra, sizeof(extra), " ZF:%lldK", zf / 1000);
-
-            /* HDR: bright green indicator, shown only when HDR is active */
-            char hdr_col[32]   = "";
-            char hdr_plain[8]  = "";
-            if (state->cfg.hdr_enable) {
-                snprintf(hdr_col,   sizeof(hdr_col),   " \x1b[92mHDR:Enabled\x1b[97m");
-                snprintf(hdr_plain, sizeof(hdr_plain), " HDR:Enabled");
-            }
-
-            /* AGC: green when ON, bright white when OFF.
-             * Suppressed entirely when HDR is active (fixed gain path,
-             * AGC has no effect and the indicator would be misleading). */
-            char agc_col[48]   = "";
-            char agc_plain[16] = "";
-            if (!state->cfg.hdr_enable) {
-                if (agc_a) {
-                    snprintf(agc_col,   sizeof(agc_col),   " \x1b[92mAGC:ON\x1b[97m");
-                    snprintf(agc_plain, sizeof(agc_plain), " AGC:ON");
-                } else {
-                    snprintf(agc_col,   sizeof(agc_col),   " \x1b[97mAGC:OFF");
-                    snprintf(agc_plain, sizeof(agc_plain), " AGC:OFF");
-                }
-            }
-
-            /* OVL: orange, 2 stars each side, placed last */
-            char ovl_col[64]   = "";
-            char ovl_plain[32] = "";
-            if (oa || ob) {
-                const char *which = (oa && ob) ? "T1+T2" : (oa ? "T1" : "T2");
-                snprintf(ovl_col,   sizeof(ovl_col),
-                         " \x1b[38;2;255;140;0m** OVL[%s] **\x1b[97m", which);
-                snprintf(ovl_plain, sizeof(ovl_plain), " ** OVL[%s] **", which);
-            }
-
-            /* Read and reset peak dBFS each interval.
-             * pk is declared here so the print block below can use it
-             * after peak_dbfs has been reset to the sentinel -90.      */
-            {
-                float pk   = state->peak_dbfs;
-                float pk_b = state->peak_dbfs_b;
-                state->peak_dbfs   = -90.0f;  /* reset for next interval */
-                state->peak_dbfs_b = -90.0f;
-
-                /* ── No-signal tracking removed ─────────────────────────
-                 * The coloured dBFS display (green/yellow/orange/------)
-                 * provides sufficient real-time signal level feedback.   */
-
-                {
-                    int el_h = (int)elapsed / 3600;
-                    int el_m = ((int)elapsed % 3600) / 60;
-                    int el_s = (int)elapsed % 60;
-                    int el_ds = (int)(elapsed * 10.0) % 10;
-
-                    {
-                        int frame_bytes = state->cfg.dual_channel ? 8 : 4;
-                        double tot_bytes = (double)cur_written * frame_bytes;
-                        char tot_str[16];
-                        if (tot_bytes >= 1073741824.0)
-                            snprintf(tot_str, sizeof(tot_str), "%5.2fGB",
-                                     tot_bytes / 1073741824.0);
-                        else
-                            snprintf(tot_str, sizeof(tot_str), "%5.1fMB",
-                                     tot_bytes / 1048576.0);
-                        snprintf(status, sizeof(status),
-                                 "[%02d:%02d:%02d.%d] RX:%5.3fM  WR:%5.3fM  Ring:%4.1f%%  OF:%d  Tot:%s",
-                                 el_h, el_m, el_s, el_ds,
-                                 rate_rx, rate_wr,
-                                 ring_fill_pct,
-                                 overflows,
-                                 tot_str);
-                    }
-                }
-
-                /* Truncate pre to console width to prevent wrap-scrolling */
-                len = (int)strlen(status);
-                if (len > con_width) status[con_width] = '\0';
-
-                /* ── Print the status line ──────────────────────────────
-                 * Status bar is bright white.
-                 * Single mode: one dBFS field, no prefix.
-                 * Dual mode:   A:xx.xdBFS  B:xx.xdBFS, each independently
-                 *              coloured green/yellow/orange by threshold.
-                 * ──────────────────────────────────────────────────────── */
-                {
-                    HANDLE hcon  = GetStdHandle(STD_OUTPUT_HANDLE);
-                    CONSOLE_SCREEN_BUFFER_INFO csbi2;
-                    WORD orig_attr = FOREGROUND_RED | FOREGROUND_GREEN
-                                     | FOREGROUND_BLUE;
-                    WORD white_attr = FOREGROUND_RED | FOREGROUND_GREEN
-                                     | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
-
-                    if (GetConsoleScreenBufferInfo(hcon, &csbi2))
-                        orig_attr = csbi2.wAttributes;
-
-                    /* Helper: pick ANSI escape for a dBFS value */
-                    #define DBFS_ESC(v) ((v) < -12.0f ? "\x1b[96m" : \
-                                         (v) < -3.0f  ? "\x1b[93m" : \
-                                                         "\x1b[38;2;255;140;0m")
-                    /* Helper: pick 16-colour attr for a dBFS value */
-                    #define DBFS_ATTR(v) ((v) < -12.0f \
-                        ? (FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_INTENSITY) \
-                        : (v) < -3.0f \
-                            ? (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY) \
-                            : (FOREGROUND_RED | FOREGROUND_INTENSITY))
-
-                    int is_dual = state->cfg.dual_channel;
-
-                    if (g_vt_enabled) {
-                        if (!is_dual) {
-                            /* Single tuner */
-                            if (pk <= -90.0f)
-                                printf("\x1b[2K\r\x1b[97m%s  ------%s%s%s%s\x1b[0m",
-                                       status, extra, hdr_col, agc_col, ovl_col);
-                            else
-                                printf("\x1b[2K\r\x1b[97m%s  %s%+5.1fdBFS\x1b[97m%s%s%s%s\x1b[0m",
-                                       status, DBFS_ESC(pk), pk,
-                                       extra, hdr_col, agc_col, ovl_col);
-                        } else {
-                            /* Dual tuner - A: and B: fields */
-                            const char *esc_a = (pk   <= -90.0f) ? "\x1b[97m" : DBFS_ESC(pk);
-                            const char *esc_b = (pk_b <= -90.0f) ? "\x1b[97m" : DBFS_ESC(pk_b);
-                            char str_a[12], str_b[12];
-                            if (pk   <= -90.0f) snprintf(str_a, sizeof(str_a), "------");
-                            else                snprintf(str_a, sizeof(str_a), "%+5.1fdBFS", pk);
-                            if (pk_b <= -90.0f) snprintf(str_b, sizeof(str_b), "------");
-                            else                snprintf(str_b, sizeof(str_b), "%+5.1fdBFS", pk_b);
-
-                            printf("\x1b[2K\r\x1b[97m%s  A:%s%s\x1b[97m  B:%s%s\x1b[97m%s%s%s%s\x1b[0m",
-                                   status,
-                                   esc_a, str_a,
-                                   esc_b, str_b,
-                                   extra, hdr_col, agc_col, ovl_col);
-                        }
-                        fflush(stdout);
-                    } else {
-                        /* 16-colour fallback */
-                        int full_vis;
-                        if (!is_dual) {
-                            char tmp[128];
-                            if (pk > -90.0f)
-                                snprintf(tmp, sizeof(tmp),
-                                         "%s  %+5.1fdBFS%s",
-                                         status, pk, extra);
-                            else
-                                snprintf(tmp, sizeof(tmp),
-                                         "%s  ------%s",
-                                         status, extra);
-                            full_vis = (int)strlen(tmp);
-                        } else {
-                            char tmp[128];
-                            snprintf(tmp, sizeof(tmp),
-                                     "%s  A:%s  B:%s%s",
-                                     status,
-                                     pk   > -90.0f ? "xx.xdBFS" : "------",
-                                     pk_b > -90.0f ? "xx.xdBFS" : "------",
-                                     extra);
-                            full_vis = (int)strlen(tmp);
-                        }
-                        pad = con_width - full_vis;
-                        if (pad < 0) pad = 0;
-
-                        SetConsoleTextAttribute(hcon, white_attr);
-                        printf("\r%s", status);
-
-                        if (!is_dual) {
-                            if (pk > -90.0f) {
-                                SetConsoleTextAttribute(hcon, (WORD)DBFS_ATTR(pk));
-                                printf("  %+5.1fdBFS", pk);
-                                SetConsoleTextAttribute(hcon, white_attr);
-                            } else {
-                                printf("  ------");
-                            }
-                        } else {
-                            /* Tuner A */
-                            printf("  A:");
-                            if (pk > -90.0f) {
-                                SetConsoleTextAttribute(hcon, (WORD)DBFS_ATTR(pk));
-                                printf("%+5.1fdBFS", pk);
-                                SetConsoleTextAttribute(hcon, white_attr);
-                            } else {
-                                printf("------");
-                            }
-                            /* Tuner B */
-                            printf("  B:");
-                            if (pk_b > -90.0f) {
-                                SetConsoleTextAttribute(hcon, (WORD)DBFS_ATTR(pk_b));
-                                printf("%+5.1fdBFS", pk_b);
-                                SetConsoleTextAttribute(hcon, white_attr);
-                            } else {
-                                printf("------");
-                            }
-                        }
-                        printf("%s%s%s%s%*s", extra, hdr_plain, agc_plain, ovl_plain, pad, "");
-                        fflush(stdout);
-                        SetConsoleTextAttribute(hcon, orig_attr);
-                    }
-                    #undef DBFS_ESC
-                    #undef DBFS_ATTR
-                }
-            }
-        }
-
-        if (state->writer_error) {
-            g_running = 0;
-            break;
-        }
-    }
-
-    return 0;
-}
 
 /* =========================================================================
  * SDRplay IF bandwidth selector
@@ -2711,13 +2559,13 @@ static void apply_notch_filters(AppState *state)
  * Displays a countdown line updated every second.
  * Returns 0 if cancelled (Ctrl+C), 1 if target time reached.
  * ========================================================================= */
-static int time_already_passed_today(const char *time_str)
+static int time_already_passed(const char *time_str)
 {
     int target_h, target_m, target_s;
     if (sscanf(time_str, "%d:%d:%d", &target_h, &target_m, &target_s) != 3)
         return 0;
     SYSTEMTIME st;
-    GetSystemTime(&st);
+    get_timestamp(&st);
     int now_secs    = st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
     int target_secs = target_h * 3600 + target_m  * 60 + target_s;
     return (now_secs > target_secs);
@@ -2729,20 +2577,20 @@ static int time_already_passed_today(const char *time_str)
  * between_recordings=1: start immediately if time passed within 5 minutes
  *                        (previous recording slightly overran). Otherwise
  *                        wait until tomorrow.                               */
-static int wait_until_utc(const char *time_str, int between_recordings)
+static int wait_until_time(const char *time_str, int between_recordings)
 {
     int target_h, target_m, target_s;
     if (sscanf(time_str, "%d:%d:%d", &target_h, &target_m, &target_s) != 3) {
-        LOG_ERROR("Invalid start_time_utc format '%s' - expected HH:MM:SS", time_str);
+        LOG_ERROR("Invalid start_time format '%s' - expected HH:MM:SS", time_str);
         return 0;
     }
-    LOG_INFO("Scheduled start: waiting until %02d:%02d:%02dZ",
+    LOG_INFO("Scheduled start: waiting until %02d:%02d:%02d",
              target_h, target_m, target_s);
 
     while (g_running) {
         SYSTEMTIME st;
         int now_secs, target_secs, diff;
-        GetSystemTime(&st);
+        get_timestamp(&st);
         now_secs    = st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
         target_secs = target_h * 3600 + target_m  * 60 + target_s;
         diff = target_secs - now_secs;
@@ -2757,18 +2605,15 @@ static int wait_until_utc(const char *time_str, int between_recordings)
         }
 
         if (diff <= 0) {
-            printf("\n");
             LOG_INFO("Scheduled start time reached");
             return 1;
         }
 
-        printf("\r\x1b[93m  Waiting for scheduled start %02d:%02d:%02dZ - %02d:%02d:%02d remaining  \x1b[0m ",
-               target_h, target_m, target_s,
-               diff / 3600, (diff % 3600) / 60, diff % 60);
-        fflush(stdout);
+        /* GUI build: countdown shown via g_state.next_start in status bar */
+        snprintf(g_state.next_start, sizeof(g_state.next_start),
+                 "%02d:%02d:%02d", target_h, target_m, target_s);
         Sleep(1000);
     }
-    printf("\n");
     return 0;
 }
 
@@ -2848,123 +2693,6 @@ static void apply_schedule_entry(AppState *state, const ScheduleEntry *e)
         strncpy(state->cfg.output_file, DEFAULT_OUTPUT_FILE, MAX_PATH_LEN - 1);
 }
 
-
-/* =========================================================================
- * Keyboard input thread
- *
- * Runs during recording. Reads keypresses without blocking using _kbhit()
- * and applies gain changes via sdrplay_api_Update() on the live stream.
- *
- * Key bindings:
- *   G  - Toggle AGC on/off. On disable, restores INI gain_reduction values.
- *        In dual-tuner mode AGC is device-level and applies to both tuners.
- *
- * Gain stays within the valid SDRplay range (20-59 dB).
- * Changes are logged to the log file (suppressed from console during
- * recording).
- * ========================================================================= */
-static DWORD WINAPI keyboard_thread_func(LPVOID param)
-{
-    AppState *state = (AppState *)param;
-    int is_dual = state->cfg.dual_channel;
-
-    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD orig_in_mode = 0;
-    BOOL  got_mode = GetConsoleMode(hin, &orig_in_mode);
-    if (got_mode)
-        SetConsoleMode(hin, orig_in_mode
-                       & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
-
-    while (g_recording && g_running) {
-        Sleep(50);
-        if (!_kbhit()) continue;
-
-        int ch = _getch();
-        if (!g_recording || !g_running) break;
-        int key = (ch >= 'a' && ch <= 'z') ? ch - 32 : ch;
-
-        if (key == 'G') {
-            if (state->cfg.hdr_enable) {
-                LOG_INFO("AGC control disabled in HDR mode (fixed gain path).");
-                continue;
-            }
-            int cur_agc = state->ch_a_params->ctrlParams.agc.enable;
-            int new_agc = (cur_agc == sdrplay_api_AGC_DISABLE)
-                          ? sdrplay_api_AGC_CTRL_EN
-                          : sdrplay_api_AGC_DISABLE;
-
-            state->ch_a_params->ctrlParams.agc.enable = new_agc;
-            if (is_dual && state->ch_b_params)
-                state->ch_b_params->ctrlParams.agc.enable = new_agc;
-
-            sdrplay_api_TunerSelectT t = is_dual
-                ? sdrplay_api_Tuner_Both : sdrplay_api_Tuner_A;
-
-            if (new_agc == sdrplay_api_AGC_DISABLE) {
-                /* Write INI gain values into the structs before the Update
-                 * so that AGC-off and gain-restore are sent in one combined
-                 * call. Two separate Update calls (AGC-off then gain) cause
-                 * the API to pause or restart the stream twice, which drops
-                 * samples and produces a shorter-than-expected recording.  */
-                int gr_a = state->cfg.gain_reduction;
-                int gr_b = (state->cfg.gain_reduction_b >= 0)
-                           ? state->cfg.gain_reduction_b
-                           : state->cfg.gain_reduction;
-                state->ch_a_params->tunerParams.gain.gRdB = gr_a;
-                if (is_dual && state->ch_b_params)
-                    state->ch_b_params->tunerParams.gain.gRdB = gr_b;
-
-                /* Single Update combining AGC-off and gain restoration */
-                sdrplay_api_ErrT err = sdrplay_api_Update(
-                    state->device.dev, t,
-                    (sdrplay_api_ReasonForUpdateT)
-                        (sdrplay_api_Update_Ctrl_Agc |
-                         sdrplay_api_Update_Tuner_Gr),
-                    sdrplay_api_Update_Ext1_None);
-                if (err == sdrplay_api_Success) {
-                    if (is_dual)
-                        LOG_INFO("AGC off - T1=%d dB  T2=%d dB", gr_a, gr_b);
-                    else
-                        LOG_INFO("AGC off - GR=%d dB", gr_a);
-                } else {
-                    /* Revert on failure */
-                    state->ch_a_params->ctrlParams.agc.enable = cur_agc;
-                    if (is_dual && state->ch_b_params)
-                        state->ch_b_params->ctrlParams.agc.enable = cur_agc;
-                    LOG_WARN("AGC off failed: %s",
-                             sdrplay_api_GetErrorString(err));
-                }
-            } else {
-                sdrplay_api_ErrT err = sdrplay_api_Update(
-                    state->device.dev, t,
-                    sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
-                if (err == sdrplay_api_Success) {
-                    LOG_INFO(is_dual ? "AGC on (both tuners)" : "AGC on");
-                } else {
-                    state->ch_a_params->ctrlParams.agc.enable = cur_agc;
-                    if (is_dual && state->ch_b_params)
-                        state->ch_b_params->ctrlParams.agc.enable = cur_agc;
-                    LOG_WARN("AGC on failed: %s",
-                             sdrplay_api_GetErrorString(err));
-                }
-            }
-        }
-    }
-
-    if (got_mode)
-        SetConsoleMode(hin, orig_in_mode);
-    return 0;
-}
-
-/* =========================================================================
- * Post-recording verification
- *
- * Reopens the output file after recording completes, reads the Linrad header
- * to extract sample rate and channel count, then compares the actual file
- * size against the expected size. Discrepancies indicate truncation, write
- * errors, or overflow gaps. Reports via LOG_OK (match) or LOG_WARN (mismatch).
- * No-op for WavViewDX format (no header to read sample rate from).
- * ========================================================================= */
 static void verify_recording(const Config *cfg, LONG64 samples_written)
 {
     if (cfg->output_format == FORMAT_WAVVIEWDX) {
@@ -3064,9 +2792,13 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
     int64_t expected_total   = header_bytes + expected_data;
     int64_t diff             = file_size.QuadPart - expected_total;
 
-    int exp_h = (int)actual_duration / 3600;
-    int exp_m = ((int)actual_duration % 3600) / 60;
-    int exp_s = (int)actual_duration % 60;
+    /* Round (not truncate) the reported total: a 40 s recording captures very
+     * slightly under 40 s of samples (the loop stops at the threshold), so
+     * truncation would display 39. Rounding restores the requested figure. */
+    long total_s = (long)(actual_duration + 0.5);
+    int exp_h = (int)(total_s / 3600);
+    int exp_m = (int)((total_s % 3600) / 60);
+    int exp_s = (int)(total_s % 60);
 
     LOG_INFO("Verifying file: %s", cfg->output_file);
 
@@ -3131,11 +2863,16 @@ static DWORD WINAPI http_worker(LPVOID param)
     int    dual       = state->cfg.dual_channel;
 
     LONG64 file_bytes = 0;
-    if (state->out_file != INVALID_HANDLE_VALUE) {
-        LARGE_INTEGER fs;
-        if (GetFileSizeEx(state->out_file, &fs)) file_bytes = fs.QuadPart;
+    if (state->stream_running) {
+        /* Use the live samples_written counter (GetFileSizeEx lags badly
+         * during recording due to OS write caching).                       */
+        int frame_bytes = state->cfg.dual_channel ? 8 : 4;
+        file_bytes = state->samples_written * frame_bytes;
     } else if (state->frozen_file_mb > 0) {
         file_bytes = state->frozen_file_mb * 1024LL * 1024LL;
+    } else if (state->out_file != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER fs;
+        if (GetFileSizeEx(state->out_file, &fs)) file_bytes = fs.QuadPart;
     }
     double file_mb = (double)file_bytes / (1024.0 * 1024.0);
 
@@ -3301,11 +3038,11 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
     int port = state->cfg.http_port;
 
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        printf("[HTTP] WSAStartup failed (%d)\n", WSAGetLastError()); fflush(stdout); return 1;
+        LOG_WARN("[HTTP] WSAStartup failed (%d)", WSAGetLastError()); return 1;
     }
     listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == INVALID_SOCKET) {
-        printf("[HTTP] socket() failed (%d)\n", WSAGetLastError()); fflush(stdout); WSACleanup(); return 1;
+        LOG_WARN("[HTTP] socket() failed (%d)", WSAGetLastError()); WSACleanup(); return 1;
     }
     { int yes=1; setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes)); }
     memset(&addr, 0, sizeof(addr));
@@ -3313,17 +3050,17 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((u_short)port);
     if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        printf("[HTTP] bind() on port %d failed (%d)\n", port, WSAGetLastError());
+        LOG_WARN("[HTTP] bind() on port %d failed (%d)", port, WSAGetLastError());
         fflush(stdout); closesocket(listen_sock); WSACleanup(); return 1;
     }
     if (listen(listen_sock, 8) != 0) {
-        printf("[HTTP] listen() failed (%d)\n", WSAGetLastError());
+        LOG_WARN("[HTTP] listen() failed (%d)", WSAGetLastError());
         fflush(stdout); closesocket(listen_sock); WSACleanup(); return 1;
     }
     { u_long nb=1; ioctlsocket(listen_sock, FIONBIO, &nb); }
 
     Sleep(100);  /* brief delay so message doesn't interrupt countdown line */
-    printf("\n[HTTP] Status server listening on port %d\n", port); fflush(stdout);
+    LOG_INFO("[HTTP] Status server listening on port %d", port);
     g_http_ready = 1;
 
     while (g_http_running) {
@@ -3333,7 +3070,7 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
         if (client_sock == INVALID_SOCKET) {
             int err = WSAGetLastError();
             if (err != WSAEWOULDBLOCK) {
-                printf("[HTTP] accept() error %d - listen socket may have closed\n", err);
+                LOG_WARN("[HTTP] accept() error %d - listen socket may have closed", err);
                 fflush(stdout);
                 break;
             }
@@ -3352,21 +3089,125 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
     return 0;
 }
 
-/* Forward declarations for functions defined after main() */
-static DWORD WINAPI keyboard_thread_func(LPVOID param);
-static void         verify_recording(const Config *cfg, LONG64 samples_written);
-static DWORD WINAPI http_worker(LPVOID param);
-static DWORD WINAPI http_status_thread_func(LPVOID param);
+/* =========================================================================
+ * Hourly recording mode helpers
+ * ========================================================================= */
 
-int main(int argc, char **argv)
+/* Parse HH:MM string into total minutes since midnight. Returns -1 on error */
+static int hhmm_to_min(const char *s)
 {
+    int h, m;
+    if (sscanf(s, "%d:%d", &h, &m) != 2) return -1;
+    if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+    return h * 60 + m;
+}
+
+/* Current time as minutes since midnight */
+/* Get current time, using UTC or local depending on config */
+static void get_timestamp(SYSTEMTIME *st)
+{
+    if (g_state.cfg.use_utc)
+        GetSystemTime(st);
+    else
+        GetLocalTime(st);
+}
+
+static int now_min(void)
+{
+    SYSTEMTIME st;
+    get_timestamp(&st);
+    return st.wHour * 60 + st.wMinute;
+}
+
+/* Current time as seconds since midnight */
+static int now_sec(void)
+{
+    SYSTEMTIME st;
+    get_timestamp(&st);
+    return st.wHour * 3600 + st.wMinute * 60 + st.wSecond;
+}
+
+/* Return 1 if current local time is within the hourly session window
+ * [start_min, stop_min). Handles overnight windows (stop < start).  */
+static int hourly_in_session(int start_min, int stop_min)
+{
+    int now = now_min();
+    if (stop_min > start_min)
+        return (now >= start_min && now < stop_min);
+    else  /* overnight: e.g. 17:00 to 05:00 */
+        return (now >= start_min || now < stop_min);
+}
+
+/* Wait until the next hourly recording start (HH:00 - half_win_sec).
+ * Returns 1 when the time has arrived, 0 if g_running went to 0.
+ *
+ * Rules:
+ *  - If we are currently inside a pre-record window AND it has just
+ *    started (i.e. we haven't missed more than 30 seconds of it),
+ *    start immediately.
+ *  - Otherwise wait until the next HH:00 - half_win_sec.
+ */
+static int hourly_wait_for_next(int half_win_sec)
+{
+    while (g_running) {
+        int cur_sec  = now_sec();
+        int now_min_val  = cur_sec / 60;
+        int sec_past = cur_sec % 3600;   /* seconds past the last hour mark */
+        int pre_sec  = 3600 - half_win_sec; /* seconds past hour when pre-rec starts */
+
+        /* Are we inside the pre-record window right now?
+         * Window runs from (HH:00 - half_win_sec) to (HH:00 + half_win_sec)
+         * i.e. sec_past >= pre_sec  OR  sec_past < half_win_sec            */
+        if (sec_past >= pre_sec) {
+            /* In the pre-window (e.g. 12:55-13:00) - start immediately */
+            LOG_INFO("Hourly: starting recording window at %02d:%02d",
+                     now_min_val / 60, now_min_val % 60);
+            return 1;
+        }
+        if (sec_past < half_win_sec) {
+            /* In the post-window (e.g. 13:00-13:05) - start immediately */
+            LOG_INFO("Hourly: starting recording window at %02d:%02d",
+                     now_min_val / 60, now_min_val % 60);
+            return 1;
+        }
+        /* Between windows - wait for next pre-record start */
+
+        /* Calculate seconds until next pre-record start */
+        int secs_to_next;
+        if (sec_past < pre_sec)
+            secs_to_next = pre_sec - sec_past;
+        else
+            secs_to_next = 3600 - sec_past + pre_sec;
+
+        /* Calculate the pre-record window start time (HH:MM:SS) */
+        int top_sec = (cur_sec + secs_to_next) % 86400;
+        int disp_h  = top_sec / 3600;
+        int disp_m  = (top_sec % 3600) / 60;
+        int disp_s  = top_sec % 60;
+
+        /* GUI build: progress shown via g_state.next_start in status bar */
+        (void)disp_h; (void)disp_m; (void)disp_s;
+
+        /* Update next_start for HTTP dashboard - show the hour boundary */
+        int hour_boundary = ((disp_h * 60 + disp_m + (half_win_sec / 60)) % (24 * 60));
+        snprintf(g_state.next_start, sizeof(g_state.next_start),
+                 "%02d:%02d:00",
+                 hour_boundary / 60,
+                 hour_boundary % 60);
+
+        Sleep(1000);
+    }
+    return 0;
+}
+
+static DWORD WINAPI recording_worker(LPVOID param)
+{
+    (void)param;
     sdrplay_api_ErrT          err;
     sdrplay_api_DeviceT       devices[6];
     unsigned int              num_devices = 0;
     sdrplay_api_CallbackFnsT  callbacks;
-    char                      config_file[MAX_PATH_LEN] = CONFIG_FILE;
-    HANDLE                    monitor_thread  = NULL;
-    HANDLE                    keyboard_thread = NULL;
+    char                     *config_file = g_config_file;
     HANDLE                    http_thread     = NULL;
     int                       sched_idx       = 0;   /* current schedule entry */
     int                       rc = 0;
@@ -3375,45 +3216,58 @@ int main(int argc, char **argv)
     char                      device_name[64] = "Unknown";
     unsigned int              i;
 
-    printf("\n");
-    printf("  DuoDX  v%s  (c) 2026 Dave Headland\n", VERSION);
-    printf("  SDR recorder for MW/HF DXing with SDRplay hardware\n");
-    printf("========================================\n");
-    printf("\n");
-
-    /* Enable ANSI/VT escape sequence processing if the console supports it.
-     * Available on Windows 10 1511+ and Windows Terminal. Graceful no-op
-     * if unavailable - we fall back to SetConsoleTextAttribute instead.  */
-    {
-        HANDLE hcon = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD mode = 0;
-        if (GetConsoleMode(hcon, &mode)) {
-            if (SetConsoleMode(hcon,
-                    mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-                g_vt_enabled = 1;
-        }
-    }
+    /* Fresh run: clear the stop flags so repeated Start presses work. */
+    g_running      = 1;
+    g_http_running = 1;
+    g_http_ready   = 0;
 
     /* Initialise global state */
     memset(&g_state, 0, sizeof(g_state));
     g_state.out_file         = INVALID_HANDLE_VALUE;
     g_state.pipe_handle      = INVALID_HANDLE_VALUE;
     g_state.frozen_file_mb   = -1;
+    g_state.last_display_file_mb = -1;
+    g_state.last_display_elapsed = 0.0;
     InitializeCriticalSection(&g_state.dual_lock);
 
     QueryPerformanceFrequency(&g_state.perf_freq);
 
-    /* Load defaults, then INI config, then CLI args (in that order) */
+    /* Load defaults then INI config (no CLI args in the GUI build). */
     config_set_defaults(&g_state.cfg);
-
-    /* First pass on CLI args just to find -c config file override */
-    for (i = 1; i < (unsigned int)argc - 1; i++) {
-        if (!strcmp(argv[i], "-c"))
-            strncpy(config_file, argv[i+1], MAX_PATH_LEN-1);
-    }
-
     config_load_ini(&g_state.cfg, config_file);
-    parse_args(argc, argv, &g_state.cfg, config_file);
+
+    LOG_INFO("DuoDX GUI v%s  (c) 2026 Dave Headland", VERSION);
+    LOG_INFO("Config file: %s", config_file);
+
+    /* Keep the GUI clock in step with this session's config. */
+    g_clock_show = g_state.cfg.show_clock;
+    g_clock_utc  = g_state.cfg.use_utc;
+
+    /* Report free space on the target drive up front, so the display shows a
+     * real value immediately instead of 0 MB until the first writer check.  */
+    {
+        ULARGE_INTEGER free_bytes;
+        char dir_path[MAX_PATH] = ".";
+        const char *src = g_state.cfg.recording_path[0]
+                          ? g_state.cfg.recording_path
+                          : g_state.cfg.output_file;
+        const char *last_sep = NULL, *p = src;
+        for (; *p; p++) if (*p == '\\' || *p == '/') last_sep = p;
+        if (g_state.cfg.recording_path[0]) {
+            strncpy(dir_path, g_state.cfg.recording_path, sizeof(dir_path) - 1);
+        } else if (last_sep) {
+            size_t len = (size_t)(last_sep - src) + 1;
+            if (len < sizeof(dir_path)) { memcpy(dir_path, src, len); dir_path[len] = '\0'; }
+        }
+        if (GetDiskFreeSpaceExA(dir_path, &free_bytes, NULL, NULL)) {
+            LONG64 free_mb = (LONG64)(free_bytes.QuadPart / (1024ULL * 1024ULL));
+            InterlockedExchange64(&g_state.disk_free_mb, free_mb);
+            if (free_mb >= 1024)
+                LOG_INFO("Free space on target drive: %.1f GB", free_mb / 1024.0);
+            else
+                LOG_INFO("Free space on target drive: %lld MB", (long long)free_mb);
+        }
+    }
 
     /* Open log file if specified */
     if (g_state.cfg.log_file[0]) {
@@ -3460,8 +3314,8 @@ int main(int argc, char **argv)
         else
             LOG_INFO("  Duration       : unlimited (Ctrl+C to stop)");
     }
-    if (g_state.cfg.start_time_utc[0])
-        LOG_INFO("  Scheduled start: %s UTC", g_state.cfg.start_time_utc);
+    if (g_state.cfg.start_time[0])
+        LOG_INFO("  Scheduled start: %s", g_state.cfg.start_time);
     if (g_state.cfg.dual_channel) {
         /* Tuner 1 can be Hi-Z or 50 ohm; Tuner 2 is always 50 ohm, no selection */
         const char *t1_port =
@@ -3497,6 +3351,8 @@ int main(int argc, char **argv)
     if (g_state.cfg.decimation > 1)
         LOG_INFO("  SW decimation  : /%d", g_state.cfg.decimation);
     LOG_INFO("  Ring buffer    : %d seconds", g_state.cfg.ring_buffer_sec);
+    LOG_INFO("  Time mode      : %s (scheduler, log and filenames)",
+             g_state.cfg.use_utc ? "UTC" : "Local time");
 
     /* Validate parameter combination before touching hardware */
     if (!validate_config(&g_state.cfg)) {
@@ -3534,17 +3390,17 @@ int main(int argc, char **argv)
              * user. The wait loop will automatically roll over to tomorrow
              * via the midnight wrap (diff < -43200 path). We force this by
              * checking here and logging clearly so it is not confusing.    */
-            if (time_already_passed_today(e->start_time))
+            if (time_already_passed(e->start_time))
                 LOG_INFO("schedule_only: schedule_1 start time %s has passed "
                          "today - waiting until tomorrow.", e->start_time);
-            strncpy(g_state.cfg.start_time_utc, e->start_time,
-                    sizeof(g_state.cfg.start_time_utc)-1);
+            strncpy(g_state.cfg.start_time, e->start_time,
+                    sizeof(g_state.cfg.start_time)-1);
             /* Pre-populate next_start so the HTTP dashboard shows the
              * waiting time before the first recording begins.          */
             strncpy(g_state.next_start, e->start_time,
                     sizeof(g_state.next_start)-1);
             LOG_INFO("schedule_only: will wait for start time %s",
-                     g_state.cfg.start_time_utc);
+                     g_state.cfg.start_time);
         } else {
             LOG_WARN("schedule_only: schedule_1 has no start_time set - "
                      "recording will start immediately.");
@@ -3556,9 +3412,7 @@ int main(int argc, char **argv)
         g_state.cfg.schedule_count--;
     }
 
-    /* Signal handler */
-    signal(SIGINT,  sig_handler);
-    signal(SIGTERM, sig_handler);
+    /* GUI build: Stop button / window close set g_running=0 (no signals). */
 
     /* ------------------------------------------------------------------ */
     /* Step 1: Open the SDRplay API                                        */
@@ -3780,9 +3634,81 @@ int main(int argc, char **argv)
 
     /* ------------------------------------------------------------------ */
     /* Step 5b: Scheduled start / pre-recording delay + recording loop    */
-    /* If [schedule] entries are defined, iterate through them. Otherwise */
-    /* run a single recording using the top-level config settings.        */
     /* ------------------------------------------------------------------ */
+
+    /* Hourly mode: validate settings and set duration */
+    if (g_state.cfg.hourly_enable) {
+        int start_min = hhmm_to_min(g_state.cfg.hourly_start);
+        int stop_min  = hhmm_to_min(g_state.cfg.hourly_stop);
+        if (start_min < 0 || stop_min < 0) {
+            LOG_ERROR("hourly_start or hourly_stop invalid format "
+                      "(expected HH:MM).");
+            rc = 1;
+            goto cleanup_device;
+        }
+        if (g_state.cfg.hourly_window_min < 2 ||
+                g_state.cfg.hourly_window_min > 59) {
+            LOG_ERROR("hourly_window_min must be between 2 and 59.");
+            rc = 1;
+            goto cleanup_device;
+        }
+        /* Override duration_sec and clear schedule entries */
+        g_state.cfg.duration_sec    = g_state.cfg.hourly_window_min * 60;
+        g_state.cfg.schedule_count  = 0;
+        g_state.cfg.start_time[0] = '\0';
+        LOG_INFO("Hourly mode: %d minute window, session %s-%s",
+                 g_state.cfg.hourly_window_min,
+                 g_state.cfg.hourly_start,
+                 g_state.cfg.hourly_stop);
+    }
+
+hourly_next:
+    if (g_state.cfg.hourly_enable) {
+        int start_min    = hhmm_to_min(g_state.cfg.hourly_start);
+        int stop_min     = hhmm_to_min(g_state.cfg.hourly_stop);
+        int half_win_sec = (g_state.cfg.hourly_window_min * 60) / 2;
+
+        /* Check if we are within the nightly session window.
+         * Recordings start half_win_sec before the hour, so the effective
+         * session open time is hourly_start minus half the window.
+         * e.g. session 13:00, 10-min window: first recording starts 12:55 */
+        /* Use seconds arithmetic to avoid rounding with odd window sizes
+         * e.g. 5-min window: half=150s, effective start = HH:57:30 not HH:58 */
+        int start_sec_midnight = start_min * 60 - half_win_sec;
+        if (start_sec_midnight < 0) start_sec_midnight += 86400;
+        int eff_start_min = start_sec_midnight / 60; /* floor to minute for session check */
+        int eff_stop_min  = stop_min;
+
+        if (!hourly_in_session(eff_start_min, eff_stop_min)) {
+            /* Outside session - wait using seconds precision for accuracy */
+            int eff_start_sec = start_min * 60 - half_win_sec;
+            if (eff_start_sec < 0) eff_start_sec += 86400;
+            LOG_INFO("Hourly: waiting for first recording window at %02d:%02d:%02d",
+                     eff_start_sec / 3600, (eff_start_sec % 3600) / 60,
+                     eff_start_sec % 60);
+            while (g_running) {
+                int cur  = now_sec();
+                int diff = eff_start_sec - cur;
+                if (diff < 0) diff += 86400;
+                if (diff == 0) break;
+                snprintf(g_state.next_start, sizeof(g_state.next_start),
+                         "%02d:%02d:%02d",
+                         eff_start_sec / 3600, (eff_start_sec % 3600) / 60,
+                         eff_start_sec % 60);
+                Sleep(1000);
+            }
+            if (!g_running) { rc = 0; goto cleanup_device; }
+        }
+
+        /* Wait for next hour pre-record window.
+         * If we just entered the session at the top of an hour and are
+         * already within the pre-record window, start immediately.     */
+        if (!hourly_wait_for_next(half_win_sec)) {
+            rc = 0;
+            goto cleanup_device;
+        }
+    }
+
 repeat_schedule:
     do {
         /* Apply schedule entry if we have one */
@@ -3793,7 +3719,7 @@ repeat_schedule:
             apply_schedule_entry(&g_state, e);
             /* Wait for this entry's start time if specified */
             if (e->start_time[0]) {
-                if (!wait_until_utc(e->start_time, 1)) {
+                if (!wait_until_time(e->start_time, 1)) {
                     rc = 0;
                     goto cleanup_writer;
                 }
@@ -3801,8 +3727,8 @@ repeat_schedule:
         } else {
             /* First (or only) recording - use top-level scheduled start.
              * Never start immediately if time has passed (allow_immediate=0). */
-            if (g_state.cfg.start_time_utc[0]) {
-                if (!wait_until_utc(g_state.cfg.start_time_utc, 0)) {
+            if (g_state.cfg.start_time[0]) {
+                if (!wait_until_time(g_state.cfg.start_time, 0)) {
                     rc = 0;
                     goto cleanup_device;
                 }
@@ -4095,8 +4021,7 @@ repeat_schedule:
     }
 
     g_state.stream_running = 1;
-    printf("\n");          /* blank line - status bar occupies this line */
-    g_recording = 1;  /* suppress console LOG output during recording */
+    g_recording = 1;  /* legacy flag; harmless in GUI build */
     QueryPerformanceCounter(&g_state.start_time);
     g_state.next_start[0] = '\0';  /* clear waiting indicator now recording */
 
@@ -4135,19 +4060,20 @@ repeat_schedule:
     LOG_INFO("Streaming started. Press Ctrl+C to stop.");
 
     /* ------------------------------------------------------------------ */
-    /* Step 9: Start monitor thread                                        */
+    /* Step 9: GUI status labels are updated by gui_monitor_thread_func,   */
+    /* which is started once in WinMain for the whole session. AGC is      */
+    /* toggled via the AGC button (serviced in the wait loop below).       */
     /* ------------------------------------------------------------------ */
-    monitor_thread = CreateThread(NULL, 0, monitor_thread_func,
-                                  &g_state, 0, NULL);
-
-    keyboard_thread = CreateThread(NULL, 0, keyboard_thread_func,
-                                   &g_state, 0, NULL);
-    LOG_INFO("Keys: G=AGC on/off");
+    LOG_INFO("Streaming. Use Stop to end, AGC to toggle gain control.");
 
     /* ------------------------------------------------------------------ */
     /* Step 10: Main wait loop                                             */
     /* ------------------------------------------------------------------ */
     while (g_running && !g_state.writer_error) {
+        if (g_agc_toggle_req) {
+            g_agc_toggle_req = 0;
+            gui_apply_agc_toggle(&g_state);
+        }
         if (g_state.cfg.duration_sec > 0) {
             LARGE_INTEGER now;
             double elapsed;
@@ -4181,6 +4107,12 @@ repeat_schedule:
                 (double)(now.QuadPart - g_state.start_time.QuadPart)
                 / (double)g_state.perf_freq.QuadPart;
     }
+    /* GUI display copies that survive the between-entry resets, so the
+     * elapsed/file readouts keep the last completed recording's values. */
+    if (g_state.frozen_elapsed_sec > 0.0)
+        g_state.last_display_elapsed = g_state.frozen_elapsed_sec;
+    if (g_state.frozen_file_mb >= 0)
+        g_state.last_display_file_mb = g_state.frozen_file_mb;
     /* Only mark session complete if this is the last recording —
      * i.e. no more schedule entries remain after this one.        */
     g_state.session_complete = (sched_idx >= g_state.cfg.schedule_count) ? 1 : 0;
@@ -4218,18 +4150,7 @@ repeat_schedule:
         g_state.next_start,
         (long long)g_state.samples_received,
         (long long)g_state.samples_written);
-    printf("\n");    /* end the status line */
     LOG_INFO("Stopping stream...");
-
-    if (keyboard_thread) {
-        WaitForSingleObject(keyboard_thread, 500);
-        CloseHandle(keyboard_thread);
-    }
-
-    if (monitor_thread) {
-        WaitForSingleObject(monitor_thread, 2000);
-        CloseHandle(monitor_thread);
-    }
 
     sdrplay_api_Uninit(g_state.device.dev);
 
@@ -4305,16 +4226,6 @@ repeat_schedule:
         /* Stop current stream */
         g_recording = 0;
         g_state.stream_running = 0;
-        if (keyboard_thread) {
-            WaitForSingleObject(keyboard_thread, 500);
-            CloseHandle(keyboard_thread);
-            keyboard_thread = NULL;
-        }
-        if (monitor_thread) {
-            WaitForSingleObject(monitor_thread, 2000);
-            CloseHandle(monitor_thread);
-            monitor_thread = NULL;
-        }
         sdrplay_api_Uninit(g_state.device.dev);
 
         /* Drain and reset ring buffer */
@@ -4368,6 +4279,32 @@ repeat_schedule:
              && sched_idx <= g_state.cfg.schedule_count);
 
     /* ------------------------------------------------------------------ */
+    /* Hourly mode: loop back for next recording if still in session      */
+    /* ------------------------------------------------------------------ */
+    if (g_running && !g_state.writer_error && !g_state.disk_stop
+            && g_state.cfg.hourly_enable) {
+
+        /* Reset counters for next recording */
+        g_state.samples_received    = 0;
+        g_state.samples_written     = 0;
+        g_state.zero_frames_written = 0;
+        g_state.overflows           = 0;
+        g_state.peak_dbfs           = -90.0f;
+        g_state.peak_dbfs_b         = -90.0f;
+        g_state.writer_error        = 0;
+        g_state.disk_stop           = 0;
+        g_state.disk_warn_issued    = 0;
+        g_state.disk_free_mb        = 0;
+        g_state.frozen_file_mb      = -1;
+        g_state.frozen_elapsed_sec  = 0.0;
+        g_state.session_complete    = 0;
+        g_state.start_time.QuadPart = 0;
+        ring_reset(&g_state.ring);
+
+        goto hourly_next;
+    }
+
+    /* ------------------------------------------------------------------ */
     /* schedule_repeat: if enabled and no errors, reload schedule and      */
     /* restart from schedule_1 for the next day.                           */
     /* ------------------------------------------------------------------ */
@@ -4411,11 +4348,11 @@ repeat_schedule:
                 strncpy(g_state.cfg.antenna, e->antenna,
                         sizeof(g_state.cfg.antenna)-1);
             if (e->start_time[0]) {
-                if (time_already_passed_today(e->start_time))
+                if (time_already_passed(e->start_time))
                     LOG_INFO("schedule_repeat: waiting until tomorrow for %s",
                              e->start_time);
-                strncpy(g_state.cfg.start_time_utc, e->start_time,
-                        sizeof(g_state.cfg.start_time_utc)-1);
+                strncpy(g_state.cfg.start_time, e->start_time,
+                        sizeof(g_state.cfg.start_time)-1);
                 strncpy(g_state.next_start, e->start_time,
                         sizeof(g_state.next_start)-1);
             }
@@ -4448,6 +4385,17 @@ repeat_schedule:
     }
 
 cleanup_writer:
+    /* Stop the GUI status monitor BEFORE freeing engine resources below.
+     * The monitor reads g_state.ring etc.; if it keeps running while
+     * ring_free()/DeleteCriticalSection() execute it can touch freed memory
+     * and crash the process (which looks like the window closing on finish). */
+    g_worker_active = 0;
+    if (g_gui_mon_thread) {
+        WaitForSingleObject(g_gui_mon_thread, 2000);
+        CloseHandle(g_gui_mon_thread);
+        g_gui_mon_thread = NULL;
+    }
+
     if (g_state.writer_thread && g_state.writer_running) {
         g_state.writer_running = 0;
         WaitForSingleObject(g_state.writer_thread, 5000);
@@ -4483,8 +4431,10 @@ cleanup_api:
     sdrplay_api_Close();
 
 cleanup_no_api:
-    if (g_state.log_fp)
+    if (g_state.log_fp) {
         fclose(g_state.log_fp);
+        g_state.log_fp = NULL;
+    }
 
     if (g_state.dual_merge_buf) free(g_state.dual_merge_buf);
     if (g_state.pending_a_i)    free(g_state.pending_a_i);
@@ -4492,55 +4442,30 @@ cleanup_no_api:
 
     DeleteCriticalSection(&g_state.dual_lock);
 
-    /* Pause before closing if launched from Explorer or similar
-     * (i.e. no parent console process), so errors can be read.
-     * Detected by checking if the parent process is cmd.exe or
-     * powershell.exe via NtQueryInformationProcess + GetProcessImageFileName.
-     * Simpler fallback: check if the console was allocated by us (AttachConsole
-     * GetConsoleWindow() returns non-NULL if a console is attached,
-     * which is the case when launched from cmd/MSYS2/PowerShell/Terminal.
-     * Returns NULL when launched by double-clicking in Explorer.          */
-    {
-        int launched_from_console = (GetConsoleWindow() != NULL) ? 1 : 0;
-
-        if (!launched_from_console || rc != 0 || g_state.cfg.http_port > 0) {
-            if (g_state.cfg.http_port > 0) {
-                /* All cleanup done - now safe to set session_complete so
-                 * the phone dashboard shows FINISHED.                    */
-                g_state.session_complete = 1;
-                snprintf(g_state.frozen_json, sizeof(g_state.frozen_json),
-                    "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
-                    "\"overflows\":%ld,\"zero_frames\":%lld,"
-                    "\"peak_dbfs_a\":%.1f,\"peak_dbfs_b\":%.1f,"
-                    "\"overload_a\":0,\"overload_b\":0,\"agc_on\":0,\"dual_channel\":0,"
-                    "\"disk_warn\":0,\"disk_stop\":0,\"writer_error\":0,\"running\":1,"
-                    "\"recording\":0,\"hdr_on\":0,\"session_complete\":1,"
-                    "\"waiting\":0,\"next_start\":\"\","
-                    "\"samples_rx\":%lld,\"samples_written\":%lld}",
-                    g_state.frozen_elapsed_sec,
-                    (double)(g_state.frozen_file_mb > 0 ? g_state.frozen_file_mb : 0),
-                    (long long)g_state.disk_free_mb,
-                    g_state.overflows,
-                    (long long)g_state.zero_frames_written,
-                    (double)g_state.peak_dbfs,
-                    (double)g_state.peak_dbfs_b,
-                    (long long)g_state.samples_received,
-                    (long long)g_state.samples_written);
-                fprintf(stderr, "\nRecording finished. HTTP monitor still running.\n");
-                fprintf(stderr, "Press Ctrl+C to close duodx.\n");
-            } else {
-                fprintf(stderr, "\nPress Enter to close...");
-            }
-            fflush(stderr);
-            /* Wait for Ctrl+C (sets g_running=0 via sig_handler).
-             * Using a sleep loop avoids getchar() EOF issues in mintty. */
-            g_running = 1;
-            while (g_running)
-                Sleep(200);
-        }
+    /* Mark the HTTP dashboard session complete before tearing it down. */
+    if (g_state.cfg.http_port > 0) {
+        g_state.session_complete = 1;
+        snprintf(g_state.frozen_json, sizeof(g_state.frozen_json),
+            "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
+            "\"overflows\":%ld,\"zero_frames\":%lld,"
+            "\"peak_dbfs_a\":%.1f,\"peak_dbfs_b\":%.1f,"
+            "\"overload_a\":0,\"overload_b\":0,\"agc_on\":0,\"dual_channel\":0,"
+            "\"disk_warn\":0,\"disk_stop\":0,\"writer_error\":0,\"running\":1,"
+            "\"recording\":0,\"hdr_on\":0,\"session_complete\":1,"
+            "\"waiting\":0,\"next_start\":\"\","
+            "\"samples_rx\":%lld,\"samples_written\":%lld}",
+            g_state.frozen_elapsed_sec,
+            (double)(g_state.frozen_file_mb > 0 ? g_state.frozen_file_mb : 0),
+            (long long)g_state.disk_free_mb,
+            g_state.overflows,
+            (long long)g_state.zero_frames_written,
+            (double)g_state.peak_dbfs,
+            (double)g_state.peak_dbfs_b,
+            (long long)g_state.samples_received,
+            (long long)g_state.samples_written);
     }
 
-    /* Stop HTTP server now that user has acknowledged */
+    /* Stop HTTP server. */
     g_running = 0;
     g_http_running = 0;
     if (http_thread) {
@@ -4549,5 +4474,774 @@ cleanup_no_api:
         http_thread = NULL;
     }
 
-    return rc;
+    LOG_INFO("Session ended.");
+
+    /* Tell the UI the worker has finished so it can re-enable Start. */
+    g_worker_active = 0;
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_DONE, (WPARAM)rc, 0);
+    return (DWORD)rc;
+}
+
+/* =========================================================================
+ * GUI: window procedure and WinMain
+ * ========================================================================= */
+
+static void gui_set_recording_ui(int recording)
+{
+    /* Toggle button: text reflects what pressing it will do. */
+    SetWindowTextA(g_hBtnToggle, recording ? "Stop" : "Start");
+    EnableWindow(g_hBtnToggle, TRUE);          /* always usable */
+    EnableWindow(g_hBtnAgc,     recording);     /* AGC only while live */
+    InvalidateRect(g_hBtnToggle, NULL, TRUE);
+}
+
+static void gui_start_session(void)
+{
+    if (g_worker_active) return;
+
+    /* Clear the log window for the new session. */
+    if (g_hLog) SetWindowTextA(g_hLog, "");
+
+    double keep_disk = g_ui.disk_free_mb;
+    memset(&g_ui, 0, sizeof(g_ui));
+    g_ui.disk_free_mb = keep_disk;
+    g_ui.peak_a = -90.0f;
+    g_ui.peak_b = -90.0f;
+    strncpy(g_ui.state, "STARTING", sizeof(g_ui.state) - 1);
+
+    g_worker_active = 1;
+    gui_set_recording_ui(1);
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+
+    g_worker_thread = CreateThread(NULL, 0, recording_worker, NULL, 0, NULL);
+    if (!g_worker_thread) {
+        g_worker_active = 0;
+        gui_set_recording_ui(0);
+        LOG_ERROR("Failed to start recording worker thread (%lu)",
+                  GetLastError());
+        return;
+    }
+
+    g_gui_mon_thread = CreateThread(NULL, 0, gui_monitor_thread_func,
+                                    &g_state, 0, NULL);
+}
+
+static void gui_stop_session(int wait_for_exit)
+{
+    if (!g_worker_active && !g_worker_thread) return;
+
+    /* Signal the engine to stop. */
+    g_running      = 0;
+    g_http_running = 0;
+    g_state.stop_requested = 1;
+    g_state.stream_running = 0;
+
+    if (wait_for_exit && g_worker_thread) {
+        WaitForSingleObject(g_worker_thread, 35000);
+    }
+}
+
+/* =========================================================================
+ * Custom drawing helpers
+ * ========================================================================= */
+
+/* Filled rounded-ish panel with a 1px border. */
+static void draw_panel(HDC dc, RECT r)
+{
+    HBRUSH fill = CreateSolidBrush(COL_PANEL);
+    HPEN   pen  = CreatePen(PS_SOLID, 1, COL_PANEL_EDGE);
+    HGDIOBJ ob = SelectObject(dc, pen);
+    HGDIOBJ of = SelectObject(dc, fill);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, 8, 8);
+    SelectObject(dc, ob);
+    SelectObject(dc, of);
+    DeleteObject(pen);
+    DeleteObject(fill);
+}
+
+static void draw_text(HDC dc, int x, int y, const char *s,
+                      COLORREF col, HFONT font)
+{
+    HGDIOBJ of = SelectObject(dc, font);
+    SetTextColor(dc, col);
+    SetBkMode(dc, TRANSPARENT);
+    TextOutA(dc, x, y, s, (int)strlen(s));
+    SelectObject(dc, of);
+}
+
+/* Draw text so its BASELINE sits at y_base. Lets different font sizes line
+ * up along the bottom of the glyphs rather than the top. Returns the pixel
+ * width drawn (so callers can place following text).                       */
+static int draw_text_base(HDC dc, int x, int y_base, const char *s,
+                          COLORREF col, HFONT font)
+{
+    HGDIOBJ of = SelectObject(dc, font);
+    TEXTMETRICA tm;
+    GetTextMetricsA(dc, &tm);
+    SIZE sz;
+    GetTextExtentPoint32A(dc, s, (int)strlen(s), &sz);
+    SetTextColor(dc, col);
+    SetBkMode(dc, TRANSPARENT);
+    TextOutA(dc, x, y_base - tm.tmAscent, s, (int)strlen(s));
+    SelectObject(dc, of);
+    return sz.cx;
+}
+
+/* Simple round LED - just the lit centre, no glow ring or highlight. */
+static void draw_led(HDC dc, int cx, int cy, int radius, COLORREF col, int glow)
+{
+    (void)glow;
+    HBRUSH b = CreateSolidBrush(col);
+    HPEN   p = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HGDIOBJ ob = SelectObject(dc, b);
+    HGDIOBJ op = SelectObject(dc, p);
+    Ellipse(dc, cx - radius, cy - radius, cx + radius, cy + radius);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(b);
+    DeleteObject(p);
+}
+
+/* Horizontal segmented signal meter driven by dBFS (-60..0).
+ * Returns nothing; draws inside the rect r.                                */
+static void draw_meter(HDC dc, RECT r, float dbfs, int overload)
+{
+    /* Track background */
+    HBRUSH bg = CreateSolidBrush(COL_BAR_BG);
+    HPEN   pen = CreatePen(PS_SOLID, 1, COL_PANEL_EDGE);
+    HGDIOBJ ob = SelectObject(dc, bg);
+    HGDIOBJ op = SelectObject(dc, pen);
+    Rectangle(dc, r.left, r.top, r.right, r.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(bg);
+    DeleteObject(pen);
+
+    const int segs = 20;
+    int active;
+    if (dbfs <= -90.0f) {
+        active = 0;                 /* silence */
+    } else {
+        float norm = (dbfs + 60.0f) / 60.0f;   /* -60 dB -> 0 .. 0 dB -> 1 */
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+        active = (int)(norm * segs + 0.5f);
+    }
+    if (overload) active = segs;
+
+    int pad = 2;
+    int innerW = (r.right - r.left) - pad * 2;
+    int innerH = (r.bottom - r.top) - pad * 2;
+    int gap = 2;
+    int segW = (innerW - gap * (segs - 1)) / segs;
+    int x = r.left + pad;
+    int y = r.top + pad;
+
+    for (int i = 0; i < segs; i++) {
+        COLORREF c;
+        if (i >= (int)(segs * 0.85)) c = COL_SEG_RED;
+        else if (i >= (int)(segs * 0.65)) c = COL_SEG_AMBER;
+        else c = COL_SEG_GREEN;
+
+        if (i >= active) {
+            /* dim unlit segment */
+            c = RGB(GetRValue(c) / 5 + 10, GetGValue(c) / 5 + 10,
+                    GetBValue(c) / 5 + 10);
+        }
+        HBRUSH sb = CreateSolidBrush(c);
+        HGDIOBJ os = SelectObject(dc, sb);
+        HGDIOBJ pp = SelectObject(dc, GetStockObject(NULL_PEN));
+        Rectangle(dc, x, y, x + segW, y + innerH);
+        SelectObject(dc, os);
+        SelectObject(dc, pp);
+        DeleteObject(sb);
+        x += segW + gap;
+    }
+}
+
+/* Small "LED counter" tile: label above, big value, in a panel. */
+static void draw_counter(HDC dc, int x, int y, int w, int h,
+                         const char *label, const char *value, COLORREF valcol)
+{
+    RECT r = { x, y, x + w, y + h };
+    draw_panel(dc, r);
+    draw_text(dc, x + 10, y + 6, label, COL_TEXT_DIM, g_hFontUI);
+    draw_text(dc, x + 10, y + 24, value, valcol, g_hFontBig);
+}
+
+static void paint_window(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    HDC wdc = BeginPaint(hwnd, &ps);
+
+    RECT cr;
+    GetClientRect(hwnd, &cr);
+
+    /* Double buffer to avoid flicker */
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, cr.right, cr.bottom);
+    HGDIOBJ obmp = SelectObject(dc, bmp);
+
+    /* Background */
+    FillRect(dc, &cr, g_hbrBg);
+
+    UiSnapshot s = g_ui;   /* snapshot */
+
+    /* ---- Title bar strip (baseline-aligned) ---- */
+    {
+        int baseline = 34;
+        int x = 14;
+        x += draw_text_base(dc, x, baseline, "DuoDX", COL_ACCENT, g_hFontBig);
+        draw_text_base(dc, x + 12, baseline, "RSP IQ Recorder  v" VERSION,
+                       COL_TEXT_DIM, g_hFontUI);
+
+        /* Recording LED + state. The LED sits at a FIXED position and the
+         * state word is drawn left-justified to its right, so the LED does
+         * not move when the word changes length (RECORDING -> FINISHED etc). */
+        COLORREF lc = s.recording ? COL_LED_ON
+                    : s.finished  ? RGB(10, 245, 25)
+                    :               COL_LED_OFF;
+        const char *st = s.state[0] ? s.state : "IDLE";
+        COLORREF stc = s.recording ? COL_LED_ON
+                      : s.finished ? RGB(10, 245, 25) : COL_TEXT_DIM;
+        /* Reserve room for the longest state word so the LED clears the
+         * version text on the left. ~110px holds "RECORDING".              */
+        int led_x  = cr.right - 14 - 110;   /* fixed LED centre x           */
+        int text_x = led_x + 14;            /* fixed text start, right of LED */
+        HGDIOBJ of = SelectObject(dc, g_hFontVal);
+        TEXTMETRICA tm; GetTextMetricsA(dc, &tm);
+        SelectObject(dc, of);
+        int mid = baseline - tm.tmAscent + tm.tmHeight / 2;
+        draw_led(dc, led_x, mid, 6, lc, 0);
+        draw_text_base(dc, text_x, baseline, st, stc, g_hFontVal);
+    }
+
+    /* ---- Frequency line (baseline-aligned) ---- */
+    {
+        int baseline = 60;
+        char fb[128];
+        snprintf(fb, sizeof(fb), "CF: %s", s.freq[0] ? s.freq : "-");
+        int w = draw_text_base(dc, 14, baseline, fb, COL_TEXT, g_hFontVal);
+
+        if (s.span[0]) {
+            char sb[80];
+            snprintf(sb, sizeof(sb), "Coverage: %s", s.span);
+            draw_text_base(dc, 14 + w + 24, baseline, sb,
+                           COL_TEXT_DIM, g_hFontUI);
+        }
+
+        /* Live clock, right-aligned, small and dim. Follows the same UTC/local
+         * choice as the rest of the app (use_utc). Optional via show_clock.   */
+        int clock_left = cr.right;
+        if (g_clock_show) {
+            SYSTEMTIME ct;
+            if (g_clock_utc) GetSystemTime(&ct); else GetLocalTime(&ct);
+            char cb[40];
+            snprintf(cb, sizeof(cb), "%02d:%02d:%02d %s",
+                     ct.wHour, ct.wMinute, ct.wSecond,
+                     g_clock_utc ? "UTC" : "local");
+            HGDIOBJ of = SelectObject(dc, g_hFontUI);
+            SIZE csz; GetTextExtentPoint32A(dc, cb, (int)strlen(cb), &csz);
+            SelectObject(dc, of);
+            clock_left = (cr.right - 14 - 110) - 6; /* aligns with LED left edge */
+            draw_text_base(dc, clock_left, baseline, cb,
+                           COL_TEXT_DIM, g_hFontUI);
+        }
+
+        /* Next scheduled start, placed to the left of the clock. */
+        if (s.next[0]) {
+            char nb[64];
+            snprintf(nb, sizeof(nb), "Next: %s", s.next);
+            HGDIOBJ of = SelectObject(dc, g_hFontUI);
+            SIZE nsz; GetTextExtentPoint32A(dc, nb, (int)strlen(nb), &nsz);
+            SelectObject(dc, of);
+            draw_text_base(dc, clock_left - 20 - nsz.cx, baseline, nb,
+                           COL_ACCENT, g_hFontUI);
+        }
+    }
+
+    /* ---- Signal meters panel ---- */
+    int panelTop = 74;
+    {
+        RECT p = { 12, panelTop, cr.right - 12, panelTop + 86 };
+        draw_panel(dc, p);
+
+        draw_text(dc, 22, panelTop + 8, "SIGNAL", COL_TEXT_DIM, g_hFontUI);
+
+        /* Channel A */
+        draw_text(dc, 22, panelTop + 30, "A", COL_TEXT, g_hFontVal);
+        RECT ma = { 44, panelTop + 30, cr.right - 120, panelTop + 48 };
+        draw_meter(dc, ma, s.recording ? s.peak_a : -90.0f, s.overload_a);
+        {
+            char db[24];
+            if (s.peak_a <= -90.0f || !s.recording)
+                snprintf(db, sizeof(db), "  --- dBFS");
+            else
+                snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_a);
+            draw_text(dc, cr.right - 110, panelTop + 30, db,
+                      s.overload_a ? COL_SEG_RED : COL_TEXT, g_hFontVal);
+        }
+
+        /* Channel B (only meaningful in dual mode, shown greyed otherwise) */
+        draw_text(dc, 22, panelTop + 56, "B", COL_TEXT, g_hFontVal);
+        RECT mb = { 44, panelTop + 56, cr.right - 120, panelTop + 74 };
+        draw_meter(dc, mb, (s.dual && s.recording) ? s.peak_b : -90.0f,
+                   s.overload_b);
+        {
+            char db[24];
+            if (!s.dual)
+                snprintf(db, sizeof(db), "  (single)");
+            else if (s.peak_b <= -90.0f || !s.recording)
+                snprintf(db, sizeof(db), "  --- dBFS");
+            else
+                snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_b);
+            draw_text(dc, cr.right - 110, panelTop + 56, db,
+                      s.overload_b ? COL_SEG_RED : COL_TEXT, g_hFontVal);
+        }
+    }
+
+    /* ---- Counter tiles row ---- */
+    int ctrTop = panelTop + 96;
+    {
+        int gap = 10;
+        int tiles = 5;
+        int totalW = cr.right - 24;
+        int tw = (totalW - gap * (tiles - 1)) / tiles;
+        int th = 56;
+        int x = 12;
+        char v[48];
+
+        int eh = (int)s.elapsed_sec / 3600;
+        int em = ((int)s.elapsed_sec % 3600) / 60;
+        int es = (int)s.elapsed_sec % 60;
+        snprintf(v, sizeof(v), "%02d:%02d:%02d", eh, em, es);
+        draw_counter(dc, x, ctrTop, tw, th, "ELAPSED", v, COL_ACCENT);
+        x += tw + gap;
+
+        if (s.file_mb >= 1024.0)
+            snprintf(v, sizeof(v), "%.2f GB", s.file_mb / 1024.0);
+        else
+            snprintf(v, sizeof(v), "%.0f MB", s.file_mb);
+        draw_counter(dc, x, ctrTop, tw, th, "FILE SIZE", v, COL_TEXT);
+        x += tw + gap;
+
+        snprintf(v, sizeof(v), "%ld", s.overflows);
+        draw_counter(dc, x, ctrTop, tw, th, "OVERFLOWS", v,
+                     s.overflows > 0 ? COL_SEG_RED : COL_SEG_GREEN);
+        x += tw + gap;
+
+        snprintf(v, sizeof(v), "%lld", s.dropped);
+        draw_counter(dc, x, ctrTop, tw, th, "DROPPED", v,
+                     s.dropped > 0 ? COL_SEG_AMBER : COL_SEG_GREEN);
+        x += tw + gap;
+
+        snprintf(v, sizeof(v), "%.1f%%", s.ring_pct);
+        COLORREF rc = s.ring_pct > 80.0f ? COL_SEG_RED
+                    : s.ring_pct > 50.0f ? COL_SEG_AMBER : COL_SEG_GREEN;
+        draw_counter(dc, x, ctrTop, tw, th, "RING BUFFER", v, rc);
+    }
+
+    /* ---- Disk line: free space + AGC / HDR / overload indicators ---- */
+    int diskY = ctrTop + 64;
+    {
+        int baseline = diskY + 16;
+        char db[80];
+        if (s.disk_free_mb >= 1024.0)
+            snprintf(db, sizeof(db), "Disk free: %.1f GB", s.disk_free_mb / 1024.0);
+        else
+            snprintf(db, sizeof(db), "Disk free: %.0f MB", s.disk_free_mb);
+        draw_text_base(dc, 14, baseline, db, COL_TEXT_DIM, g_hFontUI);
+
+        /* AGC: ON/OFF (ON green, OFF dim-grey). In HDR mode AGC is not
+         * available (fixed gain path), so show N/A in amber to make clear it
+         * cannot be toggled.                                                 */
+        COLORREF on_col  = RGB(70, 220, 110);
+        COLORREF off_col = RGB(120, 140, 165);
+        COLORREF na_col  = RGB(255, 190, 40);
+        int ix = 220;
+        ix += draw_text_base(dc, ix, baseline, "AGC: ", COL_TEXT_DIM, g_hFontUI);
+        if (s.hdr_on) {
+            ix += draw_text_base(dc, ix, baseline, "N/A", na_col, g_hFontUI);
+        } else {
+            ix += draw_text_base(dc, ix, baseline, s.agc_on ? "ON" : "OFF",
+                                 s.agc_on ? on_col : off_col, g_hFontUI);
+        }
+        ix += 18;
+        ix += draw_text_base(dc, ix, baseline, "HDR: ", COL_TEXT_DIM, g_hFontUI);
+        ix += draw_text_base(dc, ix, baseline, s.hdr_on ? "ON" : "OFF",
+                             s.hdr_on ? on_col : off_col, g_hFontUI);
+    }
+
+    /* ---- Bottom info line (scheduling), left of the buttons ---- */
+    if (s.sched[0]) {
+        draw_text_base(dc, 14, cr.bottom - 17, s.sched,
+                       COL_TEXT_DIM, g_hFontUI);
+    }
+
+    BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+
+    SelectObject(dc, obmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+/* Position child controls (buttons + log) relative to client size. */
+static void layout_children(HWND hwnd)
+{
+    RECT cr;
+    GetClientRect(hwnd, &cr);
+
+    /* Geometry mirrors the painter. */
+    int panelTop = 74;
+    int ctrTop   = panelTop + 96;
+    int diskY    = ctrTop + 64;
+
+    /* Bottom button bar: Start/Stop and AGC sit along the bottom edge. */
+    int bbh = 26;                       /* button height                    */
+    int bbY = cr.bottom - bbh - 10;     /* button row y                     */
+    int sbw = 90, abw = 64, bgap = 8;
+    /* Buttons right-aligned; scheduling text painted to their left. */
+    int agc_x = cr.right - 12 - abw;
+    int tog_x = agc_x - bgap - sbw;
+    MoveWindow(g_hBtnToggle, tog_x, bbY, sbw, bbh, TRUE);
+    MoveWindow(g_hBtnAgc,    agc_x, bbY, abw, bbh, TRUE);
+
+    /* Log fills the area between the disk line and the bottom button bar. */
+    int logTop = diskY + 26 + 6;
+    int logBottom = bbY - 8;
+    MoveWindow(g_hLog, 12, logTop, cr.right - 24, logBottom - logTop, TRUE);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, COL_TEXT);
+        SetBkColor(dc, COL_BAR_BG);
+        return (LRESULT)g_hbrPanel;
+    }
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT di = (LPDRAWITEMSTRUCT)lp;
+        if (di->CtlType == ODT_BUTTON) {
+            int dis = (di->itemState & ODS_DISABLED) != 0;
+            int down = (di->itemState & ODS_SELECTED) != 0;
+            COLORREF face;
+            if (di->CtlID == IDC_BTN_TOGGLE) {
+                /* Green = will start, Red = will stop. */
+                COLORREF base = g_worker_active ? COL_BTN_STOP : COL_BTN_START;
+                face = down ? RGB(GetRValue(base)+25, GetGValue(base)+25,
+                                  GetBValue(base)+25) : base;
+            } else if (di->CtlID == IDC_BTN_AGC && !dis && g_ui.agc_on) {
+                /* Green when AGC is currently enabled. */
+                face = down ? RGB(40, 120, 80) : COL_BTN_START;
+            } else {
+                face = dis ? COL_BTN_DIS : (down ? COL_BTN_HOT : COL_BTN_FACE);
+            }
+            HBRUSH b = CreateSolidBrush(face);
+
+            /* Fill the whole item rect with the window background first, so the
+             * rounded corners reveal navy, not the default white button face. */
+            FillRect(di->hDC, &di->rcItem, g_hbrBg);
+
+            HPEN   p = CreatePen(PS_SOLID, 1, COL_PANEL_EDGE);
+            HGDIOBJ ob = SelectObject(di->hDC, b);
+            HGDIOBJ op = SelectObject(di->hDC, p);
+            RoundRect(di->hDC, di->rcItem.left, di->rcItem.top,
+                      di->rcItem.right, di->rcItem.bottom, 5, 5);
+            SelectObject(di->hDC, ob);
+            SelectObject(di->hDC, op);
+            DeleteObject(b);
+            DeleteObject(p);
+
+            char txt[32];
+            GetWindowTextA(di->hwndItem, txt, sizeof(txt));
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, dis ? COL_TEXT_DIM : COL_TEXT);
+            HGDIOBJ of = SelectObject(di->hDC, g_hFontUI);
+            DrawTextA(di->hDC, txt, -1, &di->rcItem,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(di->hDC, of);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;   /* handled in WM_PAINT (double-buffered) */
+
+    case WM_PAINT:
+        paint_window(hwnd);
+        return 0;
+
+    case WM_TIMER:
+        if (wp == ID_TIMER_CLOCK && g_clock_show) {
+            /* Tick the clock once a second. Repaint only the top strip where
+             * the clock lives (cheap; the monitor handles the rest during a
+             * recording, and this keeps the clock smooth at idle too).      */
+            RECT cr; GetClientRect(hwnd, &cr);
+            RECT top = { 0, 0, cr.right, 74 };
+            InvalidateRect(hwnd, &top, FALSE);
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_BTN_TOGGLE:
+            if (g_worker_active) {
+                gui_stop_session(0);
+            } else {
+                gui_start_session();
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        case IDC_BTN_AGC: {
+            /* Debounce: ignore presses within 1.5 s of the last one so the
+             * API has time to settle. Rapid toggles caused NotInitialised
+             * errors because each Update() raced the previous one.          */
+            static DWORD last_agc_click = 0;
+            DWORD now = GetTickCount();
+            if (now - last_agc_click >= 1500) {
+                last_agc_click = now;
+                g_agc_toggle_req = 1;
+            }
+            return 0;
+        }
+        }
+        return 0;
+
+    case WM_APP_LOG: {
+        char *txt = (char *)lp;
+        if (txt) {
+            COLORREF col;
+            switch ((int)wp) {
+            case 1:  col = RGB(70, 220, 110); break;   /* green  */
+            case 2:  col = RGB(255, 170, 40); break;   /* orange */
+            case 3:  col = RGB(255, 80, 70);  break;   /* red    */
+            default: col = RGB(225, 235, 250); break;  /* white  */
+            }
+
+            CHARFORMAT2A cf;
+            memset(&cf, 0, sizeof(cf));
+            cf.cbSize = sizeof(cf);
+            cf.dwMask = CFM_COLOR;
+            cf.crTextColor = col;
+
+            /* Move caret to end, set colour for the new text, insert it. */
+            GETTEXTLENGTHEX gtl = { GTL_NUMCHARS, 1200 };
+            LONG len = (LONG)SendMessageA(g_hLog, EM_GETTEXTLENGTHEX,
+                                          (WPARAM)&gtl, 0);
+            SendMessageA(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+            SendMessageA(g_hLog, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+            SendMessageA(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)txt);
+            /* Auto-scroll to bottom (gentler than WM_VSCROLL SB_BOTTOM). */
+            SendMessageA(g_hLog, EM_SCROLLCARET, 0, 0);
+            free(txt);
+        }
+        return 0;
+    }
+
+    case WM_APP_DONE:
+        if (g_worker_thread) {
+            WaitForSingleObject(g_worker_thread, 2000);
+            CloseHandle(g_worker_thread);
+            g_worker_thread = NULL;
+        }
+        if (g_gui_mon_thread) {
+            WaitForSingleObject(g_gui_mon_thread, 2000);
+            CloseHandle(g_gui_mon_thread);
+            g_gui_mon_thread = NULL;
+        }
+        /* Leave the final FINISHED snapshot on screen; do NOT auto-close.
+         * Pull the final elapsed time and file size from the frozen values
+         * so the display keeps the last recording's length instead of
+         * resetting to 00:00 once the monitor thread has stopped.          */
+        g_ui.recording = 0;
+        if (g_state.last_display_elapsed > 0.0)
+            g_ui.elapsed_sec = g_state.last_display_elapsed;
+        if (g_state.last_display_file_mb >= 0)
+            g_ui.file_mb = (double)g_state.last_display_file_mb;
+        if (g_state.session_complete) {
+            g_ui.finished = 1;
+            strncpy(g_ui.state, "FINISHED", sizeof(g_ui.state) - 1);
+        } else {
+            strncpy(g_ui.state, "STOPPED", sizeof(g_ui.state) - 1);
+        }
+        gui_set_recording_ui(0);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_SIZE:
+        layout_children(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mm = (MINMAXINFO *)lp;
+        mm->ptMinTrackSize.x = 640;
+        mm->ptMinTrackSize.y = 480;
+        return 0;
+    }
+
+    case WM_CLOSE:
+        if (g_worker_active) {
+            if (MessageBoxA(hwnd,
+                    "A recording is in progress. Stop and exit?",
+                    "DuoDX", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                return 0;
+            gui_stop_session(1);
+        }
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, ID_TIMER_CLOCK);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static HWND mk_button(HWND parent, int id, const char *text)
+{
+    HWND c = CreateWindowExA(0, "BUTTON", text,
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                0, 0, 10, 10, parent, (HMENU)(INT_PTR)id,
+                (HINSTANCE)GetWindowLongPtrA(parent, GWLP_HINSTANCE), NULL);
+    return c;
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
+{
+    (void)hPrev; (void)lpCmdLine;
+
+    InitCommonControls();
+    LoadLibraryA("Msftedit.dll");   /* registers RICHEDIT50W window class */
+
+    g_hbrBg    = CreateSolidBrush(COL_BG);
+    g_hbrPanel = CreateSolidBrush(COL_BAR_BG);
+
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = g_hbrBg;
+    wc.lpszClassName = "DuoDXWindow";
+    wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
+    if (!RegisterClassA(&wc)) {
+        MessageBoxA(NULL, "RegisterClass failed", "DuoDX", MB_ICONERROR);
+        return 1;
+    }
+
+    g_hwnd = CreateWindowExA(0, "DuoDXWindow",
+                "DuoDX  v" VERSION "  -  RSP IQ Recorder",
+                WS_OVERLAPPEDWINDOW,
+                CW_USEDEFAULT, CW_USEDEFAULT, 820, 600,
+                NULL, NULL, hInst, NULL);
+    if (!g_hwnd) {
+        MessageBoxA(NULL, "CreateWindow failed", "DuoDX", MB_ICONERROR);
+        return 1;
+    }
+
+    /* Fonts */
+    g_hFontUI  = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_hFontVal = CreateFontA(-15, 0, 0, 0, FW_BOLD, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_hFontBig = CreateFontA(-22, 0, 0, 0, FW_BOLD, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    g_hFontLog = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+
+    /* Buttons (owner-drawn, positioned by layout_children) */
+    g_hBtnToggle = mk_button(g_hwnd, IDC_BTN_TOGGLE, "Start");
+    g_hBtnAgc    = mk_button(g_hwnd, IDC_BTN_AGC,    "AGC");
+
+    /* Log control - RichEdit (per-line colour). Requires Msftedit.dll. */
+    g_hLog = CreateWindowExA(WS_EX_CLIENTEDGE, "RICHEDIT50W", "",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
+                ES_AUTOVSCROLL | ES_READONLY,
+                0, 0, 10, 10, g_hwnd, (HMENU)(INT_PTR)IDC_LOG,
+                hInst, NULL);
+    if (g_hLog) {
+        if (g_hFontLog)
+            SendMessageA(g_hLog, WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
+        /* Dark background + default white-ish text. */
+        SendMessageA(g_hLog, EM_SETBKGNDCOLOR, 0, (LPARAM)COL_BAR_BG);
+        {
+            CHARFORMAT2A cf;
+            memset(&cf, 0, sizeof(cf));
+            cf.cbSize = sizeof(cf);
+            cf.dwMask = CFM_COLOR;
+            cf.crTextColor = RGB(225, 235, 250);
+            SendMessageA(g_hLog, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+        }
+        /* Keep a generous backlog. */
+        SendMessageA(g_hLog, EM_EXLIMITTEXT, 0, (LPARAM)(1024 * 1024));
+    }
+
+    gui_set_recording_ui(0);
+    layout_children(g_hwnd);
+
+    /* Seed the idle disk-free display and the clock settings by reading the
+     * INI BEFORE the window is first shown, so the initial paint already
+     * reflects show_clock and use_utc (otherwise the clock briefly appears
+     * even when disabled, until the config loads). */
+    {
+        Config tmp;
+        config_set_defaults(&tmp);
+        config_load_ini(&tmp, g_config_file);
+        ULARGE_INTEGER fb;
+        char dir_path[MAX_PATH] = ".";
+        const char *src = tmp.recording_path[0] ? tmp.recording_path
+                                                : tmp.output_file;
+        const char *last_sep = NULL, *p = src;
+        for (; *p; p++) if (*p == '\\' || *p == '/') last_sep = p;
+        if (tmp.recording_path[0])
+            strncpy(dir_path, tmp.recording_path, sizeof(dir_path) - 1);
+        else if (last_sep) {
+            size_t len = (size_t)(last_sep - src) + 1;
+            if (len < sizeof(dir_path)) { memcpy(dir_path, src, len); dir_path[len] = '\0'; }
+        }
+        if (GetDiskFreeSpaceExA(dir_path, &fb, NULL, NULL))
+            g_ui.disk_free_mb = (double)(fb.QuadPart / (1024ULL * 1024ULL));
+
+        /* Seed clock display settings from the same INI read. */
+        g_clock_show = tmp.show_clock;
+        g_clock_utc  = tmp.use_utc;
+    }
+
+    ShowWindow(g_hwnd, nShow);
+    UpdateWindow(g_hwnd);
+
+    LOG_INFO("DuoDX GUI ready. Press Start to begin recording using duodx.ini.");
+
+    /* 1-second timer to tick the live clock while idle. */
+    SetTimer(g_hwnd, ID_TIMER_CLOCK, 1000, NULL);
+
+    MSG m;
+    while (GetMessageA(&m, NULL, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+
+    /* Ensure worker is stopped on exit. */
+    gui_stop_session(1);
+
+    if (g_hFontUI)  DeleteObject(g_hFontUI);
+    if (g_hFontVal) DeleteObject(g_hFontVal);
+    if (g_hFontBig) DeleteObject(g_hFontBig);
+    if (g_hFontLog) DeleteObject(g_hFontLog);
+    if (g_hbrBg)    DeleteObject(g_hbrBg);
+    if (g_hbrPanel) DeleteObject(g_hbrPanel);
+    return (int)m.wParam;
 }
