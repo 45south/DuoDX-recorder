@@ -8,25 +8,7 @@ Optimised for medium wave (MW) DXing with the RSPduo and RSPdx, including
 native RSPduo dual-tuner recording of two frequencies to a single interleaved
 file.
 
----
-
-### ⚠️ A Word of Warning: This is an AI-Assisted Project ⚠️
-
-**This project is a personal project for my dx hobby.**
-
-A large language model (AI) helped write a significant portion of this code, *if not most.* I guided it, reviewed its output the best I could, and tested the result, but this project didn't evolve through the typical trial-and-error of a human-only endeavor. Even this README you're reading was drafted by the AI based on the source code, then edited and refined by me.
-
-Second, it's worth knowing that this was a learning project for myself. The focus was always on getting a practical, working result, which means some of the solutions are probably not what you'd find in a textbook. 
-
-*What does this mean?*
-
-*   **It's Experimental.** While it works, it hasn't been battle-tested across a wide variety of SDR settings or hardware.
-*   **Design choices not stable.** You may see features etc. suddenly appear and disappear. You may also see large commits of lots of changes. **The mainline codebase may also be broken at times due to fast moving code and changes. Releases may be more stable.** 
-*   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. Other issues causing crashes may exist too. 
-
----
-
-> Version 2.0.0 replaces the original command-line tool with a Win32 GUI. All
+> Version 2.1.0 adds graduated meter styles, an optional live clock, improved hourly recording, and numerous UI and bug fixes. Version 2.0.0 was the initial GUI release replacing the original console tool. All
 > settings are now read from `duodx.ini`; there are no command-line options.
 
 ## Features
@@ -60,8 +42,12 @@ Built with MinGW-w64 (MSYS2). From the project folder:
 make
 ```
 
-This produces a windowed `duodx.exe`. Override the SDRplay API location if
-it is installed elsewhere:
+This produces a windowed `duodx.exe` with the application icon embedded.
+The Makefile uses `windres` to compile `duodx.rc` (which references `duodx.ico`)
+into the executable. All three source files — `duodx.c`, `duodx.rc`, and
+`duodx.ico` — must be in the same folder.
+
+Override the SDRplay API location if it is installed elsewhere:
 
 ```
 make SDR_API="D:/SDRplay/API"
@@ -85,7 +71,7 @@ setting (UTC by default) consistently across the scheduler, log and filenames.
 
 Full documentation — every INI key, IF/sample-rate combinations, output file
 formats, dual-tuner and phasing setup, scheduling, HDR mode, and the HTTP
-dashboard — is in the **DuoDX User Guide** (`DuoDX_User_Guide_2_0_0.pdf`) in
+dashboard — is in the **DuoDX User Guide** (`DuoDX_User_Guide_2_0_0.docx`) in
 this repository.
 
 ## Acknowledgements

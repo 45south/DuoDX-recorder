@@ -8,6 +8,7 @@
 *.exp
 *.pdb
 *.ilk
+*.res
 build/
 bin/
 obj/

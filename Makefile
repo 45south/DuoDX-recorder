@@ -11,8 +11,11 @@
 # =============================================================================
 
 CC      := gcc
+WINDRES := windres
 TARGET  := duodx.exe
 SRC     := duodx.c
+RES_SRC := duodx.rc
+RES_OBJ := duodx.res
 
 # --- SDRplay API v3 location -------------------------------------------------
 # Default install path; override on the command line if needed.
@@ -31,8 +34,11 @@ GUIFLAG := -mwindows
 
 all: $(TARGET) strip-target
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(GUIFLAG) -o $@ $< $(LDFLAGS) $(LIBS)
+$(RES_OBJ): $(RES_SRC) duodx.ico
+	$(WINDRES) $< -O coff -o $@
+
+$(TARGET): $(SRC) $(RES_OBJ)
+	$(CC) $(CFLAGS) $(GUIFLAG) -o $@ $< $(RES_OBJ) $(LDFLAGS) $(LIBS)
 
 # Strip only for release builds (the all target).
 .PHONY: strip-target
@@ -49,4 +55,4 @@ run: all
 	./$(TARGET)
 
 clean:
-	-rm -f $(TARGET)
+	-rm -f $(TARGET) $(RES_OBJ)

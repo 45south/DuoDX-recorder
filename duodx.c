@@ -35,12 +35,16 @@
 #include <richedit.h>
 
 #include "sdrplay_api.h"
+/* RSP1B was added in API 3.14; older headers may not define this ID. */
+#ifndef SDRPLAY_RSP1B_ID
+#  define SDRPLAY_RSP1B_ID  6
+#endif
 
 /* =========================================================================
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "2.0.0"
+#define VERSION                 "2.1.0"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -211,6 +215,7 @@ typedef struct {
 
     int           use_utc;         /* 1=UTC timestamps (default), 0=local time */
     int           show_clock;      /* 1=show live clock in GUI (default), 0=hide */
+    int           meter_style;     /* 0=zone colours (default), 1=graduated blend */
     int           hourly_enable;   /* 1 = enable hourly recording mode */
     int           hourly_window_min; /* recording window centred on the hour (minutes) */
     char          hourly_start[8]; /* window open time HH:MM */
@@ -366,8 +371,9 @@ static char   g_config_file[MAX_PATH_LEN] = CONFIG_FILE;
 
 /* Clock display: read from the INI at startup and on each Start, so the GUI
  * can show a live clock even while idle (before the worker loads config). */
-static volatile int g_clock_show = 1;   /* 1 = show live clock              */
-static volatile int g_clock_utc  = 1;   /* 1 = UTC, 0 = local               */
+static volatile int g_clock_show   = 1;   /* 1 = show live clock              */
+static volatile int g_clock_utc    = 1;   /* 1 = UTC, 0 = local               */
+static volatile int g_meter_style  = 0;   /* 0 = zone, 1 = graduated          */
 
 /* ---- Live UI snapshot ---------------------------------------------------
  * The GUI monitor thread fills this; WM_PAINT reads it. Plain scalars,
@@ -704,18 +710,31 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
                 ScreenToClient(g_hwnd, &tl);
                 RECT top = { 0, 0, cr.right, tl.y };
                 InvalidateRect(g_hwnd, &top, FALSE);
-                /* bottom region: below the log (scheduling text) */
-                RECT bot = { 0, tl.y + (lr.bottom - lr.top), cr.right, cr.bottom };
-                InvalidateRect(g_hwnd, &bot, FALSE);
+                /* bottom region: only the scheduling-text strip between the
+                 * log and the button bar. Exclude the button row itself so
+                 * the owner-drawn buttons don't flicker every monitor tick.
+                 * The buttons are repainted only when their state changes.  */
+                int log_bot = tl.y + (int)(lr.bottom - lr.top);
+                int btn_top = cr.bottom - 36; /* top of button row           */
+                if (log_bot < btn_top) {
+                    RECT sched_strip = { 0, log_bot, cr.right, btn_top };
+                    InvalidateRect(g_hwnd, &sched_strip, FALSE);
+                }
             } else {
                 InvalidateRect(g_hwnd, NULL, FALSE);
             }
         }
-        /* Keep the AGC button colour in sync with the real AGC state, and
-         * disable it entirely in HDR mode (AGC not available there). */
+        /* Update AGC button state only when it changes, to avoid flicker. */
         if (g_hBtnAgc) {
-            EnableWindow(g_hBtnAgc, s.recording && !s.hdr_on);
-            InvalidateRect(g_hBtnAgc, NULL, FALSE);
+            static int last_agc_on = -1;
+            static int last_agc_enabled = -1;
+            int agc_enabled = s.recording && !s.hdr_on;
+            if (s.agc_on != last_agc_on || agc_enabled != last_agc_enabled) {
+                EnableWindow(g_hBtnAgc, agc_enabled);
+                InvalidateRect(g_hBtnAgc, NULL, FALSE);
+                last_agc_on      = s.agc_on;
+                last_agc_enabled = agc_enabled;
+            }
         }
 
         Sleep(state->cfg.monitor_interval_ms > 0
@@ -1728,6 +1747,19 @@ static int validate_config(Config *cfg)
     int    ifreq = cfg->if_khz;
     int    dual = cfg->dual_channel;
 
+    /* Validate IF gain reduction range. The SDRplay API rejects values
+     * below 20 dB because GR 0-19 always causes ADC clipping. Valid
+     * range is 20-59 for all RSP devices.                              */
+    if (cfg->gain_reduction < 20 || cfg->gain_reduction > 59) {
+        LOG_ERROR("gain_reduction=%d is out of range. "
+                  "Valid range for all RSP devices is 20-59 dB.",
+                  cfg->gain_reduction);
+        LOG_ERROR("Use 20 for maximum gain (strong signals / external preamp).");
+        LOG_ERROR("Use 59 for minimum gain (very strong local signals).");
+        LOG_ERROR("For MW DX, 30-45 is a typical starting range.");
+        return 0;
+    }
+
     for (i = 0; i < NUM_VALID_COMBOS; i++) {
         const ValidCombo *c = &VALID_COMBOS[i];
         if (c->if_khz == ifreq &&
@@ -1842,6 +1874,7 @@ static void config_set_defaults(Config *cfg)
     cfg->schedule_repeat = 0;
     cfg->use_utc         = 1;
     cfg->show_clock      = 1;
+    cfg->meter_style     = 0;
     cfg->hourly_enable      = 0;
     cfg->hourly_window_min  = 10;
     strncpy(cfg->hourly_start, "18:00", 7);
@@ -1951,6 +1984,7 @@ static void config_load_ini(Config *cfg, const char *path)
         else if (!strcmp(key, "schedule_repeat"))    cfg->schedule_repeat = atoi(val);
         else if (!strcmp(key, "use_utc"))            cfg->use_utc = atoi(val);
         else if (!strcmp(key, "show_clock"))         cfg->show_clock = atoi(val);
+        else if (!strcmp(key, "meter_style"))        cfg->meter_style = atoi(val);
         else if (!strcmp(key, "hourly_enable"))      cfg->hourly_enable = atoi(val);
         else if (!strcmp(key, "hourly_window_min"))  cfg->hourly_window_min = atoi(val);
         else if (!strcmp(key, "hourly_start")) strncpy(cfg->hourly_start, val, 7);
@@ -2612,6 +2646,14 @@ static int wait_until_time(const char *time_str, int between_recordings)
         /* GUI build: countdown shown via g_state.next_start in status bar */
         snprintf(g_state.next_start, sizeof(g_state.next_start),
                  "%02d:%02d:%02d", target_h, target_m, target_s);
+        snprintf(g_ui.sched, sizeof(g_ui.sched),
+                 "Waiting for scheduled start: %02d:%02d:%02d",
+                 target_h, target_m, target_s);
+        if (g_hwnd) {
+            RECT cr; GetClientRect(g_hwnd, &cr);
+            RECT strip = { 0, cr.bottom - 36, cr.right, cr.bottom - 10 };
+            InvalidateRect(g_hwnd, &strip, FALSE);
+        }
         Sleep(1000);
     }
     return 0;
@@ -3195,6 +3237,19 @@ static int hourly_wait_for_next(int half_win_sec)
                  hour_boundary / 60,
                  hour_boundary % 60);
 
+        /* Update the GUI scheduling text directly so it shows while the
+         * monitor thread is not running (between hourly recordings).     */
+        snprintf(g_ui.sched, sizeof(g_ui.sched),
+                 "Hourly %d min  next %s%s",
+                 g_state.cfg.hourly_window_min,
+                 g_state.next_start,
+                 g_state.cfg.schedule_repeat ? "  (repeat)" : "");
+        if (g_hwnd) {
+            RECT cr; GetClientRect(g_hwnd, &cr);
+            RECT strip = { 0, cr.bottom - 36, cr.right, cr.bottom - 10 };
+            InvalidateRect(g_hwnd, &strip, FALSE);
+        }
+
         Sleep(1000);
     }
     return 0;
@@ -3240,8 +3295,9 @@ static DWORD WINAPI recording_worker(LPVOID param)
     LOG_INFO("Config file: %s", config_file);
 
     /* Keep the GUI clock in step with this session's config. */
-    g_clock_show = g_state.cfg.show_clock;
-    g_clock_utc  = g_state.cfg.use_utc;
+    g_clock_show  = g_state.cfg.show_clock;
+    g_clock_utc   = g_state.cfg.use_utc;
+    g_meter_style = g_state.cfg.meter_style;
 
     /* Report free space on the target drive up front, so the display shows a
      * real value immediately instead of 0 MB until the first writer check.  */
@@ -3568,6 +3624,86 @@ static DWORD WINAPI recording_worker(LPVOID param)
     /* ------------------------------------------------------------------ */
     /* Step 4: Configure device parameters                                 */
     /* ------------------------------------------------------------------ */
+
+    /* Device-specific parameter validation now that hwVer is known.      */
+    {
+        unsigned char hw = g_state.device.hwVer;
+        int max_lna;
+        const char *dev_name;
+
+        if      (hw == SDRPLAY_RSP1_ID)   { max_lna = 3;  dev_name = "RSP1"; }
+        else if (hw == SDRPLAY_RSP1A_ID)  { max_lna = 9;  dev_name = "RSP1A"; }
+        else if (hw == SDRPLAY_RSP1B_ID)  { max_lna = 9;  dev_name = "RSP1B"; }
+        else if (hw == SDRPLAY_RSP2_ID)   { max_lna = 8;  dev_name = "RSP2"; }
+        else if (hw == SDRPLAY_RSPduo_ID) { max_lna = 9;  dev_name = "RSPduo"; }
+        else if (hw == SDRPLAY_RSPdx_ID)  { max_lna = 27; dev_name = "RSPdx"; }
+        else if (hw == SDRPLAY_RSPdxR2_ID){ max_lna = 27; dev_name = "RSPdxR2"; }
+        else                               { max_lna = 9;  dev_name = "RSP"; }
+
+        if (g_state.cfg.lna_state < 0 || g_state.cfg.lna_state > max_lna) {
+            LOG_ERROR("lna_state=%d is out of range for %s (valid: 0-%d).",
+                      g_state.cfg.lna_state, dev_name, max_lna);
+            LOG_ERROR("0 = maximum LNA gain (most sensitive).");
+            LOG_ERROR("%d = maximum LNA attenuation for %s.", max_lna, dev_name);
+            LOG_ERROR("For MW DX with a good antenna, lna_state=0 is usually correct.");
+            goto cleanup_device;
+        }
+
+        if (g_state.cfg.dual_channel) {
+            int max_lna_b = max_lna;   /* same device, same limit */
+            if (g_state.cfg.lna_state_b < 0 || g_state.cfg.lna_state_b > max_lna_b) {
+                LOG_ERROR("lna_state_b=%d is out of range for %s (valid: 0-%d).",
+                          g_state.cfg.lna_state_b, dev_name, max_lna_b);
+                goto cleanup_device;
+            }
+        }
+
+        /* duration_sec: 0 = unlimited, otherwise must be positive */
+        if (g_state.cfg.duration_sec < 0) {
+            LOG_ERROR("duration_sec=%d is invalid. Use 0 for unlimited or a "
+                      "positive number of seconds.", g_state.cfg.duration_sec);
+            goto cleanup_device;
+        }
+
+        /* ring_buffer_sec: must be at least 1 second */
+        if (g_state.cfg.ring_buffer_sec < 1) {
+            LOG_ERROR("ring_buffer_sec=%d is invalid (minimum 1).",
+                      g_state.cfg.ring_buffer_sec);
+            goto cleanup_device;
+        }
+
+        /* ppm: sanity check — values beyond ±100 ppm are almost certainly wrong */
+        if (g_state.cfg.ppm < -100.0 || g_state.cfg.ppm > 100.0) {
+            LOG_ERROR("ppm=%.1f is outside the expected range (-100 to +100 ppm). "
+                      "Check your ppm correction value.", g_state.cfg.ppm);
+            goto cleanup_device;
+        }
+
+        /* hdr_bw_khz: must be one of the four valid HDR bandwidths */
+        if (g_state.cfg.hdr_enable) {
+            int bw = g_state.cfg.hdr_bw_khz;
+            if (bw != 200 && bw != 500 && bw != 1200 && bw != 1700) {
+                LOG_ERROR("hdr_bw_khz=%d is invalid. "
+                          "Valid HDR bandwidths: 200, 500, 1200, 1700 kHz.", bw);
+                goto cleanup_device;
+            }
+        }
+
+        /* monitor_interval_ms range */
+        if (g_state.cfg.monitor_interval_ms < 100 ||
+            g_state.cfg.monitor_interval_ms > 5000) {
+            LOG_WARN("monitor_interval_ms=%d is outside recommended range "
+                     "(100-5000). Using 500 ms.",
+                     g_state.cfg.monitor_interval_ms);
+            g_state.cfg.monitor_interval_ms = 500;
+        }
+
+        LOG_INFO("Device parameters validated for %s "
+                 "(GR=%d dB, LNA=%d/%d).",
+                 dev_name, g_state.cfg.gain_reduction,
+                 g_state.cfg.lna_state, max_lna);
+    }
+
     if (g_state.cfg.dual_channel) {
         num_channels = 2;
         setup_device_rspduo_dual(&g_state);
@@ -3705,7 +3841,16 @@ hourly_next:
          * already within the pre-record window, start immediately.     */
         if (!hourly_wait_for_next(half_win_sec)) {
             rc = 0;
-            goto cleanup_device;
+            /* Stop the monitor thread before cleanup so it doesn't read
+             * freed resources. Writer is already stopped (done in Step 11),
+             * but the file and ring still need closing.                   */
+            g_worker_active = 0;
+            if (g_gui_mon_thread) {
+                WaitForSingleObject(g_gui_mon_thread, 2000);
+                CloseHandle(g_gui_mon_thread);
+                g_gui_mon_thread = NULL;
+            }
+            goto cleanup_file;
         }
     }
 
@@ -4214,6 +4359,22 @@ repeat_schedule:
     /* Freeze elapsed on HTTP monitor now that stats have been printed */
     g_state.start_time.QuadPart = 0;
 
+    /* Close and verify the completed recording file now, so it is
+     * immediately accessible to other applications (e.g. WavViewDX, HxD)
+     * without needing to stop DuoDX. The file handle was previously left
+     * open until the end of the entire session.                           */
+    if (g_state.out_file != INVALID_HANDLE_VALUE) {
+        if (g_state.samples_written > 0 &&
+                (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                 g_state.cfg.output_format == FORMAT_SDRCONNECT))
+            patch_wav_sizes(g_state.out_file, &g_state.cfg,
+                            g_state.samples_written);
+        CloseHandle(g_state.out_file);
+        g_state.out_file = INVALID_HANDLE_VALUE;
+        if (g_state.samples_written > 0)
+            verify_recording(&g_state.cfg, g_state.samples_written);
+    }
+
     /* ── Between-recording reset ─────────────────────────────────────────
      * If there are more schedule entries and no errors, stop the stream,
      * reset counters, reopen the output file, and restart the stream.   */
@@ -4300,6 +4461,9 @@ repeat_schedule:
         g_state.session_complete    = 0;
         g_state.start_time.QuadPart = 0;
         ring_reset(&g_state.ring);
+        /* Reset output filename so a fresh timestamped name is generated
+         * for each hourly recording rather than reusing the previous one. */
+        strncpy(g_state.cfg.output_file, DEFAULT_OUTPUT_FILE, MAX_PATH_LEN - 1);
 
         goto hourly_next;
     }
@@ -4492,14 +4656,16 @@ static void gui_set_recording_ui(int recording)
     SetWindowTextA(g_hBtnToggle, recording ? "Stop" : "Start");
     EnableWindow(g_hBtnToggle, TRUE);          /* always usable */
     EnableWindow(g_hBtnAgc,     recording);     /* AGC only while live */
-    InvalidateRect(g_hBtnToggle, NULL, TRUE);
+    InvalidateRect(g_hBtnToggle, NULL, FALSE);
 }
 
 static void gui_start_session(void)
 {
     if (g_worker_active) return;
 
-    /* Clear the log window for the new session. */
+    /* Clear the log window for the new session. Schedule a one-shot scroll
+     * to bottom 300 ms from now — by then the initial messages will have
+     * been appended and there is content to scroll to.                    */
     if (g_hLog) SetWindowTextA(g_hLog, "");
 
     double keep_disk = g_ui.disk_free_mb;
@@ -4604,7 +4770,7 @@ static void draw_led(HDC dc, int cx, int cy, int radius, COLORREF col, int glow)
 
 /* Horizontal segmented signal meter driven by dBFS (-60..0).
  * Returns nothing; draws inside the rect r.                                */
-static void draw_meter(HDC dc, RECT r, float dbfs, int overload)
+static void draw_meter(HDC dc, RECT r, float dbfs, int overload, int graduated)
 {
     /* Track background */
     HBRUSH bg = CreateSolidBrush(COL_BAR_BG);
@@ -4627,7 +4793,7 @@ static void draw_meter(HDC dc, RECT r, float dbfs, int overload)
         if (norm > 1.0f) norm = 1.0f;
         active = (int)(norm * segs + 0.5f);
     }
-    if (overload) active = segs;
+    if (active > segs) active = segs;
 
     int pad = 2;
     int innerW = (r.right - r.left) - pad * 2;
@@ -4638,10 +4804,30 @@ static void draw_meter(HDC dc, RECT r, float dbfs, int overload)
     int y = r.top + pad;
 
     for (int i = 0; i < segs; i++) {
+        /* Segment colour: zone, graduated blend, or greyscale by style. */
+        float t = (float)i / (float)(segs - 1);
         COLORREF c;
-        if (i >= (int)(segs * 0.85)) c = COL_SEG_RED;
-        else if (i >= (int)(segs * 0.65)) c = COL_SEG_AMBER;
-        else c = COL_SEG_GREEN;
+        if (graduated == 1) {
+            if (t < 0.65f) {
+                float s = t / 0.65f;
+                c = RGB((int)(40  + (255-40 ) * s * 0.75f),
+                        (int)(220 + (190-220) * s),
+                        (int)(90  + ( 40- 90) * s));
+            } else {
+                float s = (t - 0.65f) / 0.35f;
+                c = RGB(255,
+                        (int)(190 + ( 60-190) * s),
+                        (int)( 40 + ( 50- 40) * s));
+            }
+        } else if (graduated == 2) {
+            /* Greyscale: dark grey at left, bright white-grey at right. */
+            int v = (int)(60 + t * 180);
+            c = RGB(v, v, v);
+        } else {
+            if (i >= (int)(segs * 0.85))      c = COL_SEG_RED;
+            else if (i >= (int)(segs * 0.65)) c = COL_SEG_AMBER;
+            else                               c = COL_SEG_GREEN;
+        }
 
         if (i >= active) {
             /* dim unlit segment */
@@ -4656,6 +4842,25 @@ static void draw_meter(HDC dc, RECT r, float dbfs, int overload)
         SelectObject(dc, pp);
         DeleteObject(sb);
         x += segW + gap;
+    }
+
+    /* Dedicated overload indicator: a small gap then a bright red segment
+     * that only lights when the hardware reports ADC overload. The remaining
+     * pixels after the 20 segments (left over from integer division) form its
+     * width naturally, keeping it flush with the right edge of the meter.   */
+    {
+        int ovld_x = x + gap;   /* just after the last segment + one gap    */
+        int ovld_w = r.right - pad - ovld_x;
+        if (ovld_w > 2) {
+            COLORREF oc = overload ? COL_SEG_RED : RGB(60, 14, 12);
+            HBRUSH ob2 = CreateSolidBrush(oc);
+            HGDIOBJ os2 = SelectObject(dc, ob2);
+            HGDIOBJ op2 = SelectObject(dc, GetStockObject(NULL_PEN));
+            Rectangle(dc, ovld_x, y, ovld_x + ovld_w, y + innerH);
+            SelectObject(dc, os2);
+            SelectObject(dc, op2);
+            DeleteObject(ob2);
+        }
     }
 }
 
@@ -4743,7 +4948,7 @@ static void paint_window(HWND hwnd)
             HGDIOBJ of = SelectObject(dc, g_hFontUI);
             SIZE csz; GetTextExtentPoint32A(dc, cb, (int)strlen(cb), &csz);
             SelectObject(dc, of);
-            clock_left = (cr.right - 14 - 110) - 6; /* aligns with LED left edge */
+            clock_left = cr.right - 110; /* aligns with state text left edge */
             draw_text_base(dc, clock_left, baseline, cb,
                            COL_TEXT_DIM, g_hFontUI);
         }
@@ -4771,7 +4976,7 @@ static void paint_window(HWND hwnd)
         /* Channel A */
         draw_text(dc, 22, panelTop + 30, "A", COL_TEXT, g_hFontVal);
         RECT ma = { 44, panelTop + 30, cr.right - 120, panelTop + 48 };
-        draw_meter(dc, ma, s.recording ? s.peak_a : -90.0f, s.overload_a);
+        draw_meter(dc, ma, s.recording ? s.peak_a : -90.0f, s.overload_a, g_meter_style);
         {
             char db[24];
             if (s.peak_a <= -90.0f || !s.recording)
@@ -4786,7 +4991,7 @@ static void paint_window(HWND hwnd)
         draw_text(dc, 22, panelTop + 56, "B", COL_TEXT, g_hFontVal);
         RECT mb = { 44, panelTop + 56, cr.right - 120, panelTop + 74 };
         draw_meter(dc, mb, (s.dual && s.recording) ? s.peak_b : -90.0f,
-                   s.overload_b);
+                   s.overload_b, g_meter_style);
         {
             char db[24];
             if (!s.dual)
@@ -5038,7 +5243,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SendMessageA(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
             SendMessageA(g_hLog, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
             SendMessageA(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)txt);
-            /* Auto-scroll to bottom (gentler than WM_VSCROLL SB_BOTTOM). */
+            SendMessageA(g_hLog, EM_SCROLL, SB_BOTTOM, 0);
             SendMessageA(g_hLog, EM_SCROLLCARET, 0, 0);
             free(txt);
         }
@@ -5132,7 +5337,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = g_hbrBg;
     wc.lpszClassName = "DuoDXWindow";
-    wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon         = LoadIcon(hInst, MAKEINTRESOURCE(1));
     if (!RegisterClassA(&wc)) {
         MessageBoxA(NULL, "RegisterClass failed", "DuoDX", MB_ICONERROR);
         return 1;
@@ -5141,7 +5346,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
     g_hwnd = CreateWindowExA(0, "DuoDXWindow",
                 "DuoDX  v" VERSION "  -  RSP IQ Recorder",
                 WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT, CW_USEDEFAULT, 820, 600,
+                CW_USEDEFAULT, CW_USEDEFAULT, 820, 660,
                 NULL, NULL, hInst, NULL);
     if (!g_hwnd) {
         MessageBoxA(NULL, "CreateWindow failed", "DuoDX", MB_ICONERROR);
@@ -5173,6 +5378,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
                 0, 0, 10, 10, g_hwnd, (HMENU)(INT_PTR)IDC_LOG,
                 hInst, NULL);
     if (g_hLog) {
+        /* Request dark-mode scrollbar from the OS theme engine (Win10+).
+         * Loaded dynamically so the app still runs if uxtheme is absent. */
+        HMODULE hUx = LoadLibraryA("uxtheme.dll");
+        if (hUx) {
+            typedef HRESULT (WINAPI *PFN_SWT)(HWND, LPCWSTR, LPCWSTR);
+            PFN_SWT pSwt = (PFN_SWT)GetProcAddress(hUx, "SetWindowTheme");
+            if (pSwt) pSwt(g_hLog, L"DarkMode_Explorer", NULL);
+            FreeLibrary(hUx);
+        }
         if (g_hFontLog)
             SendMessageA(g_hLog, WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
         /* Dark background + default white-ish text. */
@@ -5216,8 +5430,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
             g_ui.disk_free_mb = (double)(fb.QuadPart / (1024ULL * 1024ULL));
 
         /* Seed clock display settings from the same INI read. */
-        g_clock_show = tmp.show_clock;
-        g_clock_utc  = tmp.use_utc;
+        g_clock_show  = tmp.show_clock;
+        g_clock_utc   = tmp.use_utc;
+        g_meter_style = tmp.meter_style;
     }
 
     ShowWindow(g_hwnd, nShow);
