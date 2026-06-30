@@ -4,6 +4,8 @@
 samples from SDRplay RSP receivers and writes them to disk in Linrad raw,
 WavViewDX-raw, SDRuno WAV, or SDR Connect WAV format.
 
+<img width="822" height="666" alt="Screenshot" src="https://github.com/user-attachments/assets/d0c642df-537a-42d2-884e-536c51f2e64a" />
+
 Optimised for medium wave (MW) DXing with the RSPduo and RSPdx, including
 native RSPduo dual-tuner recording of two frequencies to a single interleaved
 file.
