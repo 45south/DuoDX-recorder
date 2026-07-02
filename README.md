@@ -4,6 +4,24 @@
 samples from SDRplay RSP receivers and writes them to disk in Linrad raw,
 WavViewDX-raw, SDRuno WAV, or SDR Connect WAV format.
 
+---
+
+### ⚠️ A Quick Word of Warning: This is an AI-Assisted Project ⚠️
+
+**This project is a personal project for my dx hobby.**
+
+A large language model (AI) helped write a significant portion of this code, *if not most.* I guided it, reviewed its output the best I could, and tested the result, but this project didn't evolve through the typical trial-and-error of a human-only endeavor. Even this README you're reading was drafted by the AI based on the source code, then edited and refined by me.
+
+Second, it's worth knowing that this was a learning project for myself. The focus was always on getting a practical, working result, which means some of the solutions are probably not what you'd find in a textbook. 
+
+*What does this mean?*
+
+*   **This is experimental.** While it works, it hasn't been battle-tested across all possible options and hardware.
+*   **Design choices not stable.** You may see features etc. suddenly appear and disappear. You may also see large commits of lots of changes. 
+*   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. 
+
+---
+
 <img width="822" height="666" alt="Screenshot" src="https://github.com/user-attachments/assets/d0c642df-537a-42d2-884e-536c51f2e64a" />
 
 Optimised for medium wave (MW) DXing with the RSPduo and RSPdx, including
