@@ -44,7 +44,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "2.1.0"
+#define VERSION                 "2.1.1"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -391,6 +391,7 @@ typedef struct {
     int    overload_b;
     int    agc_on;        /* 1 = AGC currently enabled on tuner A            */
     int    hdr_on;        /* 1 = HDR mode enabled                            */
+    int    coherent;      /* 1 = RSPduo dual-channel, both tuners same freq  */
     long   overflows;
     long long dropped;    /* zero-fill frames                                */
     float  ring_pct;      /* ring buffer fill 0..100 (percent, one decimal)  */
@@ -579,6 +580,14 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
         s.recording = state->stream_running ? 1 : 0;
         s.finished  = (!state->stream_running && state->session_complete) ? 1 : 0;
         s.dual      = state->cfg.dual_channel;
+        /* Coherent dual-channel indicator: only meaningful on an RSPduo with
+         * dual_channel enabled and both tuners on the same frequency (the
+         * condition for phase-coherent diversity reception - see Section 7.3
+         * of the user guide). Hidden for any other device or configuration. */
+        s.coherent = (s.recording && state->cfg.dual_channel &&
+                      state->device.hwVer == SDRPLAY_RSPduo_ID &&
+                      fabs(state->cfg.frequency_hz - state->cfg.freq_b_hz) < 1.0)
+                     ? 1 : 0;
 
         /* Elapsed */
         if (state->stream_running && state->start_time.QuadPart > 0
@@ -1613,35 +1622,27 @@ static void event_callback(
         {
             int detected = (params->powerOverloadParams.powerOverloadChangeType
                             == sdrplay_api_Overload_Detected);
-            const char *tuner_name;
-            const char *state_str = detected ? "DETECTED" : "cleared";
 
             switch (tuner) {
             case sdrplay_api_Tuner_A:
                 state->overload_tuner_a = detected;
-                tuner_name = "Tuner A";
                 break;
             case sdrplay_api_Tuner_B:
                 state->overload_tuner_b = detected;
-                tuner_name = "Tuner B";
                 break;
             case sdrplay_api_Tuner_Both:
                 state->overload_tuner_a = detected;
                 state->overload_tuner_b = detected;
-                tuner_name = "Both tuners";
                 break;
             default:
                 state->overload_tuner_a = detected;
-                tuner_name = "Tuner A";
                 break;
             }
 
-            if (state->log_fp) {
-                fprintf(state->log_fp,
-                        "[WARN ] Signal overload %s - %s\n",
-                        state_str, tuner_name);
-                fflush(state->log_fp);
-            }
+            /* Overload state is reflected by the indicator segment at the
+             * right end of the level meter. No log message is written since
+             * overload can occur frequently and would generate excessive log
+             * entries during overnight recordings.                         */
         }
         sdrplay_api_Update(state->device.dev, state->device.tuner,
                            sdrplay_api_Update_Ctrl_OverloadMsgAck,
@@ -2716,12 +2717,9 @@ static void apply_schedule_entry(AppState *state, const ScheduleEntry *e)
     if (e->antenna[0]) {
         strncpy(state->cfg.antenna, e->antenna, 7);
         LOG_INFO("Schedule: antenna set to %s", e->antenna);
-        /* For RSPduo/RSP2 we can apply via Update immediately.
-         * For RSPdx, cfg->antenna is used at the next Init call
-         * (which already happens between schedule entries).       */
-        unsigned char hw = state->device.hwVer;
-        if (hw != SDRPLAY_RSPdx_ID && hw != SDRPLAY_RSPdxR2_ID)
-            apply_antenna_and_biast(state);
+        /* cfg->antenna is applied at the next sdrplay_api_Init call via
+         * apply_antenna_and_biast(). Calling Update here would fail with
+         * NotInitialised as the stream is stopped between schedule entries. */
     }
 
     /* Update duration for this recording */
@@ -3368,7 +3366,7 @@ static DWORD WINAPI recording_worker(LPVOID param)
             LOG_INFO("  Duration       : limited (%02d:%02d:%02d)",
                      ds / 3600, (ds % 3600) / 60, ds % 60);
         else
-            LOG_INFO("  Duration       : unlimited (Ctrl+C to stop)");
+            LOG_INFO("  Duration       : unlimited (Stop to end)");
     }
     if (g_state.cfg.start_time[0])
         LOG_INFO("  Scheduled start: %s", g_state.cfg.start_time);
@@ -3387,9 +3385,14 @@ static DWORD WINAPI recording_worker(LPVOID param)
         LOG_OK(  "  Bias-T         : ENABLED");
     else
         LOG_INFO("  Bias-T         : Off");
-    if (g_state.cfg.agc_enable)
+    if (g_state.cfg.agc_enable) {
         LOG_INFO("  AGC            : ENABLED");
-    else
+        LOG_WARN("AGC is enabled: the hardware AGC loop will continuously "
+                 "override gain_reduction (%d dB) to hit its target level. "
+                 "Changing gain_reduction will have little or no visible "
+                 "effect while AGC is on. Set agc_enable=0 for manual gain "
+                 "control to take effect.", g_state.cfg.gain_reduction);
+    } else
         LOG_INFO("  AGC            : Off");
     /* HDR validation runs later in apply_hdr_mode(). Display as white here
      * regardless of hdr_enable; apply_hdr_mode() will log a green confirmation
@@ -3651,9 +3654,13 @@ static DWORD WINAPI recording_worker(LPVOID param)
 
         if (g_state.cfg.dual_channel) {
             int max_lna_b = max_lna;   /* same device, same limit */
-            if (g_state.cfg.lna_state_b < 0 || g_state.cfg.lna_state_b > max_lna_b) {
+            /* -1 means "inherit from Tuner A" - resolve before validating,
+             * matching the inheritance logic used when applying gain.    */
+            int lna_b = (g_state.cfg.lna_state_b >= 0)
+                        ? g_state.cfg.lna_state_b : g_state.cfg.lna_state;
+            if (lna_b < 0 || lna_b > max_lna_b) {
                 LOG_ERROR("lna_state_b=%d is out of range for %s (valid: 0-%d).",
-                          g_state.cfg.lna_state_b, dev_name, max_lna_b);
+                          lna_b, dev_name, max_lna_b);
                 goto cleanup_device;
             }
         }
@@ -4202,14 +4209,13 @@ repeat_schedule:
         }
     }
 
-    LOG_INFO("Streaming started. Press Ctrl+C to stop.");
+    LOG_INFO("Streaming started. Use Stop to end, AGC to toggle gain control.");
 
     /* ------------------------------------------------------------------ */
     /* Step 9: GUI status labels are updated by gui_monitor_thread_func,   */
     /* which is started once in WinMain for the whole session. AGC is      */
     /* toggled via the AGC button (serviced in the wait loop below).       */
     /* ------------------------------------------------------------------ */
-    LOG_INFO("Streaming. Use Stop to end, AGC to toggle gain control.");
 
     /* ------------------------------------------------------------------ */
     /* Step 10: Main wait loop                                             */
@@ -5075,6 +5081,51 @@ static void paint_window(HWND hwnd)
         ix += draw_text_base(dc, ix, baseline, "HDR: ", COL_TEXT_DIM, g_hFontUI);
         ix += draw_text_base(dc, ix, baseline, s.hdr_on ? "ON" : "OFF",
                              s.hdr_on ? on_col : off_col, g_hFontUI);
+
+        /* Duration indicator — shown while recording or finished.
+         * Reads the configured duration from g_state.cfg (safe since it
+         * is only written at config-load time, before recording starts). */
+        if (s.recording || s.finished) {
+            ix += 18;
+            char dur_buf[32];
+            int ds = g_state.cfg.duration_sec;
+            if (ds <= 0) {
+                snprintf(dur_buf, sizeof(dur_buf), "DUR: unlimited");
+            } else {
+                int h = ds / 3600;
+                int m = (ds % 3600) / 60;
+                int s2 = ds % 60;
+                if (h > 0 && m > 0 && s2 == 0)
+                    snprintf(dur_buf, sizeof(dur_buf), "DUR: %dh%02dm", h, m);
+                else if (h > 0 && m == 0 && s2 == 0)
+                    snprintf(dur_buf, sizeof(dur_buf), "DUR: %dh", h);
+                else if (h > 0)
+                    snprintf(dur_buf, sizeof(dur_buf), "DUR: %dh%02dm%02ds", h, m, s2);
+                else if (m > 0 && s2 == 0)
+                    snprintf(dur_buf, sizeof(dur_buf), "DUR: %dm", m);
+                else if (m > 0)
+                    snprintf(dur_buf, sizeof(dur_buf), "DUR: %dm%02ds", m, s2);
+                else
+                    snprintf(dur_buf, sizeof(dur_buf), "DUR: %ds", s2);
+            }
+            ix += draw_text_base(dc, ix, baseline, dur_buf, COL_TEXT_DIM, g_hFontUI);
+        }
+
+        /* COHERENT indicator: only shown for RSPduo dual-channel recording
+         * with both tuners on the same frequency (phase-coherent diversity
+         * condition). Same green as the FINISHED state word. Positioned
+         * well clear of AGC/HDR so it reads as a distinct, occasional cue
+         * rather than competing with the always-on indicators.            */
+        if (s.coherent) {
+            int cx = 560;
+            HGDIOBJ of2 = SelectObject(dc, g_hFontUI);
+            TEXTMETRICA tm2; GetTextMetricsA(dc, &tm2);
+            SelectObject(dc, of2);
+            int mid2 = baseline - tm2.tmAscent + tm2.tmHeight / 2;
+            draw_led(dc, cx, mid2, 5, RGB(10, 245, 25), 0);
+            draw_text_base(dc, cx + 12, baseline, "COHERENT",
+                           RGB(10, 245, 25), g_hFontUI);
+        }
     }
 
     /* ---- Bottom info line (scheduling), left of the buttons ---- */
