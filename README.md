@@ -22,7 +22,8 @@ Second, it's worth knowing that this was a learning project for myself. The focu
 
 ---
 
-<img width="822" height="666" alt="Screenshot" src="https://github.com/user-attachments/assets/d0c642df-537a-42d2-884e-536c51f2e64a" />
+<img width="814" height="667" alt="Screenshot" src="https://github.com/user-attachments/assets/8205ac7a-cfa2-4cef-ae50-b192f86ee529" />
+
 
 Optimised for medium wave (MW) DXing with the RSPduo and RSPdx, including
 native RSPduo dual-tuner recording of two frequencies to a single interleaved
