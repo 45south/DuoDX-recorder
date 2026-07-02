@@ -1,4 +1,4 @@
-# DuoDX
+# DuoDX - dual channel recorder
 
 **RSP IQ Recorder for Windows** — a native GUI application that captures I/Q
 samples from SDRplay RSP receivers and writes them to disk in Linrad raw,
