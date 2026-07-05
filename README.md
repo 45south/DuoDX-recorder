@@ -30,6 +30,9 @@ Second, it's worth knowing that this was a learning project for myself. The focu
 > Version 2.1.2 fixes an RSPduo LNA validation bug, adds device-specific parameter validation, and adds a COHERENT indicator for dual-channel phase-coherent recording. Version 2.1.0 added graduated meter styles, an optional live clock, and numerous UI improvements. Version 2.0.0 was the initial GUI release replacing the original console tool. All
 > settings are now read from `duodx.ini`; there are no command-line options.
 
+<img width="814" height="667" alt="Screenshot" src="https://github.com/user-attachments/assets/24854fb8-ac30-4fb5-b765-f3464d245271" />
+
+
 ## Features
 
 - Single and dual-channel recording (Linrad raw, WavViewDX-raw, SDRuno WAV,
