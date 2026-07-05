@@ -668,7 +668,7 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
             snprintf(s.sched, sizeof(s.sched),
                      "Hourly %d min%s%s%s",
                      state->cfg.hourly_window_min,
-                     state->next_start[0] ? "  next " : "",
+                     state->next_start[0] ? "  starts " : "",
                      state->next_start[0] ? state->next_start : "",
                      state->cfg.schedule_repeat ? "  (repeat)" : "");
         } else if (state->cfg.schedule_only && state->cfg.schedule_count > 0) {
@@ -676,7 +676,7 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
                      "Schedule: %d entr%s%s%s%s",
                      state->cfg.schedule_count,
                      state->cfg.schedule_count == 1 ? "y" : "ies",
-                     state->next_start[0] ? "  next " : "",
+                     state->next_start[0] ? "  starts " : "",
                      state->next_start[0] ? state->next_start : "",
                      state->cfg.schedule_repeat ? "  (repeat)" : "");
         } else if (state->next_start[0]) {
@@ -2666,7 +2666,7 @@ static int wait_until_time(const char *time_str, int between_recordings)
                  "%02d:%02d:%02d", target_h, target_m, target_s);
         if (!g_worker_active) {
             snprintf(g_ui.sched, sizeof(g_ui.sched),
-                     "Waiting for scheduled start: %02d:%02d:%02d",
+                     "Waiting: scheduled start %02d:%02d:%02d",
                      target_h, target_m, target_s);
             if (g_hwnd) {
                 RECT cr; GetClientRect(g_hwnd, &cr);
@@ -4345,15 +4345,21 @@ repeat_schedule:
         g_state.last_display_file_mb = g_state.frozen_file_mb;
     /* Only mark session complete if this is the last recording —
      * i.e. no more schedule entries remain after this one.        */
-    g_state.session_complete = (sched_idx >= g_state.cfg.schedule_count) ? 1 : 0;
+    g_state.session_complete = (g_state.samples_received > 0 &&
+                                 sched_idx >= g_state.cfg.schedule_count) ? 1 : 0;
 
     /* Next scheduled start time for dashboard (empty if last recording) */
     memset(g_state.next_start, 0, sizeof(g_state.next_start));
-    if (sched_idx < g_state.cfg.schedule_count &&
-            g_state.cfg.schedule[sched_idx].start_time[0])
+    if (sched_idx == 0 && g_state.cfg.start_time[0]) {
+        /* Top-level or ad-hoc path: next start is the top-level start_time. */
+        strncpy(g_state.next_start, g_state.cfg.start_time,
+                sizeof(g_state.next_start) - 1);
+    } else if (sched_idx < g_state.cfg.schedule_count &&
+            g_state.cfg.schedule[sched_idx].start_time[0]) {
         strncpy(g_state.next_start,
                 g_state.cfg.schedule[sched_idx].start_time,
                 sizeof(g_state.next_start) - 1);
+    }
     /* Note: start_time is zeroed AFTER the stats block below so the
      * duration calculation remains correct. frozen_json is built here
      * before ring_free / ReleaseDevice / sdrplay_api_Close so all
@@ -4466,11 +4472,16 @@ repeat_schedule:
     int was_adhoc = g_state.adhoc_recording;
     g_state.adhoc_recording = 0;
     if (was_adhoc) {
-        /* Ad-hoc recording done — don't advance sched_idx, loop back to
-         * resume waiting for the original scheduled time.                */
         strncpy(g_state.cfg.output_file, DEFAULT_OUTPUT_FILE, MAX_PATH_LEN - 1);
-        LOG_INFO("Ad-hoc recording complete. Resuming wait for %s.",
-                 g_state.cfg.start_time);
+        LOG_INFO("Ad-hoc recording complete.");
+        strncpy(g_state.next_start, g_state.cfg.start_time,
+                sizeof(g_state.next_start) - 1);
+        snprintf(g_ui.sched, sizeof(g_ui.sched),
+                 "Schedule: %d entr%s  starts %s%s",
+                 g_state.cfg.schedule_count,
+                 g_state.cfg.schedule_count == 1 ? "y" : "ies",
+                 g_state.cfg.start_time,
+                 g_state.cfg.schedule_repeat ? "  (repeat)" : "");
     } else {
         sched_idx++;
     }
@@ -4760,14 +4771,20 @@ static void gui_start_session(void)
 {
     if (g_worker_active) return;
 
-    /* Clear the log window for the new session. Schedule a one-shot scroll
-     * to bottom 300 ms from now — by then the initial messages will have
-     * been appended and there is content to scroll to.                    */
+    /* Clear finished state immediately so the window doesn't briefly flash
+     * FINISHED on the next repaint before the memset runs below.         */
+    g_ui.finished = 0;
+    g_ui.next[0]  = '\0';
+    strncpy(g_ui.state, "STARTING", sizeof(g_ui.state) - 1);
+    g_state.session_complete = 0;  /* prevent monitor from re-publishing finished */
+
     if (g_hLog) SetWindowTextA(g_hLog, "");
 
     double keep_disk = g_ui.disk_free_mb;
     memset(&g_ui, 0, sizeof(g_ui));
     g_ui.disk_free_mb = keep_disk;
+    g_state.last_display_elapsed = 0.0;   /* clear so stop-while-waiting shows IDLE */
+    g_state.last_display_file_mb = -1;
     g_ui.peak_a = -90.0f;
     g_ui.peak_b = -90.0f;
     strncpy(g_ui.state, "STARTING", sizeof(g_ui.state) - 1);
@@ -5053,7 +5070,7 @@ static void paint_window(HWND hwnd)
         /* Next scheduled start, placed to the left of the clock. */
         if (s.next[0]) {
             char nb[64];
-            snprintf(nb, sizeof(nb), "Next: %s", s.next);
+            snprintf(nb, sizeof(nb), "Scheduled: %s", s.next);
             HGDIOBJ of = SelectObject(dc, g_hFontUI);
             SIZE nsz; GetTextExtentPoint32A(dc, nb, (int)strlen(nb), &nsz);
             SelectObject(dc, of);
@@ -5219,11 +5236,6 @@ static void paint_window(HWND hwnd)
         }
     }
 
-    /* ---- Bottom info line (scheduling), left of the buttons ---- */
-    if (s.sched[0]) {
-        draw_text_base(dc, 14, cr.bottom - 17, s.sched,
-                       COL_TEXT_DIM, g_hFontUI);
-    }
 
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
 
@@ -5419,12 +5431,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_ui.elapsed_sec = g_state.last_display_elapsed;
         if (g_state.last_display_file_mb >= 0)
             g_ui.file_mb = (double)g_state.last_display_file_mb;
-        if (g_state.session_complete) {
+        if (g_state.samples_received == 0) {
+            strncpy(g_ui.state, "IDLE", sizeof(g_ui.state) - 1);
+        } else if (g_state.session_complete) {
             g_ui.finished = 1;
             strncpy(g_ui.state, "FINISHED", sizeof(g_ui.state) - 1);
         } else {
-            strncpy(g_ui.state, "STOPPED", sizeof(g_ui.state) - 1);
+            strncpy(g_ui.state, "FINISHED", sizeof(g_ui.state) - 1);
         }
+        g_ui.next[0] = '\0';   /* clear scheduled time on stop/finish */
         gui_set_recording_ui(0);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
