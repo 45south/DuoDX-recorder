@@ -5,6 +5,35 @@ All notable changes to DuoDX are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.2] - 2026-07-04
+
+### Added
+- Record Now button: appears while waiting for a scheduled start; runs an immediate ad-hoc recording using current INI settings, then resumes waiting for the original scheduled time without disturbing the schedule.
+- Duration shown on the disk-info line (e.g. DUR: 9h10m).
+- Startup warning when schedule entries are not in chronological order.
+
+### Fixed
+- Pressing Stop during a scheduled wait no longer closes the application.
+- Scheduling status text now clears when recording starts and is not overwritten during active recording.
+- Log messages referencing Ctrl+C updated to reference the Stop button.
+
+## [2.1.1] - 2026-06-29
+
+### Added
+- Green COHERENT indicator on the disk-info line, shown only while recording on an RSPduo in dual-channel mode with both tuners set to the same frequency (the phase-coherent diversity condition).
+- Device-specific validation for `lna_state` (and `lna_state_b`) against the correct maximum for the connected device.
+- Validation for `duration_sec`, `ring_buffer_sec`, `ppm`, and `hdr_bw_khz` with explanatory error messages.
+- Startup log warning when `agc_enable=1`, explaining that `gain_reduction` will have little visible effect while AGC is on.
+
+### Fixed
+- `lna_state_b=-1` (the "inherit from Tuner A" default) was incorrectly rejected by the device-specific LNA validation added in 2.1.0's later builds, breaking RSPduo recordings that left Tuner B settings at their default. The inherited value is now resolved before validating.
+- A spurious "RSPduo AM port select failed: sdrplay_api_NotInitialised" warning when a multi-entry schedule applied an antenna setting between recordings after the device had already been uninitialised. The antenna setting is still applied correctly at the next recording's startup.
+
+### Documentation
+- Clarified that AGC overrides `gain_reduction` in real time, and that gain changes have little effect while AGC is enabled.
+- Clarified that the signal meters give a general indication of RF level for monitoring, not a precise calibrated measurement.
+- Documented the new COHERENT indicator.
+
 ## [2.1.0] - 2026-06-28
 
 ### Added
@@ -75,6 +104,8 @@ dual-tuner recording; scheduled, hourly and repeating recording; lock-free ring 
 zero-fill compensation; HTTP remote monitoring dashboard; named-pipe streaming;
 post-recording verification.
 
+[2.1.2]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.1.2
+[2.1.1]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.1.1
 [2.1.0]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.1.0
 [2.0.0]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.0.0
 [1.2.8]: https://github.com/45south/DuoDX-recorder/releases/tag/v1.2.8

@@ -44,7 +44,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "2.1.1"
+#define VERSION                 "2.1.2"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -284,6 +284,7 @@ typedef struct {
 
     /* Control */
     volatile int stop_requested;
+    volatile int adhoc_recording;  /* 1 = Record Now ad-hoc, resume wait after */
 
     /* Disk space monitoring (writer thread) */
     volatile int disk_warn_issued;   /* 1 once the low-space warning has fired */
@@ -322,6 +323,7 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 #define IDC_LOG          1001
 #define IDC_BTN_TOGGLE   1002
 #define IDC_BTN_AGC      1004
+#define IDC_BTN_NOW      1006
 
 /* Private window messages */
 #define WM_APP_LOG       (WM_APP + 1)   /* lParam = char* (heap), append to log  */
@@ -354,6 +356,7 @@ static HWND   g_hwnd        = NULL;
 static HWND   g_hLog        = NULL;
 static HWND   g_hBtnToggle  = NULL;
 static HWND   g_hBtnAgc     = NULL;
+static HWND   g_hBtnNow     = NULL;   /* Start Now — visible only while waiting */
 static HFONT  g_hFontLog    = NULL;
 static HFONT  g_hFontUI     = NULL;   /* labels                              */
 static HFONT  g_hFontVal    = NULL;   /* bold values / counters              */
@@ -374,6 +377,7 @@ static char   g_config_file[MAX_PATH_LEN] = CONFIG_FILE;
 static volatile int g_clock_show   = 1;   /* 1 = show live clock              */
 static volatile int g_clock_utc    = 1;   /* 1 = UTC, 0 = local               */
 static volatile int g_meter_style  = 0;   /* 0 = zone, 1 = graduated          */
+static volatile int g_record_now   = 0;  /* set by Record Now button: run one ad-hoc recording then resume wait */
 
 /* ---- Live UI snapshot ---------------------------------------------------
  * The GUI monitor thread fills this; WM_PAINT reads it. Plain scalars,
@@ -655,8 +659,12 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
 
         strncpy(s.next, state->next_start, sizeof(s.next) - 1);
 
-        /* Scheduling status for the bottom info line. */
-        if (state->cfg.hourly_enable) {
+        /* Scheduling status for the bottom info line.
+         * Only shown while waiting, not during active recording
+         * (the recording LED makes it obvious what state we're in). */
+        if (s.recording) {
+            s.sched[0] = '\0';
+        } else if (state->cfg.hourly_enable) {
             snprintf(s.sched, sizeof(s.sched),
                      "Hourly %d min%s%s%s",
                      state->cfg.hourly_window_min,
@@ -743,6 +751,15 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
                 InvalidateRect(g_hBtnAgc, NULL, FALSE);
                 last_agc_on      = s.agc_on;
                 last_agc_enabled = agc_enabled;
+            }
+        }
+        /* Show Start Now only while waiting for a scheduled start. */
+        if (g_hBtnNow) {
+            static int last_waiting = -1;
+            int waiting = !s.recording && !s.finished && g_state.cfg.start_time[0];
+            if (waiting != last_waiting) {
+                ShowWindow(g_hBtnNow, waiting ? SW_SHOW : SW_HIDE);
+                last_waiting = waiting;
             }
         }
 
@@ -2639,7 +2656,7 @@ static int wait_until_time(const char *time_str, int between_recordings)
                 diff += 86400;  /* wait until tomorrow        */
         }
 
-        if (diff <= 0) {
+        if (diff <= 0 || g_record_now) {
             LOG_INFO("Scheduled start time reached");
             return 1;
         }
@@ -2647,13 +2664,15 @@ static int wait_until_time(const char *time_str, int between_recordings)
         /* GUI build: countdown shown via g_state.next_start in status bar */
         snprintf(g_state.next_start, sizeof(g_state.next_start),
                  "%02d:%02d:%02d", target_h, target_m, target_s);
-        snprintf(g_ui.sched, sizeof(g_ui.sched),
-                 "Waiting for scheduled start: %02d:%02d:%02d",
-                 target_h, target_m, target_s);
-        if (g_hwnd) {
-            RECT cr; GetClientRect(g_hwnd, &cr);
-            RECT strip = { 0, cr.bottom - 36, cr.right, cr.bottom - 10 };
-            InvalidateRect(g_hwnd, &strip, FALSE);
+        if (!g_worker_active) {
+            snprintf(g_ui.sched, sizeof(g_ui.sched),
+                     "Waiting for scheduled start: %02d:%02d:%02d",
+                     target_h, target_m, target_s);
+            if (g_hwnd) {
+                RECT cr; GetClientRect(g_hwnd, &cr);
+                RECT strip = { 0, cr.bottom - 36, cr.right, cr.bottom - 10 };
+                InvalidateRect(g_hwnd, &strip, FALSE);
+            }
         }
         Sleep(1000);
     }
@@ -3237,15 +3256,17 @@ static int hourly_wait_for_next(int half_win_sec)
 
         /* Update the GUI scheduling text directly so it shows while the
          * monitor thread is not running (between hourly recordings).     */
-        snprintf(g_ui.sched, sizeof(g_ui.sched),
-                 "Hourly %d min  next %s%s",
-                 g_state.cfg.hourly_window_min,
-                 g_state.next_start,
-                 g_state.cfg.schedule_repeat ? "  (repeat)" : "");
-        if (g_hwnd) {
-            RECT cr; GetClientRect(g_hwnd, &cr);
-            RECT strip = { 0, cr.bottom - 36, cr.right, cr.bottom - 10 };
-            InvalidateRect(g_hwnd, &strip, FALSE);
+        if (!g_worker_active) {
+            snprintf(g_ui.sched, sizeof(g_ui.sched),
+                     "Hourly %d min  next %s%s",
+                     g_state.cfg.hourly_window_min,
+                     g_state.next_start,
+                     g_state.cfg.schedule_repeat ? "  (repeat)" : "");
+            if (g_hwnd) {
+                RECT cr; GetClientRect(g_hwnd, &cr);
+                RECT strip = { 0, cr.bottom - 36, cr.right, cr.bottom - 10 };
+                InvalidateRect(g_hwnd, &strip, FALSE);
+            }
         }
 
         Sleep(1000);
@@ -3432,6 +3453,21 @@ static DWORD WINAPI recording_worker(LPVOID param)
      * apply_schedule_entry before the device is initialised, and ensures
      * the start time is handled by the normal top-level wait path.      */
     if (g_state.cfg.schedule_only && g_state.cfg.schedule_count > 0) {
+        /* Warn if schedule entries are not in chronological order — only
+         * useful when schedule_1 hasn't passed (if it has, we skip it
+         * anyway and the "order" is irrelevant).                        */
+        if (!time_already_passed(g_state.cfg.schedule[0].start_time)) {
+            for (int si = 0; si < g_state.cfg.schedule_count - 1; si++) {
+                const char *t1 = g_state.cfg.schedule[si].start_time;
+                const char *t2 = g_state.cfg.schedule[si+1].start_time;
+                if (t1[0] && t2[0] && strcmp(t1, t2) > 0) {
+                    LOG_WARN("Schedule entries are not in chronological order: "
+                             "schedule_%d (%s) is after schedule_%d (%s). "
+                             "Re-number them chronologically.",
+                             si+1, t1, si+2, t2);
+                }
+            }
+        }
         ScheduleEntry *e = &g_state.cfg.schedule[0];
         LOG_INFO("schedule_only=1: using schedule_1 as first recording.");
         if (e->frequency_hz > 0.0)
@@ -3445,30 +3481,55 @@ static DWORD WINAPI recording_worker(LPVOID param)
         if (e->antenna[0])
             strncpy(g_state.cfg.antenna, e->antenna, sizeof(g_state.cfg.antenna)-1);
         if (e->start_time[0]) {
-            /* If the first scheduled time has already passed today, warn the
-             * user. The wait loop will automatically roll over to tomorrow
-             * via the midnight wrap (diff < -43200 path). We force this by
-             * checking here and logging clearly so it is not confusing.    */
-            if (time_already_passed(e->start_time))
-                LOG_INFO("schedule_only: schedule_1 start time %s has passed "
-                         "today - waiting until tomorrow.", e->start_time);
-            strncpy(g_state.cfg.start_time, e->start_time,
-                    sizeof(g_state.cfg.start_time)-1);
-            /* Pre-populate next_start so the HTTP dashboard shows the
-             * waiting time before the first recording begins.          */
-            strncpy(g_state.next_start, e->start_time,
-                    sizeof(g_state.next_start)-1);
-            LOG_INFO("schedule_only: will wait for start time %s",
-                     g_state.cfg.start_time);
+            if (!time_already_passed(e->start_time)) {
+                strncpy(g_state.cfg.start_time, e->start_time,
+                        sizeof(g_state.cfg.start_time)-1);
+            }
+            /* else: handled after the shift below */
         } else {
             LOG_WARN("schedule_only: schedule_1 has no start_time set - "
                      "recording will start immediately.");
         }
+        /* Save schedule_1 start_time before the shift overwrites schedule[0]. */
+        char orig_start[16] = {0};
+        strncpy(orig_start, e->start_time, sizeof(orig_start)-1);
+
         /* Remove schedule_1 from the list - remaining entries shift down */
         int i;
         for (i = 0; i < g_state.cfg.schedule_count - 1; i++)
             g_state.cfg.schedule[i] = g_state.cfg.schedule[i+1];
         g_state.cfg.schedule_count--;
+
+        /* Now handle the case where schedule_1 time has passed. */
+        if (orig_start[0] && time_already_passed(orig_start)) {
+            int found = 0;
+            for (int si = 0; si < g_state.cfg.schedule_count; si++) {
+                ScheduleEntry *se = &g_state.cfg.schedule[si];
+                if (se->start_time[0] && !time_already_passed(se->start_time)) {
+                    LOG_WARN("schedule_only: schedule_1 time %s has passed. "
+                             "Skipping to next entry at %s.",
+                             orig_start, se->start_time);
+                    strncpy(g_state.cfg.start_time, se->start_time,
+                            sizeof(g_state.cfg.start_time)-1);
+                    sched_idx = si + 1;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                LOG_INFO("schedule_only: all schedule times have passed today "
+                         "- waiting until schedule_1 (%s) tomorrow.", orig_start);
+                strncpy(g_state.cfg.start_time, orig_start,
+                        sizeof(g_state.cfg.start_time)-1);
+            }
+        }
+
+        if (g_state.cfg.start_time[0]) {
+            strncpy(g_state.next_start, g_state.cfg.start_time,
+                    sizeof(g_state.next_start)-1);
+            LOG_INFO("schedule_only: will wait for start time %s",
+                     g_state.cfg.start_time);
+        }
     }
 
     /* GUI build: Stop button / window close set g_running=0 (no signals). */
@@ -3862,6 +3923,7 @@ hourly_next:
     }
 
 repeat_schedule:
+    { int was_adhoc = 0;
     do {
         /* Apply schedule entry if we have one */
         if (g_state.cfg.schedule_count > 0 && sched_idx > 0) {
@@ -3878,13 +3940,29 @@ repeat_schedule:
             }
         } else {
             /* First (or only) recording - use top-level scheduled start.
-             * Never start immediately if time has passed (allow_immediate=0). */
-            if (g_state.cfg.start_time[0]) {
+             * Loop so Record Now can run an ad-hoc recording then resume
+             * waiting for the original scheduled time.                   */
+            while (g_state.cfg.start_time[0] && g_running) {
                 if (!wait_until_time(g_state.cfg.start_time, 0)) {
+                    /* Stop pressed — clean up and exit. */
                     rc = 0;
+                    g_worker_active = 0;
+                    if (g_gui_mon_thread) {
+                        WaitForSingleObject(g_gui_mon_thread, 2000);
+                        CloseHandle(g_gui_mon_thread);
+                        g_gui_mon_thread = NULL;
+                    }
                     goto cleanup_device;
                 }
+                if (!g_record_now) break;   /* normal scheduled start — proceed */
+                /* Record Now: set flag so the do-while loop resets and waits again */
+                g_state.adhoc_recording = 1;
+                g_record_now = 0;
+                LOG_INFO("Record Now: running ad-hoc recording, will resume wait for %s afterwards.",
+                         g_state.cfg.start_time);
+                break;
             }
+            if (!g_running) goto cleanup_device;
         }
 
 
@@ -4209,6 +4287,7 @@ repeat_schedule:
         }
     }
 
+    g_record_now = 0;   /* clear Start Now override once streaming begins */
     LOG_INFO("Streaming started. Use Stop to end, AGC to toggle gain control.");
 
     /* ------------------------------------------------------------------ */
@@ -4384,9 +4463,19 @@ repeat_schedule:
     /* ── Between-recording reset ─────────────────────────────────────────
      * If there are more schedule entries and no errors, stop the stream,
      * reset counters, reopen the output file, and restart the stream.   */
-    sched_idx++;
+    int was_adhoc = g_state.adhoc_recording;
+    g_state.adhoc_recording = 0;
+    if (was_adhoc) {
+        /* Ad-hoc recording done — don't advance sched_idx, loop back to
+         * resume waiting for the original scheduled time.                */
+        strncpy(g_state.cfg.output_file, DEFAULT_OUTPUT_FILE, MAX_PATH_LEN - 1);
+        LOG_INFO("Ad-hoc recording complete. Resuming wait for %s.",
+                 g_state.cfg.start_time);
+    } else {
+        sched_idx++;
+    }
     if (g_running && !g_state.writer_error
-            && sched_idx <= g_state.cfg.schedule_count) {
+            && (was_adhoc || sched_idx <= g_state.cfg.schedule_count)) {
         LOG_INFO("Preparing for schedule entry %d of %d ...",
                  sched_idx, g_state.cfg.schedule_count);
 
@@ -4443,7 +4532,8 @@ repeat_schedule:
     }
 
     } while (g_running && !g_state.writer_error
-             && sched_idx <= g_state.cfg.schedule_count);
+             && (was_adhoc || sched_idx <= g_state.cfg.schedule_count));
+    } /* end repeat_schedule scope */
 
     /* ------------------------------------------------------------------ */
     /* Hourly mode: loop back for next recording if still in session      */
@@ -4658,11 +4748,12 @@ cleanup_no_api:
 
 static void gui_set_recording_ui(int recording)
 {
-    /* Toggle button: text reflects what pressing it will do. */
     SetWindowTextA(g_hBtnToggle, recording ? "Stop" : "Start");
-    EnableWindow(g_hBtnToggle, TRUE);          /* always usable */
-    EnableWindow(g_hBtnAgc,     recording);     /* AGC only while live */
+    EnableWindow(g_hBtnToggle, TRUE);
+    EnableWindow(g_hBtnAgc,     recording);
     InvalidateRect(g_hBtnToggle, NULL, FALSE);
+    /* Hide Start Now — it shows only during the scheduled wait. */
+    if (g_hBtnNow) ShowWindow(g_hBtnNow, SW_HIDE);
 }
 
 static void gui_start_session(void)
@@ -5156,12 +5247,14 @@ static void layout_children(HWND hwnd)
     /* Bottom button bar: Start/Stop and AGC sit along the bottom edge. */
     int bbh = 26;                       /* button height                    */
     int bbY = cr.bottom - bbh - 10;     /* button row y                     */
-    int sbw = 90, abw = 64, bgap = 8;
+    int sbw = 90, abw = 64, nw = 80, bgap = 8;
     /* Buttons right-aligned; scheduling text painted to their left. */
     int agc_x = cr.right - 12 - abw;
     int tog_x = agc_x - bgap - sbw;
+    int now_x = tog_x - bgap - nw;
     MoveWindow(g_hBtnToggle, tog_x, bbY, sbw, bbh, TRUE);
     MoveWindow(g_hBtnAgc,    agc_x, bbY, abw, bbh, TRUE);
+    if (g_hBtnNow) MoveWindow(g_hBtnNow, now_x, bbY, nw, bbh, TRUE);
 
     /* Log fills the area between the disk line and the bottom button bar. */
     int logTop = diskY + 26 + 6;
@@ -5254,6 +5347,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 gui_start_session();
             }
             InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        case IDC_BTN_NOW:
+            /* Override the scheduled wait — start recording immediately. */
+            g_record_now = 1;
+            if (g_hBtnNow) ShowWindow(g_hBtnNow, SW_HIDE);
             return 0;
         case IDC_BTN_AGC: {
             /* Debounce: ignore presses within 1.5 s of the last one so the
@@ -5421,6 +5519,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
     /* Buttons (owner-drawn, positioned by layout_children) */
     g_hBtnToggle = mk_button(g_hwnd, IDC_BTN_TOGGLE, "Start");
     g_hBtnAgc    = mk_button(g_hwnd, IDC_BTN_AGC,    "AGC");
+    g_hBtnNow    = mk_button(g_hwnd, IDC_BTN_NOW,    "Start Now");
+    if (g_hBtnNow) ShowWindow(g_hBtnNow, SW_HIDE);
 
     /* Log control - RichEdit (per-line colour). Requires Msftedit.dll. */
     g_hLog = CreateWindowExA(WS_EX_CLIENTEDGE, "RICHEDIT50W", "",
