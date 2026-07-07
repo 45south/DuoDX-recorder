@@ -44,7 +44,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "2.1.2"
+#define VERSION                 "2.1.3"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -285,6 +285,12 @@ typedef struct {
     /* Control */
     volatile int stop_requested;
     volatile int adhoc_recording;  /* 1 = Record Now ad-hoc, resume wait after */
+    double   adhoc_frequency_hz;   /* top-level freq saved before schedule promotion */
+    double   adhoc_freq_b_hz;
+    int      adhoc_duration_sec;
+    double   sched1_frequency_hz;  /* schedule_1 freq (after promotion) */
+    double   sched1_freq_b_hz;
+    int      sched1_duration_sec;
 
     /* Disk space monitoring (writer thread) */
     volatile int disk_warn_issued;   /* 1 once the low-space warning has fired */
@@ -377,7 +383,8 @@ static char   g_config_file[MAX_PATH_LEN] = CONFIG_FILE;
 static volatile int g_clock_show   = 1;   /* 1 = show live clock              */
 static volatile int g_clock_utc    = 1;   /* 1 = UTC, 0 = local               */
 static volatile int g_meter_style  = 0;   /* 0 = zone, 1 = graduated          */
-static volatile int g_record_now   = 0;  /* set by Record Now button: run one ad-hoc recording then resume wait */
+static volatile int g_record_now   = 0;
+static volatile int g_log_freeze   = 0;  /* suppress auto-scroll after error */
 
 /* ---- Live UI snapshot ---------------------------------------------------
  * The GUI monitor thread fills this; WM_PAINT reads it. Plain scalars,
@@ -404,6 +411,7 @@ typedef struct {
     char   freq[48];
     char   span[64];      /* coverage range, e.g. "150 - 1750 kHz"          */
     char   sched[96];     /* scheduling status line for the bottom bar       */
+    char   infobar[128];  /* recording info strip (device, antenna, gain...) */
 } UiSnapshot;
 
 static UiSnapshot g_ui;   /* zero-initialised                                */
@@ -580,6 +588,8 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
     while (g_worker_active) {
         UiSnapshot s;
         memset(&s, 0, sizeof(s));
+        /* Preserve infobar from previous tick until device is known */
+        strncpy(s.infobar, g_ui.infobar, sizeof(s.infobar) - 1);
 
         s.recording = state->stream_running ? 1 : 0;
         s.finished  = (!state->stream_running && state->session_complete) ? 1 : 0;
@@ -592,6 +602,39 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
                       state->device.hwVer == SDRPLAY_RSPduo_ID &&
                       fabs(state->cfg.frequency_hz - state->cfg.freq_b_hz) < 1.0)
                      ? 1 : 0;
+
+        /* Info strip — built whenever device is known, persists after recording */
+        {
+            const char *dn = "RSP";
+            unsigned char hw = state->device.hwVer;
+            if (hw) {  /* only once device has been enumerated */
+                if      (hw == SDRPLAY_RSP1_ID)    dn = "RSP1";
+                else if (hw == SDRPLAY_RSP1A_ID)   dn = "RSP1A";
+                else if (hw == SDRPLAY_RSP1B_ID)   dn = "RSP1B";
+                else if (hw == SDRPLAY_RSP2_ID)    dn = "RSP2";
+                else if (hw == SDRPLAY_RSPduo_ID)  dn = "RSPduo";
+                else if (hw == SDRPLAY_RSPdx_ID)   dn = "RSPdx";
+                else if (hw == SDRPLAY_RSPdxR2_ID) dn = "RSPdxR2";
+                if (state->cfg.dual_channel)
+                    snprintf(s.infobar, sizeof(s.infobar),
+                             "%s  \xB7  Ant: %s  \xB7  GR: %d/%d dB  LNA: %d/%d  \xB7  SR: %.3g Msps",
+                             dn,
+                             state->cfg.antenna[0] ? state->cfg.antenna : "-",
+                             state->cfg.gain_reduction,
+                             state->cfg.gain_reduction_b >= 0 ? state->cfg.gain_reduction_b : state->cfg.gain_reduction,
+                             state->cfg.lna_state,
+                             state->cfg.lna_state_b >= 0 ? state->cfg.lna_state_b : state->cfg.lna_state,
+                             state->cfg.expected_output_rate_hz / 1e6);
+                else
+                    snprintf(s.infobar, sizeof(s.infobar),
+                             "%s  \xB7  Ant: %s  \xB7  GR: %d dB  LNA: %d  \xB7  SR: %.3g Msps",
+                             dn,
+                             state->cfg.antenna[0] ? state->cfg.antenna : "-",
+                             state->cfg.gain_reduction,
+                             state->cfg.lna_state,
+                             state->cfg.expected_output_rate_hz / 1e6);
+            }
+        }
 
         /* Elapsed */
         if (state->stream_running && state->start_time.QuadPart > 0
@@ -732,10 +775,15 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
                  * the owner-drawn buttons don't flicker every monitor tick.
                  * The buttons are repainted only when their state changes.  */
                 int log_bot = tl.y + (int)(lr.bottom - lr.top);
-                int btn_top = cr.bottom - 36; /* top of button row           */
+                int btn_top = cr.bottom - 36;
                 if (log_bot < btn_top) {
                     RECT sched_strip = { 0, log_bot, cr.right, btn_top };
                     InvalidateRect(g_hwnd, &sched_strip, FALSE);
+                }
+                if (g_ui.infobar[0]) {
+                    /* Invalidate only left of the buttons (now_x = cr.right - 262) */
+                    RECT ib_strip = { 0, btn_top, cr.right - 262, cr.bottom };
+                    InvalidateRect(g_hwnd, &ib_strip, FALSE);
                 }
             } else {
                 InvalidateRect(g_hwnd, NULL, FALSE);
@@ -756,7 +804,8 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
         /* Show Start Now only while waiting for a scheduled start. */
         if (g_hBtnNow) {
             static int last_waiting = -1;
-            int waiting = !s.recording && !s.finished && g_state.cfg.start_time[0];
+            int waiting = !s.recording && !s.finished &&
+                          (g_state.cfg.start_time[0] || g_state.next_start[0]);
             if (waiting != last_waiting) {
                 ShowWindow(g_hBtnNow, waiting ? SW_SHOW : SW_HIDE);
                 last_waiting = waiting;
@@ -1043,7 +1092,8 @@ static int write_linrad_header(HANDLE fh, const Config *cfg, int num_channels)
     hdr.rx_ad_speed        = (int32_t)cfg->expected_output_rate_hz;
     hdr.save_init_flag     = 0;
 
-    LOG_INFO("Writing Linrad 41-byte header: passband_center=%.6f MHz  "
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writing Linrad 41-byte header: passband_center=%.6f MHz  "
              "SR=%d sps  CH=%d",
              hdr.passband_center, hdr.rx_ad_speed, hdr.rx_rf_channels);
 
@@ -1120,7 +1170,8 @@ static int write_sdruno_header(HANDLE fh, const Config *cfg)
     hdr.start_time.wMilliseconds = st.wMilliseconds;
     hdr.centre_freq_hz = (uint32_t)(cfg->frequency_hz + 0.5);
     memcpy(hdr.data_id, "data", 4);  hdr.data_size = 0;
-    LOG_INFO("Writing SDRuno WAV header: SR=%u Hz  CF=%u Hz",
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writing SDRuno WAV header: SR=%u Hz  CF=%u Hz",
              hdr.sample_rate, hdr.centre_freq_hz);
     if (!WriteFile(fh, &hdr, (DWORD)sizeof(hdr), &written, NULL)
             || written != (DWORD)sizeof(hdr)) {
@@ -1147,7 +1198,8 @@ static int write_sdrconnect_header(HANDLE fh, const Config *cfg)
     hdr.byte_rate    = hdr.sample_rate * 4;
     hdr.block_align  = 4;  hdr.bits_per_sample = 16;
     memcpy(hdr.data_id, "data", 4);  hdr.data_size = 0;
-    LOG_INFO("Writing SDR Connect WAV header: SR=%u Hz  CF=%.0f Hz",
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writing SDR Connect WAV header: SR=%u Hz  CF=%.0f Hz",
              hdr.sample_rate, cfg->frequency_hz);
     if (!WriteFile(fh, &hdr, (DWORD)sizeof(hdr), &written, NULL)
             || written != (DWORD)sizeof(hdr)) {
@@ -1413,7 +1465,8 @@ static DWORD WINAPI writer_thread_func(LPVOID param)
                          (LONG64)(to_read / (state->cfg.dual_channel ? 8 : 4)));
     }
 
-    LOG_INFO("Writer thread exiting");
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writer thread exiting");
     return 0;
 }
 
@@ -1800,7 +1853,8 @@ static int validate_config(Config *cfg)
 
             LOG_INFO("Config validated: %s", c->note);
             if (c->decimation > 1)
-                LOG_INFO("  Internal decimation /%d: output will be %.0f sps",
+                if (g_state.cfg.verbose)
+                    LOG_INFO("  Internal decimation /%d: output will be %.0f sps",
                          c->decimation, c->output_rate_hz);
             return 1;
         }
@@ -2344,7 +2398,8 @@ static void apply_antenna_and_biast(AppState *state)
     /* Antenna and Bias-T are set before Init in setup_device_single.
      * No post-Init Update call needed or supported for these fields. */
     if (hw == SDRPLAY_RSPdx_ID || hw == SDRPLAY_RSPdxR2_ID) {
-        LOG_INFO("RSPdx antenna: %s%s", cfg->antenna,
+        if (cfg->verbose)
+            LOG_INFO("RSPdx antenna: %s%s", cfg->antenna,
                  cfg->bias_t ? "  Bias-T: enabled" : "");
         return;
     }
@@ -2385,7 +2440,8 @@ static void apply_antenna_and_biast(AppState *state)
         if (err != sdrplay_api_Success)
             LOG_WARN("RSPduo AM port select failed: %s", sdrplay_api_GetErrorString(err));
         else
-            LOG_INFO("RSPduo Tuner 1 port: %s", use_hiz ? "Hi-Z" : "50 ohm");
+            if (cfg->verbose)
+                LOG_INFO("RSPduo Tuner 1 port: %s", use_hiz ? "Hi-Z" : "50 ohm");
 
         /* Hi-Z AM notch - only applies when Tuner 1 is on the Hi-Z port */
         if (cfg->hiz_notch) {
@@ -2414,7 +2470,8 @@ static void apply_antenna_and_biast(AppState *state)
                 if (err != sdrplay_api_Success)
                     LOG_WARN("RSPduo Bias-T failed: %s", sdrplay_api_GetErrorString(err));
                 else
-                    LOG_INFO("RSPduo Tuner 2 Bias-T enabled");
+                    if (cfg->verbose)
+                        LOG_INFO("RSPduo Tuner 2 Bias-T enabled");
             } else {
                 LOG_WARN("RSPduo Bias-T requires dual-channel mode or Tuner 2 active");
             }
@@ -2538,7 +2595,8 @@ static void apply_notch_filters(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSPduo T1 RF notch failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSPduo Tuner A RF notch enabled");
+                if (cfg->verbose)
+                    LOG_INFO("RSPduo Tuner A RF notch enabled");
         }
         if (cfg->notch_dab) {
             state->ch_a_params->rspDuoTunerParams.rfDabNotchEnable = 1;
@@ -2548,7 +2606,8 @@ static void apply_notch_filters(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSPduo T1 DAB notch failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSPduo Tuner A DAB notch enabled");
+                if (cfg->verbose)
+                    LOG_INFO("RSPduo Tuner A DAB notch enabled");
         }
         /* Tuner B notches (only meaningful in dual-channel mode) */
         if (cfg->dual_channel && state->ch_b_params) {
@@ -2560,7 +2619,8 @@ static void apply_notch_filters(AppState *state)
                 if (err != sdrplay_api_Success)
                     LOG_WARN("RSPduo T2 RF notch failed: %s", sdrplay_api_GetErrorString(err));
                 else
-                    LOG_INFO("RSPduo Tuner B RF notch enabled");
+                    if (cfg->verbose)
+                        LOG_INFO("RSPduo Tuner B RF notch enabled");
             }
             if (dab_b) {
                 state->ch_b_params->rspDuoTunerParams.rfDabNotchEnable = 1;
@@ -2570,7 +2630,8 @@ static void apply_notch_filters(AppState *state)
                 if (err != sdrplay_api_Success)
                     LOG_WARN("RSPduo T2 DAB notch failed: %s", sdrplay_api_GetErrorString(err));
                 else
-                    LOG_INFO("RSPduo Tuner B DAB notch enabled");
+                    if (cfg->verbose)
+                        LOG_INFO("RSPduo Tuner B DAB notch enabled");
             }
         }
         return;
@@ -2859,7 +2920,8 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
     int exp_m = (int)((total_s % 3600) / 60);
     int exp_s = (int)(total_s % 60);
 
-    LOG_INFO("Verifying file: %s", cfg->output_file);
+    if (cfg->verbose)
+        LOG_INFO("Verifying file: %s", cfg->output_file);
 
     if (diff == 0) {
         LOG_OK("Verification PASSED - Total duration: %02d:%02d:%02d.",
@@ -3284,6 +3346,7 @@ static DWORD WINAPI recording_worker(LPVOID param)
     char                     *config_file = g_config_file;
     HANDLE                    http_thread     = NULL;
     int                       sched_idx       = 0;   /* current schedule entry */
+    int                       orig_sched_count = 0; /* total entries for display */
     int                       rc = 0;
     SIZE_T                    ring_size;
     int                       num_channels;
@@ -3311,7 +3374,8 @@ static DWORD WINAPI recording_worker(LPVOID param)
     config_load_ini(&g_state.cfg, config_file);
 
     LOG_INFO("DuoDX GUI v%s  (c) 2026 Dave Headland", VERSION);
-    LOG_INFO("Config file: %s", config_file);
+    if (g_state.cfg.verbose)
+        LOG_INFO("Config file: %s", config_file);
 
     /* Keep the GUI clock in step with this session's config. */
     g_clock_show  = g_state.cfg.show_clock;
@@ -3337,10 +3401,12 @@ static DWORD WINAPI recording_worker(LPVOID param)
         if (GetDiskFreeSpaceExA(dir_path, &free_bytes, NULL, NULL)) {
             LONG64 free_mb = (LONG64)(free_bytes.QuadPart / (1024ULL * 1024ULL));
             InterlockedExchange64(&g_state.disk_free_mb, free_mb);
-            if (free_mb >= 1024)
-                LOG_INFO("Free space on target drive: %.1f GB", free_mb / 1024.0);
-            else
-                LOG_INFO("Free space on target drive: %lld MB", (long long)free_mb);
+            if (free_mb >= 1024) {
+                if (g_state.cfg.verbose)
+                    LOG_INFO("Free space on target drive: %.1f GB", free_mb / 1024.0);
+            } else
+                if (g_state.cfg.verbose)
+                    LOG_INFO("Free space on target drive: %lld MB", (long long)free_mb);
         }
     }
 
@@ -3352,14 +3418,19 @@ static DWORD WINAPI recording_worker(LPVOID param)
     }
 
     /* Print effective configuration */
-    LOG_INFO("Configuration:");
+    if (g_state.cfg.verbose)
+        LOG_INFO("Configuration:");
     if (g_state.cfg.recording_path[0])
         LOG_INFO("  Recording path : %s", g_state.cfg.recording_path);
-    LOG_INFO("  Output file    : %s", g_state.cfg.output_file);
-    LOG_INFO("  Sample rate    : %.3f Msps (ADC rate; actual output may differ with IF mode)",
+    if (g_state.cfg.verbose)
+        LOG_INFO("  Output file    : %s", g_state.cfg.output_file);
+    if (g_state.cfg.verbose)
+        LOG_INFO("  Sample rate    : %.3f Msps (ADC rate; actual output may differ with IF mode)",
              g_state.cfg.sample_rate_hz / 1e6);
-    LOG_INFO("  IF frequency   : %d kHz", g_state.cfg.if_khz);
-    LOG_INFO("  IF bandwidth   : %d kHz", g_state.cfg.bw_khz);
+    if (g_state.cfg.verbose)
+        LOG_INFO("  IF frequency   : %d kHz", g_state.cfg.if_khz);
+    if (g_state.cfg.verbose)
+        LOG_INFO("  IF bandwidth   : %d kHz", g_state.cfg.bw_khz);
     if (g_state.cfg.dual_channel) {
         int gr_b  = (g_state.cfg.gain_reduction_b >= 0) ? g_state.cfg.gain_reduction_b : g_state.cfg.gain_reduction;
         int lna_b = (g_state.cfg.lna_state_b      >= 0) ? g_state.cfg.lna_state_b      : g_state.cfg.lna_state;
@@ -3368,29 +3439,38 @@ static DWORD WINAPI recording_worker(LPVOID param)
         if (g_state.device.hwVer == SDRPLAY_RSPduo_ID)
             LOG_OK(  "  Dual channel   : YES (RSPduo)");
         else
-            LOG_INFO("  Dual channel   : YES");
-        LOG_INFO("  Tuner A        : %.6f MHz  Gain: %d dB  LNA: %d",
+            if (g_state.cfg.verbose)
+                LOG_INFO("  Dual channel   : YES");
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Tuner A        : %.6f MHz  Gain: %d dB  LNA: %d",
                  g_state.cfg.frequency_hz / 1e6,
                  g_state.cfg.gain_reduction,
                  g_state.cfg.lna_state);
-        LOG_INFO("  Tuner B        : %.6f MHz  Gain: %d dB  LNA: %d  (%s)",
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Tuner B        : %.6f MHz  Gain: %d dB  LNA: %d  (%s)",
                  g_state.cfg.freq_b_hz / 1e6, gr_b, lna_b,
                  indep ? "independent" : "same as A");
     } else {
-        LOG_INFO("  Frequency      : %.6f MHz", g_state.cfg.frequency_hz / 1e6);
-        LOG_INFO("  Gain reduction : %d dB  LNA: %d",
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Frequency      : %.6f MHz", g_state.cfg.frequency_hz / 1e6);
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Gain reduction : %d dB  LNA: %d",
                  g_state.cfg.gain_reduction, g_state.cfg.lna_state);
     }
     {
         int ds = g_state.cfg.duration_sec;
-        if (ds > 0)
-            LOG_INFO("  Duration       : limited (%02d:%02d:%02d)",
+        if (ds > 0) {
+            if (g_state.cfg.verbose)
+                LOG_INFO("  Duration       : limited (%02d:%02d:%02d)",
                      ds / 3600, (ds % 3600) / 60, ds % 60);
-        else
-            LOG_INFO("  Duration       : unlimited (Stop to end)");
+        } else {
+            if (g_state.cfg.verbose)
+                LOG_INFO("  Duration       : unlimited (Stop to end)");
+        }
     }
     if (g_state.cfg.start_time[0])
-        LOG_INFO("  Scheduled start: %s", g_state.cfg.start_time);
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Scheduled start: %s", g_state.cfg.start_time);
     if (g_state.cfg.dual_channel) {
         /* Tuner 1 can be Hi-Z or 50 ohm; Tuner 2 is always 50 ohm, no selection */
         const char *t1_port =
@@ -3398,14 +3478,17 @@ static DWORD WINAPI recording_worker(LPVOID param)
              !strcmp(g_state.cfg.antenna, "hi-z") ||
              !strcmp(g_state.cfg.antenna, "HIZ"))
             ? "Hi-Z" : "50 ohm";
-        LOG_INFO("  Antenna        : T1=%s  T2=50 ohm (fixed)", t1_port);
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Antenna        : T1=%s  T2=50 ohm (fixed)", t1_port);
     } else {
-        LOG_INFO("  Antenna        : %s", g_state.cfg.antenna);
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Antenna        : %s", g_state.cfg.antenna);
     }
     if (g_state.cfg.bias_t)
         LOG_OK(  "  Bias-T         : ENABLED");
     else
-        LOG_INFO("  Bias-T         : Off");
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Bias-T         : Off");
     if (g_state.cfg.agc_enable) {
         LOG_INFO("  AGC            : ENABLED");
         LOG_WARN("AGC is enabled: the hardware AGC loop will continuously "
@@ -3414,14 +3497,18 @@ static DWORD WINAPI recording_worker(LPVOID param)
                  "effect while AGC is on. Set agc_enable=0 for manual gain "
                  "control to take effect.", g_state.cfg.gain_reduction);
     } else
-        LOG_INFO("  AGC            : Off");
+        if (g_state.cfg.verbose)
+            LOG_INFO("  AGC            : Off");
     /* HDR validation runs later in apply_hdr_mode(). Display as white here
      * regardless of hdr_enable; apply_hdr_mode() will log a green confirmation
      * if the configuration is valid, or an error if not.                   */
-    if (g_state.cfg.hdr_enable)
-        LOG_INFO("  HDR mode       : ENABLED (BW=%d kHz)", g_state.cfg.hdr_bw_khz);
-    else
-        LOG_INFO("  HDR mode       : Off");
+    if (g_state.cfg.hdr_enable) {
+        if (g_state.cfg.verbose)
+            LOG_INFO("  HDR mode       : ENABLED (BW=%d kHz)", g_state.cfg.hdr_bw_khz);
+    } else {
+        if (g_state.cfg.verbose)
+            LOG_INFO("  HDR mode       : Off");
+    }
     if (g_state.cfg.hiz_notch)
         LOG_INFO("  Hi-Z AM notch  : ENABLED");
     if (g_state.cfg.ppm != 0.0)
@@ -3430,8 +3517,10 @@ static DWORD WINAPI recording_worker(LPVOID param)
         LOG_INFO("  Device serial  : %s", g_state.cfg.device_serial);
     if (g_state.cfg.decimation > 1)
         LOG_INFO("  SW decimation  : /%d", g_state.cfg.decimation);
-    LOG_INFO("  Ring buffer    : %d seconds", g_state.cfg.ring_buffer_sec);
-    LOG_INFO("  Time mode      : %s (scheduler, log and filenames)",
+    if (g_state.cfg.verbose)
+        LOG_INFO("  Ring buffer    : %d seconds", g_state.cfg.ring_buffer_sec);
+    if (g_state.cfg.verbose)
+        LOG_INFO("  Time mode      : %s (scheduler, log and filenames)",
              g_state.cfg.use_utc ? "UTC" : "Local time");
 
     /* Validate parameter combination before touching hardware */
@@ -3470,12 +3559,21 @@ static DWORD WINAPI recording_worker(LPVOID param)
         }
         ScheduleEntry *e = &g_state.cfg.schedule[0];
         LOG_INFO("schedule_only=1: using schedule_1 as first recording.");
+        orig_sched_count = g_state.cfg.schedule_count; /* save total before shift */
+        /* Save original top-level values (pre-promotion) for ad-hoc recordings. */
+        g_state.adhoc_frequency_hz  = g_state.cfg.frequency_hz;
+        g_state.adhoc_freq_b_hz     = g_state.cfg.freq_b_hz;
+        g_state.adhoc_duration_sec  = g_state.cfg.duration_sec;
         if (e->frequency_hz > 0.0)
             g_state.cfg.frequency_hz = e->frequency_hz;
         if (e->freq_b_hz > 0.0)
             g_state.cfg.freq_b_hz = e->freq_b_hz;
         if (e->duration_sec > 0)
             g_state.cfg.duration_sec = e->duration_sec;
+        /* Save schedule_1 values post-promotion for restoration after ad-hoc. */
+        g_state.sched1_frequency_hz = g_state.cfg.frequency_hz;
+        g_state.sched1_freq_b_hz    = g_state.cfg.freq_b_hz;
+        g_state.sched1_duration_sec = g_state.cfg.duration_sec;
         if (e->output_file[0])
             strncpy(g_state.cfg.output_file, e->output_file, MAX_PATH_LEN-1);
         if (e->antenna[0])
@@ -3544,13 +3642,15 @@ static DWORD WINAPI recording_worker(LPVOID param)
         rc = 1;
         goto cleanup_no_api;
     }
-    LOG_INFO("SDRplay API opened successfully");
+    if (g_state.cfg.verbose)
+        LOG_INFO("SDRplay API opened successfully");
 
     /* Check API version */
     {
         float ver;
         sdrplay_api_ApiVersion(&ver);
-        LOG_INFO("SDRplay API version: %.2f", ver);
+        if (g_state.cfg.verbose)
+            LOG_INFO("SDRplay API version: %.2f", ver);
         if (ver < 3.0f) {
             LOG_ERROR("API version 3.0 or later required");
             rc = 1;
@@ -3576,9 +3676,11 @@ static DWORD WINAPI recording_worker(LPVOID param)
         goto cleanup_api;
     }
 
-    LOG_INFO("Found %u SDRplay device(s):", num_devices);
+    if (g_state.cfg.verbose)
+        LOG_INFO("Found %u SDRplay device(s):", num_devices);
     for (i = 0; i < num_devices; i++) {
-        LOG_INFO("  [%u] hwVer=%u  SerNo=%s  tuner=%d",
+        if (g_state.cfg.verbose)
+            LOG_INFO("  [%u] hwVer=%u  SerNo=%s  tuner=%d",
                  i, devices[i].hwVer, devices[i].SerNo, devices[i].tuner);
     }
 
@@ -3621,6 +3723,26 @@ static DWORD WINAPI recording_worker(LPVOID param)
     default:                   strncpy(device_name, "RSP?",    63); break;
     }
     LOG_INFO("Using device: %s (SerNo: %s)", device_name, g_state.device.SerNo);
+
+    /* Pre-populate infobar so it shows immediately, before monitor starts */
+    if (g_state.cfg.dual_channel)
+        snprintf(g_ui.infobar, sizeof(g_ui.infobar),
+                 "%s  \xB7  Ant: %s  \xB7  GR: %d/%d dB  LNA: %d/%d  \xB7  SR: %.3g Msps",
+                 device_name,
+                 g_state.cfg.antenna[0] ? g_state.cfg.antenna : "-",
+                 g_state.cfg.gain_reduction,
+                 g_state.cfg.gain_reduction_b >= 0 ? g_state.cfg.gain_reduction_b : g_state.cfg.gain_reduction,
+                 g_state.cfg.lna_state,
+                 g_state.cfg.lna_state_b >= 0 ? g_state.cfg.lna_state_b : g_state.cfg.lna_state,
+                 g_state.cfg.expected_output_rate_hz / 1e6);
+    else
+        snprintf(g_ui.infobar, sizeof(g_ui.infobar),
+                 "%s  \xB7  Ant: %s  \xB7  GR: %d dB  LNA: %d  \xB7  SR: %.3g Msps",
+                 device_name,
+                 g_state.cfg.antenna[0] ? g_state.cfg.antenna : "-",
+                 g_state.cfg.gain_reduction,
+                 g_state.cfg.lna_state,
+                 g_state.cfg.expected_output_rate_hz / 1e6);
 
     /* Check for RSPduo dual mode request */
     if (g_state.cfg.dual_channel) {
@@ -3766,7 +3888,8 @@ static DWORD WINAPI recording_worker(LPVOID param)
             g_state.cfg.monitor_interval_ms = 500;
         }
 
-        LOG_INFO("Device parameters validated for %s "
+        if (g_state.cfg.verbose)
+            LOG_INFO("Device parameters validated for %s "
                  "(GR=%d dB, LNA=%d/%d).",
                  dev_name, g_state.cfg.gain_reduction,
                  g_state.cfg.lna_state, max_lna);
@@ -3803,7 +3926,8 @@ static DWORD WINAPI recording_worker(LPVOID param)
             ring_size = RING_BUFFER_MIN_BYTES;
         }
 
-        LOG_INFO("Allocating ring buffer: %zu MB",
+        if (g_state.cfg.verbose)
+            LOG_INFO("Allocating ring buffer: %zu MB",
                  ring_size / (1024 * 1024));
 
         if (ring_init(&g_state.ring, ring_size) != 0) {
@@ -3824,7 +3948,8 @@ static DWORD WINAPI recording_worker(LPVOID param)
         if (!http_thread)
             LOG_WARN("HTTP: CreateThread failed - status server disabled.");
         else {
-            LOG_INFO("Open http://<this-pc-ip>:%d/ in a browser to monitor.",
+            if (g_state.cfg.verbose)
+                LOG_INFO("Open http://<this-pc-ip>:%d/ in a browser to monitor.",
                      g_state.cfg.http_port);
             /* Wait for the HTTP thread to finish binding so its listening
              * message prints before the scheduled countdown begins.     */
@@ -3929,7 +4054,7 @@ repeat_schedule:
         if (g_state.cfg.schedule_count > 0 && sched_idx > 0) {
             ScheduleEntry *e = &g_state.cfg.schedule[sched_idx - 1];
             LOG_INFO("Schedule entry %d of %d",
-                     sched_idx, g_state.cfg.schedule_count);
+                     sched_idx + 1, orig_sched_count);
             apply_schedule_entry(&g_state, e);
             /* Wait for this entry's start time if specified */
             if (e->start_time[0]) {
@@ -3937,6 +4062,20 @@ repeat_schedule:
                     rc = 0;
                     goto cleanup_writer;
                 }
+            }
+            /* If Record Now was pressed during the wait, restore top-level
+             * frequency/duration so the ad-hoc uses original INI settings. */
+            if (g_record_now) {
+                if (g_state.adhoc_frequency_hz > 0.0)
+                    g_state.cfg.frequency_hz = g_state.adhoc_frequency_hz;
+                if (g_state.adhoc_freq_b_hz > 0.0)
+                    g_state.cfg.freq_b_hz = g_state.adhoc_freq_b_hz;
+                if (g_state.adhoc_duration_sec > 0)
+                    g_state.cfg.duration_sec = g_state.adhoc_duration_sec;
+                g_state.adhoc_recording = 1;
+                g_record_now = 0;
+                LOG_INFO("Record Now: ad-hoc recording at %.3f MHz for %d sec.",
+                         g_state.cfg.frequency_hz / 1e6, g_state.cfg.duration_sec);
             }
         } else {
             /* First (or only) recording - use top-level scheduled start.
@@ -3955,11 +4094,18 @@ repeat_schedule:
                     goto cleanup_device;
                 }
                 if (!g_record_now) break;   /* normal scheduled start — proceed */
-                /* Record Now: set flag so the do-while loop resets and waits again */
+                /* Record Now: restore original top-level freq/duration so
+                 * ad-hoc uses INI settings, not the promoted schedule_1 values. */
+                if (g_state.adhoc_frequency_hz > 0.0)
+                    g_state.cfg.frequency_hz = g_state.adhoc_frequency_hz;
+                if (g_state.adhoc_freq_b_hz > 0.0)
+                    g_state.cfg.freq_b_hz = g_state.adhoc_freq_b_hz;
+                if (g_state.adhoc_duration_sec > 0)
+                    g_state.cfg.duration_sec = g_state.adhoc_duration_sec;
                 g_state.adhoc_recording = 1;
                 g_record_now = 0;
-                LOG_INFO("Record Now: running ad-hoc recording, will resume wait for %s afterwards.",
-                         g_state.cfg.start_time);
+                LOG_INFO("Record Now: ad-hoc recording at %.3f MHz for %d sec.",
+                         g_state.cfg.frequency_hz / 1e6, g_state.cfg.duration_sec);
                 break;
             }
             if (!g_running) goto cleanup_device;
@@ -4094,7 +4240,8 @@ repeat_schedule:
         if (hsp != INVALID_HANDLE_VALUE) {
             static uint8_t spinup_buf[4096];
             DWORD written, remaining = (DWORD)g_state.cfg.spinup_bytes;
-            LOG_INFO("Spinning up drive (writing %d kB to '%s') ...",
+            if (g_state.cfg.verbose)
+                LOG_INFO("Spinning up drive (writing %d kB to '%s') ...",
                      g_state.cfg.spinup_bytes / 1024, spinup_path);
             while (remaining > 0) {
                 DWORD chunk = remaining < sizeof(spinup_buf)
@@ -4105,7 +4252,8 @@ repeat_schedule:
             }
             FlushFileBuffers(hsp);
             CloseHandle(hsp);
-            LOG_INFO("Drive spin-up complete.");
+            if (g_state.cfg.verbose)
+                LOG_INFO("Drive spin-up complete.");
         } else {
             LOG_WARN("Drive spin-up: could not create temp file '%s' "
                      "(error %lu) - continuing without spin-up.",
@@ -4126,6 +4274,7 @@ repeat_schedule:
         LOG_ERROR("Cannot open output file '%s': error %lu",
                   g_state.cfg.output_file, GetLastError());
         rc = 1;
+        g_running = 0;   /* prevent retry / schedule continuation on error */
         goto cleanup_ring;
     }
 
@@ -4156,18 +4305,10 @@ repeat_schedule:
      * recording indefinitely).                                             *
      * ------------------------------------------------------------------ */
     {
-        char dir_path[MAX_PATH] = ".";
-        const char *last_sep = NULL;
-        const char *p2 = g_state.cfg.output_file;
-        for (; *p2; p2++)
-            if (*p2 == '\\' || *p2 == '/') last_sep = p2;
-        if (last_sep) {
-            size_t len = (size_t)(last_sep - g_state.cfg.output_file) + 1;
-            if (len < sizeof(dir_path)) {
-                memcpy(dir_path, g_state.cfg.output_file, len);
-                dir_path[len] = '\0';
-            }
-        }
+        /* Use recording_path for the disk check — output_file may not
+         * have been generated yet and still holds the default name.     */
+        const char *dir_path = g_state.cfg.recording_path[0]
+                               ? g_state.cfg.recording_path : ".";
 
         ULARGE_INTEGER free_bytes;
         if (GetDiskFreeSpaceExA(dir_path, &free_bytes, NULL, NULL)) {
@@ -4227,7 +4368,8 @@ repeat_schedule:
 
     /* Wait for writer thread to be ready */
     WaitForSingleObject(g_state.writer_ready_event, 5000);
-    LOG_INFO("Writer thread started");
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writer thread started");
 
     /* ------------------------------------------------------------------ */
     /* Step 8: Set up and start streaming                                  */
@@ -4242,7 +4384,8 @@ repeat_schedule:
         callbacks.StreamACbFn = stream_callback_single;
     }
 
-    LOG_INFO("Starting stream...");
+    if (g_state.cfg.verbose)
+        LOG_INFO("Starting stream...");
     err = sdrplay_api_Init(g_state.device.dev, &callbacks, &g_state);
     if (err != sdrplay_api_Success) {
         LOG_ERROR("sdrplay_api_Init: %s", sdrplay_api_GetErrorString(err));
@@ -4386,12 +4529,14 @@ repeat_schedule:
         g_state.next_start,
         (long long)g_state.samples_received,
         (long long)g_state.samples_written);
-    LOG_INFO("Stopping stream...");
+    if (g_state.cfg.verbose)
+        LOG_INFO("Stopping stream...");
 
     sdrplay_api_Uninit(g_state.device.dev);
 
     /* Let writer drain the remaining ring buffer data */
-    LOG_INFO("Draining ring buffer (%zu KB remaining)...",
+    if (g_state.cfg.verbose)
+        LOG_INFO("Draining ring buffer (%zu KB remaining)...",
              ring_available(&g_state.ring) / 1024);
     g_state.writer_running = 0;
     WaitForSingleObject(g_state.writer_thread, 30000);
@@ -4407,9 +4552,12 @@ repeat_schedule:
                   / (double)g_state.perf_freq.QuadPart;
 
         LOG_INFO("Recording complete:");
-        LOG_INFO("  Duration       : %.2f seconds", elapsed);
-        LOG_INFO("  Samples rx     : %lld", (long long)g_state.samples_received);
-        LOG_INFO("  Samples written: %lld (real + zero-fill)",
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Duration       : %.2f seconds", elapsed);
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Samples rx     : %lld", (long long)g_state.samples_received);
+        if (g_state.cfg.verbose)
+            LOG_INFO("  Samples written: %lld (real + zero-fill)",
                  (long long)g_state.samples_written);
 
         /* Zero-fill and overflow lines: green when clean, orange when not */
@@ -4474,6 +4622,13 @@ repeat_schedule:
     if (was_adhoc) {
         strncpy(g_state.cfg.output_file, DEFAULT_OUTPUT_FILE, MAX_PATH_LEN - 1);
         LOG_INFO("Ad-hoc recording complete.");
+        /* Restore schedule_1 settings so it records at correct frequency. */
+        if (sched_idx == 0 && g_state.sched1_frequency_hz > 0.0) {
+            g_state.cfg.frequency_hz = g_state.sched1_frequency_hz;
+            g_state.cfg.freq_b_hz    = g_state.sched1_freq_b_hz;
+            if (g_state.sched1_duration_sec > 0)
+                g_state.cfg.duration_sec = g_state.sched1_duration_sec;
+        }
         strncpy(g_state.next_start, g_state.cfg.start_time,
                 sizeof(g_state.next_start) - 1);
         snprintf(g_ui.sched, sizeof(g_ui.sched),
@@ -4485,10 +4640,11 @@ repeat_schedule:
     } else {
         sched_idx++;
     }
-    if (g_running && !g_state.writer_error
+    if (g_running && !g_state.writer_error && rc == 0
             && (was_adhoc || sched_idx <= g_state.cfg.schedule_count)) {
-        LOG_INFO("Preparing for schedule entry %d of %d ...",
-                 sched_idx, g_state.cfg.schedule_count);
+        if (g_state.cfg.verbose)
+            LOG_INFO("Preparing for schedule entry %d of %d ...",
+                 sched_idx + 1, orig_sched_count);
 
         /* Stop current stream */
         g_recording = 0;
@@ -4542,7 +4698,7 @@ repeat_schedule:
         ring_reset(&g_state.ring);
     }
 
-    } while (g_running && !g_state.writer_error
+    } while (g_running && !g_state.writer_error && rc == 0
              && (was_adhoc || sched_idx <= g_state.cfg.schedule_count));
     } /* end repeat_schedule scope */
 
@@ -4691,9 +4847,23 @@ cleanup_file:
     }
 
 cleanup_ring:
+    /* Stop monitor thread if still running (skipped cleanup_writer path) */
+    if (g_gui_mon_thread) {
+        g_worker_active = 0;
+        WaitForSingleObject(g_gui_mon_thread, 2000);
+        CloseHandle(g_gui_mon_thread);
+        g_gui_mon_thread = NULL;
+    }
     ring_free(&g_state.ring);
 
 cleanup_device:
+    /* Stop monitor if still running (may have skipped cleanup_writer/ring) */
+    if (g_gui_mon_thread) {
+        g_worker_active = 0;
+        WaitForSingleObject(g_gui_mon_thread, 2000);
+        CloseHandle(g_gui_mon_thread);
+        g_gui_mon_thread = NULL;
+    }
     sdrplay_api_ReleaseDevice(&g_state.device);
     g_state.ch_a_params = NULL;
     g_state.ch_b_params = NULL;
@@ -4746,6 +4916,8 @@ cleanup_no_api:
     }
 
     LOG_INFO("Session ended.");
+    if (rc != 0)
+        LOG_ERROR("RECORDING FAILED - check errors above");
 
     /* Tell the UI the worker has finished so it can re-enable Start. */
     g_worker_active = 0;
@@ -4773,13 +4945,20 @@ static void gui_start_session(void)
 
     /* Clear finished state immediately so the window doesn't briefly flash
      * FINISHED on the next repaint before the memset runs below.         */
-    g_ui.finished = 0;
-    g_ui.next[0]  = '\0';
+    g_ui.finished   = 0;
+    g_ui.next[0]    = '\0';
+    g_ui.infobar[0] = '\0';
     strncpy(g_ui.state, "STARTING", sizeof(g_ui.state) - 1);
-    g_state.session_complete = 0;  /* prevent monitor from re-publishing finished */
+    g_state.session_complete = 0;
 
-    if (g_hLog) SetWindowTextA(g_hLog, "");
-
+    if (g_hLog) {
+        if (g_log_freeze) {
+            LOG_WARN("--- New session started ---");
+        } else {
+            SetWindowTextA(g_hLog, "");
+        }
+    }
+    g_log_freeze = 0;
     double keep_disk = g_ui.disk_free_mb;
     memset(&g_ui, 0, sizeof(g_ui));
     g_ui.disk_free_mb = keep_disk;
@@ -5017,12 +5196,15 @@ static void paint_window(HWND hwnd)
         /* Recording LED + state. The LED sits at a FIXED position and the
          * state word is drawn left-justified to its right, so the LED does
          * not move when the word changes length (RECORDING -> FINISHED etc). */
+        int waiting = !s.recording && !s.finished && s.next[0];
         COLORREF lc = s.recording ? COL_LED_ON
                     : s.finished  ? RGB(10, 245, 25)
-                    :               COL_LED_OFF;
+                    : waiting     ? RGB(200, 160, 0)
+                    :               RGB(160, 160, 160);
         const char *st = s.state[0] ? s.state : "IDLE";
         COLORREF stc = s.recording ? COL_LED_ON
-                      : s.finished ? RGB(10, 245, 25) : COL_TEXT_DIM;
+                     : s.finished  ? RGB(10, 245, 25)
+                     :               COL_TEXT_DIM;
         /* Reserve room for the longest state word so the LED clears the
          * version text on the left. ~110px holds "RECORDING".              */
         int led_x  = cr.right - 14 - 110;   /* fixed LED centre x           */
@@ -5236,6 +5418,11 @@ static void paint_window(HWND hwnd)
         }
     }
 
+    /* Info strip: device, antenna, gain — shown only while recording */
+    if (s.infobar[0]) {
+        int bbh2 = 26, bbY2 = cr.bottom - bbh2 - 10;
+        draw_text_base(dc, 14, bbY2 + 17, s.infobar, COL_TEXT_DIM, g_hFontUI);
+    }
 
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
 
@@ -5269,8 +5456,8 @@ static void layout_children(HWND hwnd)
     if (g_hBtnNow) MoveWindow(g_hBtnNow, now_x, bbY, nw, bbh, TRUE);
 
     /* Log fills the area between the disk line and the bottom button bar. */
-    int logTop = diskY + 26 + 6;
-    int logBottom = bbY - 8;
+    int logTop    = diskY + 26 + 6;
+    int logBottom = bbY - 4;
     MoveWindow(g_hLog, 12, logTop, cr.right - 24, logBottom - logTop, TRUE);
 }
 
@@ -5404,14 +5591,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SendMessageA(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
             SendMessageA(g_hLog, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
             SendMessageA(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)txt);
-            SendMessageA(g_hLog, EM_SCROLL, SB_BOTTOM, 0);
-            SendMessageA(g_hLog, EM_SCROLLCARET, 0, 0);
+            if (!g_log_freeze) {
+                SendMessageA(g_hLog, EM_SCROLL, SB_BOTTOM, 0);
+                SendMessageA(g_hLog, EM_SCROLLCARET, 0, 0);
+            }
             free(txt);
         }
         return 0;
     }
 
     case WM_APP_DONE:
+        if ((int)wp != 0) g_log_freeze = 1;
         if (g_worker_thread) {
             WaitForSingleObject(g_worker_thread, 2000);
             CloseHandle(g_worker_thread);
