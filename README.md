@@ -1,110 +1,60 @@
 # DuoDX
 
-**RSP IQ Recorder for Windows** — a native GUI application that captures I/Q
-samples from SDRplay RSP receivers and writes them to disk in Linrad raw,
-WavViewDX-raw, SDRuno WAV, or SDR Connect WAV format.
+**RSP Dual Channel IQ Recorder** — a Windows native GUI application for recording raw I/Q data from SDRplay RSP receivers, with a live audio monitor, genuine dual-tuner support on RSPduo, and RSPduo Master/Slave mode for two entirely independent frequencies at once.
 
-Optimised for medium wave (MW) DXing with the RSPduo and RSPdx, including
-native RSPduo dual-tuner recording of two frequencies to a single interleaved
-file.
-
----
-
-### ⚠️ A Quick Word of Warning: This is an AI-Assisted Project ⚠️
-
-**This project is a personal project for my dx hobby.**
-
-A large language model (AI) helped write a significant portion of this code, *if not most.* I guided it, reviewed its output the best I could, and tested the result, but this project didn't evolve through the typical trial-and-error of a human-only endeavor. Even this README you're reading was drafted by the AI based on the source code, then edited and refined by me.
-
-Second, it's worth knowing that this was a learning project for myself. The focus was always on getting a practical, working result, which means some of the solutions are probably not what you'd find in a textbook. 
-
-*What does this mean?*
-
-*   **This is experimental.** While it works, it hasn't been battle-tested across all possible options and hardware.
-*   **Design choices not stable.** You may see features etc. suddenly appear and disappear. You may also see large commits of lots of changes. 
-*   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. 
-
----
-
-
-> Version 2.1.2 fixes an RSPduo LNA validation bug, adds device-specific parameter validation, and adds a COHERENT indicator for dual-channel phase-coherent recording. Version 2.1.0 added graduated meter styles, an optional live clock, and numerous UI improvements. Version 2.0.0 was the initial GUI release replacing the original console tool. All
-> settings are now read from `duodx.ini`; there are no command-line options.
-
-<img width="814" height="667" alt="Screenshot" src="https://github.com/user-attachments/assets/24854fb8-ac30-4fb5-b765-f3464d245271" />
-
+Version 3.0.0
 
 ## Features
 
-- Single and dual-channel recording (Linrad raw, WavViewDX-raw, SDRuno WAV,
-  SDR Connect WAV).
-- RSPduo dual-tuner mode for simultaneous reception on two frequencies.
-- Low-IF mode tuned for MW, plus Zero-IF for wider/shortwave captures.
-- Scheduled, hourly and repeating unattended recording.
-- Lock-free ring buffer with zero-fill gap compensation to preserve timing.
-- Live GUI: signal meters, elapsed/file/overflow/dropped/ring-buffer readouts,
-  colour-coded log, recording LED, and an optional clock.
-- Built-in HTTP dashboard for monitoring from a phone or browser on the LAN.
-- Post-recording file verification.
+- Records raw I/Q to Linrad-compatible format, plus SDRuno and SDR Connect WAV output
+- Full single-tuner support for all RSP models (RSP1, RSP1A, RSP1B, RSPdx, RSPdx-R2)
+- Genuine dual-channel recording on RSPduo — both tuners to one interleaved file
+- RSPduo Master/Slave mode — two independently tuned frequencies, each to its own file, including entirely different bands (e.g. medium wave on one tuner, shortwave on the other)
+- Live audio monitor, independent of the recording path: AM (6/4/2.4 kHz), FM-N, FM-W, LSB, USB, and CW demodulation, with its own AGC, volume, low-cut filter, and scrollable-digit frequency tuning
+- Carrier frequency offset display (AM mode) — measures how far a station's actual carrier sits from the dial, with adaptive integration time for weak/DX-level signals
+- Narrowband S-meter for the live monitor, showing the tuned station's own strength
+- In-app Settings dialog covering nearly every commonly-changed option, patching `duodx.ini` in place without disturbing anything not shown in the dialog
+- Multi-entry and hourly scheduling, with a live HTTP status dashboard and an optional named-pipe interface
+- HDR mode, Bias-T, antenna selection, IF notch, DC/IQ correction — all per-tuner where the hardware supports it
+
+See `DuoDX_User_Guide_3_0_0.docx` for full usage documentation, and `DuoDX_Version_History.docx` for the complete changelog back to the original 1.x console version.
 
 ## Requirements
 
-- Windows 10 (1511+) or Windows 11.
-- [SDRplay API 3.x](https://www.sdrplay.com/) installed and the API service
-  running.
-- A supported SDRplay device (RSP1/1A/1B, RSP2, RSPduo, RSPdx/RSPdxR2).
+- Windows 10 or 11 (x64)
+- [SDRplay API](https://www.sdrplay.com/api/) (v3.x) installed, with the appropriate device drivers
+- An SDRplay RSP-series receiver (RSP1, RSP1A, RSP1B, RSPdx, RSPdx-R2, or RSPduo)
 
-If `sdrplay_api.dll` is not found at startup, copy it from
-`C:\Program Files\SDRplay\API\x64\` into the same folder as `duodx.exe`.
+## Building
 
-## Build
+Requires MinGW-w64 (via [MSYS2](https://www.msys2.org/) is the easiest route) and the SDRplay API's headers and import library.
 
-Built with MinGW-w64 (MSYS2). From the project folder:
-
-```
-make
+```sh
+gcc -O2 -o duodx.exe duodx.c -I"C:\Program Files\SDRplay\API\inc" \
+    -L"C:\Program Files\SDRplay\API\x64" -lsdrplay_api -lwinmm -mthreads
 ```
 
-This produces a windowed `duodx.exe` with the application icon embedded.
-The Makefile uses `windres` to compile `duodx.rc` (which references `duodx.ico`)
-into the executable. All three source files — `duodx.c`, `duodx.rc`, and
-`duodx.ico` — must be in the same folder.
+Or with MSVC:
 
-Override the SDRplay API location if it is installed elsewhere:
-
-```
-make SDR_API="D:/SDRplay/API"
+```bat
+cl /O2 duodx.c /I"C:\Program Files\SDRplay\API\inc" ^
+   /link "C:\Program Files\SDRplay\API\x64\sdrplay_api.lib" winmm.lib
 ```
 
-`make debug` builds an unstripped binary with a console attached for
-diagnostics. See the `Makefile` for details.
+Adjust the include/library paths if the SDRplay API is installed somewhere other than the default location. No other third-party dependencies are required — everything else is drawn from the standard Windows API.
 
-## Usage
+## Running
 
-1. Place `duodx.ini` in the same folder as `duodx.exe` (copy and edit
-   `duodx.example.ini` to start).
-2. Run `duodx.exe`.
-3. Set your frequency, format, gain and schedule in `duodx.ini`, then press
-   **Start**.
+Place `duodx.exe` and `sdrplay_api.dll` (or ensure the SDRplay API is installed so the DLL is on the system path) in the same folder, and run it. A `duodx.ini` will be created alongside the executable on first run with sensible defaults; see the User Guide for the full list of settings, both those exposed in the in-app Settings dialog and the smaller number that are INI-only.
 
-All configuration is documented in the user guide. Times follow the `use_utc`
-setting (UTC by default) consistently across the scheduler, log and filenames.
+## Output formats
 
-## Documentation
+DuoDX writes raw, uncompressed 16-bit interleaved I/Q samples in a Linrad-compatible format by default, and can optionally write directly in SDRuno or SDR Connect WAV format instead. See the User Guide's Recording section for the exact byte layout of each.
 
-Full documentation — every INI key, IF/sample-rate combinations, output file
-formats, dual-tuner and phasing setup, scheduling, HDR mode, and the HTTP
-dashboard — is in the **DuoDX User Guide** (`DuoDX_User_Guide_2_1_2.docx`) in
-this repository.
+## License
+
+Not yet specified — see the repository owner before reusing this code.
 
 ## Acknowledgements
 
-Linrad is © Leif Åsbrink SM5BSZ. WavViewDX is © Reinhard Weiß. DuoDX was
-inspired by [rsp-recorder](https://github.com/fventuri/rsp-recorder) by Franco
-Venturi. Developed with the assistance of Claude (Anthropic). SDRplay, RSPduo,
-RSPdx and related names are trademarks of SDRplay Ltd. DuoDX is an independent
-application and is not affiliated with or endorsed by SDRplay Ltd, Leif
-Åsbrink, or Reinhard Weiß.
-
-## Author
-
-Dave Headland — <https://github.com/45south/DuoDX-recorder>
+Built against the [SDRplay API](https://www.sdrplay.com/api/). SDRplay and RSP are trademarks of SDRplay Limited; this project is not affiliated with or endorsed by SDRplay.

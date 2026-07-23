@@ -1,38 +1,36 @@
 # Build output
 *.exe
-*.o
 *.obj
-*.a
+*.o
+*.res
+*.ilk
+*.pdb
+*.map
+*.exp
 *.lib
 *.dll
-*.exp
-*.pdb
-*.ilk
-*.res
-build/
-bin/
-obj/
 
-# MinGW / MSYS2
-*.stackdump
-
-# Editor / IDE
-.vscode/
-.idea/
-*.swp
-*~
-*.code-workspace
-
-# OS cruft
-Thumbs.db
-Desktop.ini
-.DS_Store
-
-# Local config and recordings (do not commit personal settings or captures)
+# Runtime-generated files (created next to duodx.exe on first run / each session)
 duodx.ini
 *.raw
 *.wav
-*.log
+*_session.log
+duodx_*.log
+crash_*.txt
+crash_*.dmp
 
-# Keep the example config in the repo (force-tracked despite duodx.ini rule)
-!duodx.example.ini
+# Editor / IDE
+.vscode/
+.vs/
+*.suo
+*.user
+*.sln.docstates
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Archives some builds have kept around locally
+/build/
+/out/

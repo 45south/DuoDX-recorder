@@ -1,111 +1,44 @@
 # Changelog
 
-All notable changes to DuoDX are documented in this file.
+This file summarizes the 3.0.0 release line. For the complete, detailed changelog back to the original 1.x console version — including every fix, INI key, and section reference into the User Guide — see `DuoDX_Version_History.docx`.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/),
-and this project adheres to [Semantic Versioning](https://semver.org/).
+## 3.0.0
 
-## [2.1.2] - 2026-07-04
-
-### Added
-- Record Now button: appears while waiting for a scheduled start; runs an immediate ad-hoc recording using current INI settings, then resumes waiting for the original scheduled time without disturbing the schedule.
-- Duration shown on the disk-info line (e.g. DUR: 9h10m).
-- Startup warning when schedule entries are not in chronological order.
-
-### Fixed
-- Pressing Stop during a scheduled wait no longer closes the application.
-- Scheduling status text now clears when recording starts and is not overwritten during active recording.
-- Log messages referencing Ctrl+C updated to reference the Stop button.
-
-## [2.1.1] - 2026-06-29
+Major feature release: live signal monitor, RSPduo Master/Slave mode, in-app Settings dialog, and genuine dual-tuner Listening. (2.2.0 was developed but never released; its changes are folded into 3.0.0 below.)
 
 ### Added
-- Green COHERENT indicator on the disk-info line, shown only while recording on an RSPduo in dual-channel mode with both tuners set to the same frequency (the phase-coherent diversity condition).
-- Device-specific validation for `lna_state` (and `lna_state_b`) against the correct maximum for the connected device.
-- Validation for `duration_sec`, `ring_buffer_sec`, `ppm`, and `hdr_bw_khz` with explanatory error messages.
-- Startup log warning when `agc_enable=1`, explaining that `gain_reduction` will have little visible effect while AGC is on.
-
-### Fixed
-- `lna_state_b=-1` (the "inherit from Tuner A" default) was incorrectly rejected by the device-specific LNA validation added in 2.1.0's later builds, breaking RSPduo recordings that left Tuner B settings at their default. The inherited value is now resolved before validating.
-- A spurious "RSPduo AM port select failed: sdrplay_api_NotInitialised" warning when a multi-entry schedule applied an antenna setting between recordings after the device had already been uninitialised. The antenna setting is still applied correctly at the next recording's startup.
-
-### Documentation
-- Clarified that AGC overrides `gain_reduction` in real time, and that gain changes have little effect while AGC is enabled.
-- Clarified that the signal meters give a general indication of RF level for monitoring, not a precise calibrated measurement.
-- Documented the new COHERENT indicator.
-
-## [2.1.0] - 2026-06-28
-
-### Added
-- Graduated and greyscale meter styles via `meter_style` INI key (0=zone, 1=graduated, 2=greyscale).
-- Optional live clock top-right, via `show_clock` INI key. Labelled UTC or local to match time mode.
-- Dedicated overload indicator segment at the far right of each meter bar.
-- AGC button turns green when AGC is enabled; shows N/A in amber and is disabled in HDR mode.
-- Scheduling status text along the bottom of the window.
-- Coloured AGC: ON/OFF and HDR: ON/OFF indicators on the disk line.
-- Application icon (duodx.ico) embedded via Windows resource file (duodx.rc), visible on the taskbar, Alt+Tab switcher, and title bar.
-- Version information block in the executable (visible in Properties → Details).
+- Live audio signal monitor, independent of the recording path: AM (6/4/2.4 kHz), FM-N, FM-W, LSB, USB, and CW demodulation, with a feedback-loop AGC, scrollable-digit tuning, an independent IF notch, and a Tuner A/B selector
+- Carrier frequency offset display (AM mode) — measures the difference between the dial and a station's actual carrier, with adaptive integration time (1–12s) so strong signals lock in seconds while weak/DX-level signals integrate longer for a reliable reading; shows a "(lock)" indicator once the reading has genuinely settled
+- RSPduo Master/Slave mode — independently tuned Tuner A/B frequencies, each recorded to its own file, including entirely different bands
+- Dual-channel and Master/Slave Listening — Monitor now opens both tuners at once for these session types
+- Narrowband S-meter for the live monitor, with a gain-compensated, user-calibratable dBm reading
+- In-app Settings dialog (Receiver, Recording, Monitor, Network, Schedule, Miscellaneous tabs), patching `duodx.ini` in place
+- Genuine independent Tuner 2 AGC/DC/IQ/notch settings
+- A=B frequency lock for quickly comparing tuners/antennas at the same frequency
+- Crash reports written to disk (diagnostic `.txt` and, where possible, a `.dmp` minidump)
+- Window position/size and Volume level remembered across restarts
+- Auto-saved per-session log file (independent of the INI-only `log_file` setting)
+- Schedule Enable/Disable toggle, always visible
+- Dark Grey color scheme option (now default for new installs)
 
 ### Changed
-- Recording LED fixed at a constant position — no longer shifts when state word changes length.
-- LED colours updated to traffic-light red (recording) and bright green (finished).
-- Start/Stop and AGC buttons moved to a bottom bar under the log window.
-- Log window scrolls to bottom on each new line.
-- Clock aligned to the left edge of the state text.
-- Window default height increased to 660 pixels.
-- Ring buffer fill shown with one decimal place.
-- Dark scrollbar theme applied to the log window.
+- The device-info status line (RSPdx / Ant / GR / LNA / SR) has been removed from the main window
+- Monitor AGC now uses a proper envelope follower for its level detection instead of reacting to raw instantaneous samples, reducing audible pumping/breathing on program audio
+- `ppm` frequency correction now accepts ±1000 instead of ±100 — SDRplay's API documents no hard limit for this value
+- Antenna, Bias-T, and Hi-Z notch now apply live while Listening, not just at the next Record/restart
 
 ### Fixed
-- App no longer closes when a recording finishes (window stays open showing FINISHED).
-- Elapsed time retained after scheduled or hourly recording stops.
-- Hourly recording no longer reuses the previous session's filename (error 32).
-- Stop during inter-recording wait in hourly mode no longer crashes the application.
-- Clock no longer briefly appears at startup when show_clock=0.
-- Overload indicator segment now lights correctly on hardware ADC overload.
-- Recording duration rounded to nearest second (40s no longer displays as 39s).
-- start_time_utc accepted as alias for start_time (no longer logs Unknown config key).
-- Completed recording files are now closed immediately after each recording, so they are accessible to other applications (WavViewDX, HxD etc.) without closing DuoDX.
-- Stop button no longer flickers during inter-recording wait.
-- Scheduling status text now visible during inter-recording wait (hourly next time, scheduled start time).
+- A crash that could occur when opening Settings immediately after stopping a session, before the Tuner button visually went inactive (a race between Settings' own device probe and the still-finishing device teardown)
+- Numerous Timer/Schedule/Hourly interaction bugs (see the full history document for the complete list)
 
-## [2.0.0] - 2026-06-27
+## 2.1.x (2.1.0–2.1.3)
 
-Initial Win32 GUI release replacing the console application.
+Significant GUI improvements: graduated/greyscale meter styles, live clock, coloured AGC/HDR indicators, scheduling status text, and a range of stability fixes around scheduled and hourly recording.
 
-### Added
-- Native Win32 graphical interface with a dark theme.
-- Start/Stop toggle button and AGC button.
-- Recording status LED, channel A/B signal meters, live counter tiles.
-- Colour-coded log window.
-- Centre-frequency readout with coverage span.
-- Disk free space read and displayed at startup.
+## 2.0.0
 
-### Changed
-- All settings now read from duodx.ini only — no command-line options.
-- use_utc governs the scheduler, log timestamps, filenames and clock.
-- Window header and title bar read "RSP IQ Recorder".
-- File-size derived from live written-sample count.
+First graphical version of DuoDX, moving on from the original command-line recorder.
 
-### Removed
-- All command-line options.
-- Keyboard runtime controls (G key); AGC is now the on-screen button.
-- Console status line and ANSI colour handling.
+## 1.x
 
-### Fixed
-- App stays open after recording finishes.
-- AGC debounced to prevent NotInitialised errors on rapid toggling.
-- start_time_utc alias recognised.
-
-## [1.2.8] - 2026
-
-Final console release. Linrad, WavViewDX, SDRuno and SDR Connect output formats; RSPduo
-dual-tuner recording; scheduled, hourly and repeating recording; lock-free ring buffer with
-zero-fill compensation; HTTP remote monitoring dashboard; named-pipe streaming;
-post-recording verification.
-
-[2.1.2]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.1.2
-[2.1.1]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.1.1
-[2.1.0]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.1.0
-[2.0.0]: https://github.com/45south/DuoDX-recorder/releases/tag/v2.0.0
-[1.2.8]: https://github.com/45south/DuoDX-recorder/releases/tag/v1.2.8
+Original command-line console recorder for SDRplay devices.
