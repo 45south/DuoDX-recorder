@@ -28,6 +28,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <inttypes.h>
 #include <time.h>
 #include <math.h>
@@ -52,7 +53,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "3.0.0"
+#define VERSION                 "3.0.1"
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -121,9 +122,27 @@ typedef struct {
 typedef enum {
     FORMAT_LINRAD    = 0,  /* 41-byte binary header + raw 16-bit I/Q        */
     FORMAT_WAVVIEWDX = 1,  /* No header - pure 16-bit I/Q, WavViewDX naming */
-    FORMAT_SDRUNO    = 2,  /* RIFF/WAV with fmt+auxi chunks, 216-byte header */
-    FORMAT_SDRCONNECT= 3   /* RIFF/WAV with JUNK padding, 80-byte header     */
+    FORMAT_SDRUNO    = 2,  /* RIFF/WAV with fmt+auxi chunks, 216-byte header.
+                               SDRuno itself doesn't support RF64, so this
+                               format always splits at ~4 GiB - no choice
+                               offered in Settings.                        */
+    FORMAT_SDRCONNECT= 3,  /* RIFF/WAV with JUNK padding, 80-byte header    */
+    FORMAT_WINRAD    = 4   /* Same 216-byte fmt+auxi header/data layout as
+                               FORMAT_SDRUNO (reuses its writer functions),
+                               just a different filename prefix - for
+                               software that does support RF64 for files
+                               over 4 GiB, unlike SDRuno itself.            */
 } OutputFormat;
+
+/* Large-file handling for WAV-based output formats where it's actually
+ * offered as a choice (SDR Connect and Winrad) - not meaningful for
+ * Linrad or WavViewDX, which have no 4 GiB header limit to work around,
+ * and not offered for SDRuno, which always splits (see FORMAT_SDRUNO
+ * above - SDRuno itself doesn't support RF64 playback). A plain WAV
+ * data_size field is 32-bit and cannot describe more than ~4 GiB of audio
+ * data; these two modes are the alternatives:                            */
+#define LARGE_FILE_SPLIT 0   /* auto-split into numbered parts at ~4 GiB  */
+#define LARGE_FILE_RF64  1   /* single file, RF64 extended header        */
 
 /* =========================================================================
  * Configuration - populated from INI file then overridden by CLI args
@@ -207,6 +226,18 @@ typedef struct {
                                   path for anyone who wants that instead. */
     int      verbose;
     OutputFormat output_format;  /* FORMAT_LINRAD or FORMAT_WAVVIEWDX */
+    int      large_file_mode;  /* LARGE_FILE_SPLIT or LARGE_FILE_RF64 -
+                                     consulted when output_format is
+                                     FORMAT_WINRAD or FORMAT_SDRCONNECT.
+                                     Ignored for FORMAT_SDRUNO, which always
+                                     splits regardless of this value (it
+                                     can't play back RF64), and irrelevant
+                                     for Linrad/WavViewDX.                 */
+
+    /* ── Observer location, for the sunrise/sunset tile ─────────────────── */
+    double   latitude;          /* Decimal degrees, +north / -south, 0.0 default */
+    double   longitude;         /* Decimal degrees, +east  / -west,  0.0 default */
+    int      show_sun_times;    /* Show the SUN tile on the main window if set   */
 
 
     /* ── Antenna selection ──────────────────────────────────────────────── */
@@ -360,6 +391,19 @@ typedef struct {
     /* Statistics (updated atomically by callback, read by monitor) */
     volatile LONG64 samples_received;    /* Total sample frames received */
     volatile LONG64 samples_written;     /* Total sample frames written */
+    volatile LONG64 segment_samples_written; /* Frames written to the CURRENT
+                                     physical file - equals samples_written
+                                     unless split mode has rolled over to a
+                                     new part file, in which case it resets
+                                     to 0 at each rollover.                */
+    int         output_part_number;     /* 1 = first file, 2+ = how many
+                                            times split mode has rolled
+                                            over so far this recording -
+                                            purely informational (each
+                                            rolled-over file gets its own
+                                            fresh timestamped name, see
+                                            check_split_rollover()), used
+                                            only for the log messages.     */
     volatile LONG64 callback_count;      /* Number of callback invocations */
     volatile LONG   overflows;           /* Ring buffer overflow count */
     volatile LONG   teardown_forced;     /* 1 = sdrplay_api_Uninit gave up while
@@ -536,6 +580,10 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 #define IDC_SET_TAB4          1153
 #define IDC_SET_TAB5          1178
 #define IDC_SET_TAB6          1203
+#define IDC_SET_LARGEMODE 1204
+#define IDC_SET_LATITUDE  1205
+#define IDC_SET_LONGITUDE 1206
+#define IDC_SET_SHOW_SUN  1207
 #define IDC_SET_COLOR_SCHEME  1179
 #define IDC_SET_VERBOSE       1180
 #define IDC_SET_LOG_AUTOSAVE  1181
@@ -915,6 +963,11 @@ static COLORREF COL_PANEL_EDGE = RGB(45, 80, 130);   /* panel border            
 #define COL_SEG_GREEN RGB(40, 220, 90)
 #define COL_SEG_AMBER RGB(255, 190, 40)
 #define COL_SEG_RED   RGB(255, 60, 50)
+/* Sunrise/sunset tile - "navy blue" is brightened well past a literal
+ * navy (which would be near-invisible on this dark a panel background)
+ * so it actually reads as blue rather than just vanishing.               */
+#define COL_SUNRISE   RGB(212, 175, 55)   /* metallic gold */
+#define COL_SUNSET    RGB(70, 110, 210)   /* navy blue, brightened for legibility */
 #define COL_BTN_FACE  RGB(30, 58, 100)
 #define COL_BTN_HOT   RGB(45, 85, 140)
 #define COL_BTN_DIS   RGB(22, 38, 62)
@@ -2381,17 +2434,22 @@ static void generate_output_filename(Config *cfg, int num_channels)
                  (long long)cfg->expected_output_rate_hz,
                  st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond);
-    } else if (cfg->output_format == FORMAT_SDRUNO) {
-        /* SDRuno WAV - keep Z regardless of use_utc for compatibility */
+    } else if (cfg->output_format == FORMAT_SDRUNO || cfg->output_format == FORMAT_WINRAD) {
+        /* SDRuno and Winrad share the same WAV layout and naming pattern -
+         * Winrad just gets a different filename prefix so it's obvious at
+         * a glance which files are RF64-capable and which are SDRuno's
+         * plain-WAV split segments. Keep Z regardless of use_utc for
+         * compatibility.                                                 */
         long long freq_khz = (long long)(cfg->frequency_hz / 1000.0 + 0.5);
         char freq_str[32];
+        const char *prefix = (cfg->output_format == FORMAT_WINRAD) ? "Winrad" : "SDRuno";
         if (fabs(cfg->frequency_hz - (double)(freq_khz * 1000)) < 1.0)
             snprintf(freq_str, sizeof(freq_str), "%lldkHz", freq_khz);
         else
             snprintf(freq_str, sizeof(freq_str), "%.1fkHz", cfg->frequency_hz / 1000.0);
         snprintf(cfg->output_file, MAX_PATH_LEN,
-                 "SDRuno_%04d%02d%02d_%02d%02d%02dZ_%s.wav",
-                 st.wYear, st.wMonth, st.wDay,
+                 "%s_%04d%02d%02d_%02d%02d%02dZ_%s.wav",
+                 prefix, st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond, freq_str);
     } else if (cfg->output_format == FORMAT_SDRCONNECT) {
         /* SDR Connect WAV - no Z suffix in this format */
@@ -2592,6 +2650,46 @@ typedef struct {
     uint16_t block_align, bits_per_sample;
     char data_id[4]; uint32_t data_size;
 } SDRConnectHeader;  /* 80 bytes */
+
+/* RF64 variant of the SDRuno header (252 bytes) - EBU Tech 3306 framing.
+ * "RF64" replaces "RIFF" as the outer id, riff_size and data_size are
+ * both permanently set to the 0xFFFFFFFF sentinel (per spec - it tells a
+ * reader "see the ds64 chunk instead"), and a ds64 chunk carrying real
+ * 64-bit sizes is inserted right after the WAVE id, before fmt. Layout
+ * otherwise matches SDRunoHeader (same fmt/auxi content) so the audio
+ * data itself is byte-identical to the plain-WAV version.                */
+typedef struct {
+    char riff_id[4]; uint32_t riff_size; char wave_id[4];   /* "RF64", 0xFFFFFFFF, "WAVE" */
+    char ds64_id[4]; uint32_t ds64_size;                     /* "ds64", 28                 */
+    uint64_t riff_size64, data_size64, sample_count64;
+    uint32_t table_length;                                   /* 0 - no extra table entries */
+    char fmt_id[4];  uint32_t fmt_size;
+    uint16_t audio_format, num_channels;
+    uint32_t sample_rate, byte_rate;
+    uint16_t block_align, bits_per_sample;
+    char auxi_id[4]; uint32_t auxi_size;
+    WavSystime start_time, stop_time;
+    uint32_t centre_freq_hz;
+    uint8_t  auxi_pad[128];
+    char data_id[4]; uint32_t data_size;                     /* 0xFFFFFFFF sentinel        */
+} SDRunoRF64Header;  /* 252 bytes */
+
+/* RF64 variant of the SDR Connect header (116 bytes). Same reasoning as
+ * SDRunoRF64Header above - the ds64 chunk must come immediately after the
+ * WAVE id per the RF64 spec, ahead of every other chunk including this
+ * format's JUNK padding, so it's inserted there rather than at the end.  */
+typedef struct {
+    char riff_id[4]; uint32_t riff_size; char wave_id[4];   /* "RF64", 0xFFFFFFFF, "WAVE" */
+    char ds64_id[4]; uint32_t ds64_size;                     /* "ds64", 28                 */
+    uint64_t riff_size64, data_size64, sample_count64;
+    uint32_t table_length;
+    char junk_id[4]; uint32_t junk_size; uint8_t junk_pad[28];
+    char fmt_id[4];  uint32_t fmt_size;
+    uint16_t audio_format, num_channels;
+    uint32_t sample_rate, byte_rate;
+    uint16_t block_align, bits_per_sample;
+    char data_id[4]; uint32_t data_size;                     /* 0xFFFFFFFF sentinel        */
+} SDRConnectRF64Header;  /* 116 bytes */
 #pragma pack(pop)
 
 /* =========================================================================
@@ -2632,6 +2730,49 @@ static int write_sdruno_header(HANDLE fh, const Config *cfg)
 }
 
 /* =========================================================================
+ * SDRuno RF64 header writer (252 bytes) - single-file alternative to the
+ * split-at-4GB mode, for recordings expected to exceed the plain WAV
+ * 4 GiB data limit. riff_size/data_size are written as 0xFFFFFFFF and the
+ * ds64 chunk's real sizes are left at 0 here, to be patched in once the
+ * actual sample count is known (see patch_wav_sizes_rf64()).             */
+static int write_sdruno_header_rf64(HANDLE fh, const Config *cfg)
+{
+    SDRunoRF64Header hdr; DWORD written; SYSTEMTIME st; get_timestamp(&st);
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.riff_id, "RF64", 4);  hdr.riff_size = 0xFFFFFFFFu;
+    memcpy(hdr.wave_id, "WAVE", 4);
+    memcpy(hdr.ds64_id, "ds64", 4);  hdr.ds64_size = 28;
+    hdr.riff_size64 = 0;  hdr.data_size64 = 0;  hdr.sample_count64 = 0;
+    hdr.table_length = 0;
+    memcpy(hdr.fmt_id,  "fmt ", 4);  hdr.fmt_size  = 16;
+    hdr.audio_format = 1;  hdr.num_channels = 2;
+    hdr.sample_rate  = (uint32_t)cfg->expected_output_rate_hz;
+    hdr.byte_rate    = hdr.sample_rate * 4;
+    hdr.block_align  = 4;  hdr.bits_per_sample = 16;
+    memcpy(hdr.auxi_id, "auxi", 4);  hdr.auxi_size = 164;
+    hdr.start_time.wYear         = st.wYear;
+    hdr.start_time.wMonth        = st.wMonth;
+    hdr.start_time.wDayOfWeek    = st.wDayOfWeek;
+    hdr.start_time.wDay          = st.wDay;
+    hdr.start_time.wHour         = st.wHour;
+    hdr.start_time.wMinute       = st.wMinute;
+    hdr.start_time.wSecond       = st.wSecond;
+    hdr.start_time.wMilliseconds = st.wMilliseconds;
+    hdr.centre_freq_hz = (uint32_t)(cfg->frequency_hz + 0.5);
+    memcpy(hdr.data_id, "data", 4);  hdr.data_size = 0xFFFFFFFFu;
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writing SDRuno RF64 header: SR=%u Hz  CF=%u Hz",
+             hdr.sample_rate, hdr.centre_freq_hz);
+    if (!WriteFile(fh, &hdr, (DWORD)sizeof(hdr), &written, NULL)
+            || written != (DWORD)sizeof(hdr)) {
+        LOG_ERROR("SDRuno RF64 header write failed: %lu bytes, error %lu",
+                  written, GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+/* =========================================================================
  * SDR Connect WAV header writer (80 bytes)
  * ========================================================================= */
 static int write_sdrconnect_header(HANDLE fh, const Config *cfg)
@@ -2660,6 +2801,39 @@ static int write_sdrconnect_header(HANDLE fh, const Config *cfg)
 }
 
 /* =========================================================================
+ * SDR Connect RF64 header writer (116 bytes) - single-file alternative to
+ * split-at-4GB mode for SDR Connect recordings expected to exceed the
+ * plain WAV 4 GiB data limit. Same pattern as write_sdruno_header_rf64().
+ * ========================================================================= */
+static int write_sdrconnect_header_rf64(HANDLE fh, const Config *cfg)
+{
+    SDRConnectRF64Header hdr; DWORD written;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.riff_id, "RF64", 4);  hdr.riff_size = 0xFFFFFFFFu;
+    memcpy(hdr.wave_id, "WAVE", 4);
+    memcpy(hdr.ds64_id, "ds64", 4);  hdr.ds64_size = 28;
+    hdr.riff_size64 = 0;  hdr.data_size64 = 0;  hdr.sample_count64 = 0;
+    hdr.table_length = 0;
+    memcpy(hdr.junk_id, "JUNK", 4);  hdr.junk_size = 28;
+    memcpy(hdr.fmt_id,  "fmt ", 4);  hdr.fmt_size  = 16;
+    hdr.audio_format = 1;  hdr.num_channels = 2;
+    hdr.sample_rate  = (uint32_t)cfg->expected_output_rate_hz;
+    hdr.byte_rate    = hdr.sample_rate * 4;
+    hdr.block_align  = 4;  hdr.bits_per_sample = 16;
+    memcpy(hdr.data_id, "data", 4);  hdr.data_size = 0xFFFFFFFFu;
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writing SDR Connect RF64 header: SR=%u Hz  CF=%.0f Hz",
+             hdr.sample_rate, cfg->frequency_hz);
+    if (!WriteFile(fh, &hdr, (DWORD)sizeof(hdr), &written, NULL)
+            || written != (DWORD)sizeof(hdr)) {
+        LOG_ERROR("SDR Connect RF64 header write failed: %lu bytes, error %lu",
+                  written, GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+/* =========================================================================
  * RIFF size patcher -- seeks back and updates riff_size and data_size.
  * Called before CloseHandle for SDRuno and SDR Connect formats.
  * Both fields were written as 0 in the initial header.
@@ -2667,10 +2841,17 @@ static int write_sdrconnect_header(HANDLE fh, const Config *cfg)
 static void patch_wav_sizes(HANDLE fh, const Config *cfg, LONG64 samples_written)
 {
     int64_t  data_bytes  = samples_written * 4;
-    uint32_t data_size32 = (data_bytes > 0xFFFFFFFCLL)
-                           ? 0xFFFFFFFC : (uint32_t)data_bytes;
-    int64_t  header_size = (cfg->output_format == FORMAT_SDRUNO) ? 216 : 80;
-    uint32_t riff_size32 = (uint32_t)((header_size - 8 + data_bytes) & 0xFFFFFFFF);
+    int64_t  header_size = (cfg->output_format == FORMAT_SDRUNO ||
+                             cfg->output_format == FORMAT_WINRAD) ? 216 : 80;
+    int64_t  riff_total  = header_size - 8 + data_bytes;
+    /* Clamp to 0xFFFFFFFF rather than wrapping mod 2^32 - this matches
+     * genuine SDRuno's own behaviour for oversized files (confirmed via
+     * SDR Trim's write_wav_header(), which was built against real SDRuno
+     * output). In current DuoDX usage this path should never actually see
+     * an oversized value - split mode rolls the file over well before 4
+     * GiB - but the clamp is correct defensive behaviour regardless.     */
+    uint32_t riff_size32 = (riff_total  > 0xFFFFFFFFLL) ? 0xFFFFFFFFu : (uint32_t)riff_total;
+    uint32_t data_size32 = (data_bytes  > 0xFFFFFFFFLL) ? 0xFFFFFFFFu : (uint32_t)data_bytes;
     DWORD written; LARGE_INTEGER li;
     li.QuadPart = 4;
     if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
@@ -2679,6 +2860,150 @@ static void patch_wav_sizes(HANDLE fh, const Config *cfg, LONG64 samples_written
     if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
         WriteFile(fh, &data_size32, 4, &written, NULL);
     LOG_INFO("WAV sizes patched: riff_size=%u  data_size=%u", riff_size32, data_size32);
+
+    /* Patch the auxi chunk's StopTime field (SDRuno/Winrad only - SDR
+     * Connect's header has no auxi chunk). This was never being written
+     * at all before now: every DuoDX SDRuno/Winrad file left StopTime at
+     * all-zero from the initial memset in write_sdruno_header(). Real
+     * SDRuno files always carry a genuine StopTime here (confirmed from
+     * two actual SDRuno recordings), and SDR Console's recordings browser
+     * appears to compute displayed duration from StopTime-StartTime
+     * rather than from data_size - with StopTime stuck at zero (an
+     * "invalid"/epoch-like date well before StartTime), that subtraction
+     * produces exactly the large negative garbage duration being seen.   */
+    if (cfg->output_format == FORMAT_SDRUNO || cfg->output_format == FORMAT_WINRAD) {
+        SYSTEMTIME st;
+        WavSystime stop_time;
+        get_timestamp(&st);
+        stop_time.wYear         = st.wYear;
+        stop_time.wMonth        = st.wMonth;
+        stop_time.wDayOfWeek    = st.wDayOfWeek;
+        stop_time.wDay          = st.wDay;
+        stop_time.wHour         = st.wHour;
+        stop_time.wMinute       = st.wMinute;
+        stop_time.wSecond       = st.wSecond;
+        stop_time.wMilliseconds = st.wMilliseconds;
+        li.QuadPart = offsetof(SDRunoHeader, stop_time);
+        if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
+            WriteFile(fh, &stop_time, sizeof(stop_time), &written, NULL);
+        LOG_INFO("StopTime patched: %04d-%02d-%02d %02d:%02d:%02d",
+                 stop_time.wYear, stop_time.wMonth, stop_time.wDay,
+                 stop_time.wHour, stop_time.wMinute, stop_time.wSecond);
+    }
+}
+
+/* =========================================================================
+ * RF64 size patcher -- seeks back and updates the ds64 chunk's 64-bit
+ * riff/data/sample-count fields. riff_size and data_size at the fixed
+ * 32-bit offsets stay at the 0xFFFFFFFF sentinel written at open time -
+ * that is what tells an RF64-aware reader to look at ds64 instead, so
+ * unlike patch_wav_sizes() those two fields are never touched here.
+ * ========================================================================= */
+static void patch_wav_sizes_rf64(HANDLE fh, const Config *cfg, LONG64 samples_written)
+{
+    int64_t  data_bytes    = samples_written * 4;
+    int64_t  header_size   = (cfg->output_format == FORMAT_SDRCONNECT)
+                              ? (int64_t)sizeof(SDRConnectRF64Header)
+                              : (int64_t)sizeof(SDRunoRF64Header); /* also covers Winrad */
+    uint64_t riff_size64   = (uint64_t)(header_size - 8 + data_bytes);
+    uint64_t data_size64   = (uint64_t)data_bytes;
+    uint64_t sample_count64 = (uint64_t)samples_written;
+    DWORD written; LARGE_INTEGER li;
+
+    /* The ds64 chunk sits at identical byte offsets in both RF64 header
+     * variants (same fields, same order, immediately after WAVE id in
+     * both), guaranteed at compile time just below - so SDRunoRF64Header's
+     * offsets are reused for SDR Connect too rather than duplicating this
+     * function per format.                                               */
+    li.QuadPart = offsetof(SDRunoRF64Header, riff_size64);
+    if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
+        WriteFile(fh, &riff_size64, 8, &written, NULL);
+    li.QuadPart = offsetof(SDRunoRF64Header, data_size64);
+    if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
+        WriteFile(fh, &data_size64, 8, &written, NULL);
+    li.QuadPart = offsetof(SDRunoRF64Header, sample_count64);
+    if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
+        WriteFile(fh, &sample_count64, 8, &written, NULL);
+    LOG_INFO("RF64 ds64 sizes patched: riff_size64=%llu  data_size64=%llu",
+             (unsigned long long)riff_size64, (unsigned long long)data_size64);
+
+    /* The classic 32-bit riff_size/data_size fields were written as the
+     * RF64 spec's 0xFFFFFFFF sentinel at file-open time (real size wasn't
+     * known yet). Now that it is, patch in the REAL value whenever it
+     * actually fits in 32 bits - i.e. whenever this particular recording
+     * never grew past ~4 GiB, which is the common case even in RF64 mode
+     * (RF64 just means "won't be truncated IF it grows that large", not
+     * that every recording does). Tools that don't implement true RF64
+     * ds64 lookup and instead read these classic fields directly - which
+     * is what appears to be causing corrupted/negative duration values in
+     * SDR Console's recordings browser for these files - will then see an
+     * entirely ordinary, correct WAV file. Only genuinely oversized files
+     * keep the sentinel, since the real value can't fit in 32 bits there
+     * regardless of what we do - a reader that can't handle RF64 simply
+     * can't be told the true size of a file that large in any format.    */
+    if (riff_size64 <= 0xFFFFFFFEULL && data_size64 <= 0xFFFFFFFEULL) {
+        uint32_t riff_size32 = (uint32_t)riff_size64;
+        uint32_t data_size32 = (uint32_t)data_size64;
+        li.QuadPart = 4; /* riff_size32, right after the 4-byte "RF64" id */
+        if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
+            WriteFile(fh, &riff_size32, 4, &written, NULL);
+        li.QuadPart = header_size - 4; /* data_size32, right before audio data */
+        if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
+            WriteFile(fh, &data_size32, 4, &written, NULL);
+        LOG_INFO("RF64 classic 32-bit fields also patched with real values "
+                 "(file stayed under 4GB): riff_size=%u  data_size=%u",
+                 riff_size32, data_size32);
+    }
+
+    /* Same StopTime fix as patch_wav_sizes() - Winrad's auxi chunk had
+     * never had StopTime written, only SDR Connect RF64 has no auxi chunk
+     * to patch here (SDRuno itself never reaches this RF64 patcher at all
+     * - see the OutputFormat enum comment).                              */
+    if (cfg->output_format == FORMAT_WINRAD) {
+        SYSTEMTIME st;
+        WavSystime stop_time;
+        get_timestamp(&st);
+        stop_time.wYear         = st.wYear;
+        stop_time.wMonth        = st.wMonth;
+        stop_time.wDayOfWeek    = st.wDayOfWeek;
+        stop_time.wDay          = st.wDay;
+        stop_time.wHour         = st.wHour;
+        stop_time.wMinute       = st.wMinute;
+        stop_time.wSecond       = st.wSecond;
+        stop_time.wMilliseconds = st.wMilliseconds;
+        li.QuadPart = offsetof(SDRunoRF64Header, stop_time);
+        if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
+            WriteFile(fh, &stop_time, sizeof(stop_time), &written, NULL);
+        LOG_INFO("StopTime patched: %04d-%02d-%02d %02d:%02d:%02d",
+                 stop_time.wYear, stop_time.wMonth, stop_time.wDay,
+                 stop_time.wHour, stop_time.wMinute, stop_time.wSecond);
+    }
+}
+
+/* Compile-time guard for the offset reuse above: if either RF64 header
+ * struct's ds64 field layout ever changes so the two no longer match,
+ * this fails the build instead of silently corrupting SDR Connect RF64
+ * headers with SDRuno's offsets (or vice versa).                        */
+typedef char ds64_offsets_must_match_riff
+    [(offsetof(SDRunoRF64Header, riff_size64) == offsetof(SDRConnectRF64Header, riff_size64)) ? 1 : -1];
+typedef char ds64_offsets_must_match_data
+    [(offsetof(SDRunoRF64Header, data_size64) == offsetof(SDRConnectRF64Header, data_size64)) ? 1 : -1];
+typedef char ds64_offsets_must_match_sampcount
+    [(offsetof(SDRunoRF64Header, sample_count64) == offsetof(SDRConnectRF64Header, sample_count64)) ? 1 : -1];
+
+/* Dispatch wrapper - picks the plain-WAV or RF64 size patcher depending on
+ * output format/mode, so call sites don't need to know the difference.
+ * SDRuno is deliberately excluded from the RF64 branch - it never sets
+ * large_file_mode to LARGE_FILE_RF64 (Settings hides that choice for it),
+ * but excluding it here too means a stale/hand-edited ini value can't
+ * accidentally produce an RF64 file SDRuno itself can't play back.       */
+static void finalize_output_header(HANDLE fh, const Config *cfg, LONG64 samples_written)
+{
+    if ((cfg->output_format == FORMAT_WINRAD || cfg->output_format == FORMAT_SDRCONNECT)
+            && cfg->large_file_mode == LARGE_FILE_RF64)
+        patch_wav_sizes_rf64(fh, cfg, samples_written);
+    else
+        patch_wav_sizes(fh, cfg, samples_written);
 }
 
 /* =========================================================================
@@ -2759,10 +3084,81 @@ static int write_gap_fill(AppState *state, LONG64 bytes_to_fill)
                          (LONG64)(chunk / frame_size));
         InterlockedAdd64(&state->samples_written,
                          (LONG64)(chunk / frame_size));
+        InterlockedAdd64(&state->segment_samples_written,
+                         (LONG64)(chunk / frame_size));
         remaining -= chunk;
     }
 
     return 1;
+}
+
+/* Threshold comfortably under the 4 GiB (4,294,967,296 byte) WAV limit,
+ * chosen as a round number divisible by both 4-byte (single-tuner) and
+ * 8-byte (dual-tuner interleaved) sample frames.                        */
+#define SPLIT_THRESHOLD_BYTES 4000000000ULL
+
+/* =========================================================================
+ * Split mode: once the currently-open file's data would cross the split
+ * threshold, finalize it (patch its now-known size) and open a new file
+ * to continue into, timestamped at the moment of rollover - this matches
+ * the naming convention genuine SDRuno/SDR Connect recordings use when
+ * they split a long capture: each segment gets its own current-time
+ * filename (e.g. SDRuno_20260518_090743Z_1125kHz.wav next to
+ * SDRuno_20260518_085324Z_1125kHz.wav), not a "_partN" suffix on a shared
+ * name. Called for FORMAT_SDRUNO unconditionally (it always splits - see
+ * the OutputFormat enum comment), and for FORMAT_WINRAD/FORMAT_SDRCONNECT
+ * when large_file_mode==LARGE_FILE_SPLIT; RF64 mode (Winrad/SDR Connect
+ * only) never rolls over, it just keeps growing one file.
+ * ========================================================================= */
+static void check_split_rollover(AppState *state)
+{
+    int64_t seg_bytes = state->segment_samples_written * 4;
+    HANDLE new_file;
+    int hdr_ok;
+
+    if ((uint64_t)seg_bytes < SPLIT_THRESHOLD_BYTES)
+        return;
+
+    /* Finalize the segment that's about to close. */
+    FlushFileBuffers(state->out_file);
+    finalize_output_header(state->out_file, &state->cfg,
+                            state->segment_samples_written);
+    CloseHandle(state->out_file);
+    LOG_OK("Part %d complete (%lld samples) - rolling over to a new file.",
+           state->output_part_number, (long long)state->segment_samples_written);
+
+    state->output_part_number++;
+    /* num_channels is only consulted for FORMAT_WAVVIEWDX inside this
+     * function - irrelevant here since split mode is SDRuno/SDR Connect
+     * only, so the placeholder value has no effect on the name produced. */
+    generate_output_filename(&state->cfg, 1);
+
+    new_file = CreateFileA(state->cfg.output_file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (new_file == INVALID_HANDLE_VALUE) {
+        LOG_ERROR("Split mode: cannot open '%s' (error %lu) - recording will stop.",
+                  state->cfg.output_file, GetLastError());
+        state->out_file = INVALID_HANDLE_VALUE;
+        state->writer_error = 1;
+        return;
+    }
+
+    hdr_ok = (state->cfg.output_format == FORMAT_SDRCONNECT)
+             ? write_sdrconnect_header(new_file, &state->cfg)
+             : write_sdruno_header(new_file, &state->cfg);
+    if (!hdr_ok) {
+        LOG_ERROR("Split mode: header write failed for '%s' - recording will stop.",
+                  state->cfg.output_file);
+        CloseHandle(new_file);
+        state->out_file = INVALID_HANDLE_VALUE;
+        state->writer_error = 1;
+        return;
+    }
+    FlushFileBuffers(new_file);
+
+    state->out_file = new_file;
+    state->segment_samples_written = 0;
+    LOG_OK("Part %d started: %s", state->output_part_number, state->cfg.output_file);
 }
 
 static DWORD WINAPI writer_thread_func(LPVOID param)
@@ -2978,6 +3374,18 @@ static DWORD WINAPI writer_thread_func(LPVOID param)
 
         InterlockedAdd64(&state->samples_written,
                          (LONG64)(to_read / (state->cfg.dual_channel ? 8 : 4)));
+        InterlockedAdd64(&state->segment_samples_written,
+                         (LONG64)(to_read / (state->cfg.dual_channel ? 8 : 4)));
+
+        {
+            int split_active =
+                (state->cfg.output_format == FORMAT_SDRUNO) ||
+                ((state->cfg.output_format == FORMAT_WINRAD ||
+                  state->cfg.output_format == FORMAT_SDRCONNECT) &&
+                 state->cfg.large_file_mode == LARGE_FILE_SPLIT);
+            if (split_active && state->out_file != INVALID_HANDLE_VALUE)
+                check_split_rollover(state);
+        }
     }
 
     if (g_state.cfg.verbose)
@@ -3566,6 +3974,10 @@ static void config_set_defaults(Config *cfg)
     cfg->monitor_interval_ms  = DEFAULT_MONITOR_INTERVAL_MS;
     cfg->verbose        = 0;
     cfg->output_format  = FORMAT_LINRAD;
+    cfg->large_file_mode = LARGE_FILE_SPLIT;
+    cfg->latitude        = 0.0;
+    cfg->longitude       = 0.0;
+    cfg->show_sun_times  = 0;
 
     strncpy(cfg->antenna, "A", 7);  /* default to Antenna A / 50 ohm */
     cfg->bias_t         = 0;
@@ -3607,7 +4019,7 @@ static void config_set_defaults(Config *cfg)
     cfg->window_w = 930;
     cfg->window_h = 660;
     cfg->window_maximized = 0;
-    strncpy(cfg->color_scheme, "grey", sizeof(cfg->color_scheme) - 1);
+    strncpy(cfg->color_scheme, "navy", sizeof(cfg->color_scheme) - 1);
     strncpy(cfg->timer_last_mode, "schedule", sizeof(cfg->timer_last_mode) - 1);
 }
 
@@ -3799,9 +4211,22 @@ static void config_load_ini(Config *cfg, const char *path)
                 cfg->output_format = FORMAT_SDRUNO;
             else if (!strcmp(val, "sdrconnect") || !strcmp(val, "SDRConnect"))
                 cfg->output_format = FORMAT_SDRCONNECT;
+            else if (!strcmp(val, "winrad") || !strcmp(val, "Winrad"))
+                cfg->output_format = FORMAT_WINRAD;
             else
                 cfg->output_format = FORMAT_LINRAD;
         }
+        else if (!strcmp(key, "large_file_mode")) {
+            int m = atoi(val);
+            cfg->large_file_mode = (m == LARGE_FILE_RF64)
+                                      ? LARGE_FILE_RF64 : LARGE_FILE_SPLIT;
+        }
+        else if (!strcmp(key, "latitude"))
+            cfg->latitude = atof(val);
+        else if (!strcmp(key, "longitude"))
+            cfg->longitude = atof(val);
+        else if (!strcmp(key, "show_sun_times"))
+            cfg->show_sun_times = atoi(val) ? 1 : 0;
         else
             LOG_WARN("Unknown config key: '%s'", key);
     }
@@ -4709,9 +5134,10 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
         return;
     }
 
-    /* SDRuno and SDR Connect: RIFF ChunkSize was patched before CloseHandle.
-     * Read it back and compare to expected from sample count.             */
+    /* SDRuno, Winrad, and SDR Connect: RIFF ChunkSize was patched before
+     * CloseHandle. Read it back and compare to expected from sample count. */
     if (cfg->output_format == FORMAT_SDRUNO ||
+            cfg->output_format == FORMAT_WINRAD ||
             cfg->output_format == FORMAT_SDRCONNECT) {
         HANDLE fh2 = CreateFileA(cfg->output_file, GENERIC_READ, FILE_SHARE_READ,
                                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -4720,17 +5146,26 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
                      cfg->output_file, GetLastError());
             return;
         }
-        LARGE_INTEGER fsz; uint32_t riff_sz = 0; DWORD nr;
+        LARGE_INTEGER fsz;
         GetFileSizeEx(fh2, &fsz);
-        LARGE_INTEGER li2; li2.QuadPart = 4;
-        SetFilePointerEx(fh2, li2, NULL, FILE_BEGIN);
-        ReadFile(fh2, &riff_sz, 4, &nr, NULL);
         CloseHandle(fh2);
 
-        int64_t hdr_sz         = (cfg->output_format == FORMAT_SDRUNO) ? 216 : 80;
+        /* Compare against the actual measured file size rather than the
+         * 32-bit riff_size field in the header - that field wraps around
+         * on files >4GB, which previously caused a false "SHORT" warning
+         * even though the file itself was complete and correct.          */
+        int64_t hdr_sz;
+        if (cfg->output_format == FORMAT_SDRUNO)
+            hdr_sz = 216; /* never RF64 - see the OutputFormat enum comment */
+        else if (cfg->output_format == FORMAT_WINRAD)
+            hdr_sz = (cfg->large_file_mode == LARGE_FILE_RF64)
+                     ? (int64_t)sizeof(SDRunoRF64Header) : 216;
+        else /* FORMAT_SDRCONNECT */
+            hdr_sz = (cfg->large_file_mode == LARGE_FILE_RF64)
+                     ? (int64_t)sizeof(SDRConnectRF64Header) : 80;
         int64_t expected_data  = samples_written * 4;
         int64_t expected_total = hdr_sz + expected_data;
-        int64_t actual_total   = (int64_t)riff_sz + 8;
+        int64_t actual_total   = fsz.QuadPart;
         int64_t diff           = actual_total - expected_total;
         double  dur = (cfg->expected_output_rate_hz > 0)
                       ? (double)(expected_data / 4) / cfg->expected_output_rate_hz : 0.0;
@@ -5151,6 +5586,99 @@ static int now_min(void)
     SYSTEMTIME st;
     get_timestamp(&st);
     return st.wHour * 60 + st.wMinute;
+}
+
+/* Local constant rather than relying on math.h's M_PI, which isn't
+ * guaranteed to be defined on MinGW without _USE_MATH_DEFINES set before
+ * the #include - simpler to just not depend on that.                    */
+#define SUN_PI 3.14159265358979323846
+
+/* =========================================================================
+ * Sunrise/sunset calculation - NOAA's General Solar Position algorithm
+ * (the same formulas behind NOAA's published Solar Calculator spreadsheet).
+ * Accurate to roughly a minute, which is plenty for an informational
+ * display tile - this is not intended for precision astronomical use.
+ *
+ * Returns 1 with *sunrise_min_utc/*sunset_min_utc set to minutes-since-
+ * midnight-UTC for the given calendar date (can be negative or >1440;
+ * the caller wraps to the correct clock time), or 0 if the sun doesn't
+ * rise/set at all that day at this latitude (polar day or polar night),
+ * in which case both outputs are set to -1.
+ * ========================================================================= */
+static int calc_sun_times(int year, int month, int day,
+                           double lat_deg, double lon_deg,
+                           double *sunrise_min_utc, double *sunset_min_utc)
+{
+    static const int cum_days[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    int leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    int doy  = cum_days[month - 1] + day + ((leap && month > 2) ? 1 : 0);
+
+    double gamma = 2.0 * SUN_PI / 365.0 * (double)(doy - 1);
+    double eqtime = 229.18 * (0.000075 + 0.001868 * cos(gamma) - 0.032077 * sin(gamma)
+                               - 0.014615 * cos(2 * gamma) - 0.040849 * sin(2 * gamma));
+    double decl = 0.006918 - 0.399912 * cos(gamma) + 0.070257 * sin(gamma)
+                  - 0.006758 * cos(2 * gamma) + 0.000907 * sin(2 * gamma)
+                  - 0.002697 * cos(3 * gamma) + 0.00148  * sin(3 * gamma);
+
+    double lat_rad    = lat_deg * SUN_PI / 180.0;
+    double zenith_rad = 90.833 * SUN_PI / 180.0; /* atmospheric refraction + solar disk radius */
+    double cos_ha = (cos(zenith_rad) / (cos(lat_rad) * cos(decl))) - (tan(lat_rad) * tan(decl));
+
+    if (cos_ha > 1.0 || cos_ha < -1.0) {
+        *sunrise_min_utc = -1.0;
+        *sunset_min_utc  = -1.0;
+        return 0; /* sun never rises (cos_ha>1) or never sets (cos_ha<-1) today here */
+    }
+
+    {
+        double ha_deg = acos(cos_ha) * 180.0 / SUN_PI;
+        *sunrise_min_utc = 720.0 - 4.0 * (lon_deg + ha_deg) - eqtime;
+        *sunset_min_utc  = 720.0 - 4.0 * (lon_deg - ha_deg) - eqtime;
+    }
+    return 1;
+}
+
+/* Formats today's sunrise/sunset as "HH:MM" strings for the SUN tile,
+ * displayed in local or UTC time matching cfg->use_utc - the same
+ * convention the rest of the app's clock/logging already uses. Falls
+ * back to "--:--" for polar day/night at extreme latitudes.             */
+static void get_sun_times_str(const Config *cfg,
+                               char *sunrise_str, size_t sunrise_len,
+                               char *sunset_str,  size_t sunset_len)
+{
+    SYSTEMTIME st;
+    double sunrise_min, sunset_min;
+
+    get_timestamp(&st); /* today's date, in whichever zone cfg->use_utc selects */
+
+    /* calc_sun_times() works from a UTC calendar date; using "today" in
+     * the display's own zone rather than converting to a true UTC date is
+     * a deliberate simplification - right at a local midnight this could
+     * shift the result by under a minute, which doesn't matter for a
+     * display-only feature and avoids a full calendar-date conversion.   */
+    if (!calc_sun_times(st.wYear, st.wMonth, st.wDay, cfg->latitude, cfg->longitude,
+                         &sunrise_min, &sunset_min)) {
+        snprintf(sunrise_str, sunrise_len, "--:--");
+        snprintf(sunset_str,  sunset_len,  "--:--");
+        return;
+    }
+
+    if (!cfg->use_utc) {
+        TIME_ZONE_INFORMATION tzi;
+        DWORD r = GetTimeZoneInformation(&tzi);
+        /* Win32 convention: UTC = local + Bias, so local = UTC - Bias.   */
+        double bias_min = (double)tzi.Bias +
+                           (double)((r == TIME_ZONE_ID_DAYLIGHT) ? tzi.DaylightBias : tzi.StandardBias);
+        sunrise_min -= bias_min;
+        sunset_min  -= bias_min;
+    }
+
+    {
+        int sr = ((int)floor(sunrise_min) % 1440 + 1440) % 1440;
+        int ss = ((int)floor(sunset_min)  % 1440 + 1440) % 1440;
+        snprintf(sunrise_str, sunrise_len, "%02d:%02d", sr / 60, sr % 60);
+        snprintf(sunset_str,  sunset_len,  "%02d:%02d", ss / 60, ss % 60);
+    }
 }
 
 /* Current time as seconds since midnight */
@@ -6739,11 +7267,13 @@ repeat_schedule:
         const char *fmt_name =
             g_state.cfg.output_format == FORMAT_WAVVIEWDX  ? "WavViewDX-raw" :
             g_state.cfg.output_format == FORMAT_SDRUNO     ? "SDRuno WAV (216-byte header)" :
+            g_state.cfg.output_format == FORMAT_WINRAD     ? "Winrad WAV (216-byte header)" :
             g_state.cfg.output_format == FORMAT_SDRCONNECT ? "SDR Connect WAV (80-byte header)" :
                                                               "Linrad (41-byte header)";
         LOG_INFO("Output format : %s", fmt_name);
         if (g_state.cfg.dual_channel && !g_state.master_slave_active &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                 g_state.cfg.output_format == FORMAT_WINRAD ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT)) {
             LOG_ERROR("Output format '%s' does not support interleaved "
                       "dual-channel mode (same CF on both tuners).", fmt_name);
@@ -6758,6 +7288,7 @@ repeat_schedule:
         }
         if (g_state.master_slave_active &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                 g_state.cfg.output_format == FORMAT_WINRAD ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT)) {
             LOG_INFO("Different CFs on Tuner A/B: recording as two separate "
                      "%s files (one per tuner), not an interleaved dual file.",
@@ -6859,6 +7390,18 @@ repeat_schedule:
         goto cleanup_ring;
     }
 
+    /* Split mode (SDRuno always; Winrad/SDR Connect when so configured):
+     * make sure the part counter starts clean (it's also reset alongside
+     * samples_written between recordings, but a first-ever recording in
+     * this process needs it set here too).                               */
+    if (g_state.cfg.output_format == FORMAT_SDRUNO ||
+            ((g_state.cfg.output_format == FORMAT_WINRAD ||
+              g_state.cfg.output_format == FORMAT_SDRCONNECT) &&
+             g_state.cfg.large_file_mode == LARGE_FILE_SPLIT)) {
+        g_state.output_part_number = 1;
+    }
+    g_state.segment_samples_written = 0;
+
     /* Writing two separate single-channel files (different CFs) rather
      * than one interleaved dual file - each header says 1 channel. */
     {
@@ -6871,12 +7414,25 @@ repeat_schedule:
             }
             FlushFileBuffers(g_state.out_file);
         } else if (g_state.cfg.output_format == FORMAT_SDRUNO) {
+            /* SDRuno never gets RF64 - it can't play those back (see the
+             * OutputFormat enum comment) - so this is unconditional.     */
             if (!write_sdruno_header(g_state.out_file, &g_state.cfg)) {
                 rc = 1; goto cleanup_file;
             }
             FlushFileBuffers(g_state.out_file);
+        } else if (g_state.cfg.output_format == FORMAT_WINRAD) {
+            int hdr_ok = (g_state.cfg.large_file_mode == LARGE_FILE_RF64)
+                         ? write_sdruno_header_rf64(g_state.out_file, &g_state.cfg)
+                         : write_sdruno_header(g_state.out_file, &g_state.cfg);
+            if (!hdr_ok) {
+                rc = 1; goto cleanup_file;
+            }
+            FlushFileBuffers(g_state.out_file);
         } else if (g_state.cfg.output_format == FORMAT_SDRCONNECT) {
-            if (!write_sdrconnect_header(g_state.out_file, &g_state.cfg)) {
+            int hdr_ok = (g_state.cfg.large_file_mode == LARGE_FILE_RF64)
+                         ? write_sdrconnect_header_rf64(g_state.out_file, &g_state.cfg)
+                         : write_sdrconnect_header(g_state.out_file, &g_state.cfg);
+            if (!hdr_ok) {
                 rc = 1; goto cleanup_file;
             }
             FlushFileBuffers(g_state.out_file);
@@ -7368,15 +7924,21 @@ repeat_schedule:
      * without needing to stop DuoDX. The file handle was previously left
      * open until the end of the entire session.                           */
     if (g_state.out_file != INVALID_HANDLE_VALUE) {
-        if (g_state.samples_written > 0 &&
+        /* segment_samples_written, not samples_written: if split mode
+         * rolled over to a new part file, samples_written is the
+         * cumulative session total but this file only holds the current
+         * segment - segment_samples_written tracks that correctly and is
+         * identical to samples_written whenever no rollover happened.    */
+        if (g_state.segment_samples_written > 0 &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                 g_state.cfg.output_format == FORMAT_WINRAD ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT))
-            patch_wav_sizes(g_state.out_file, &g_state.cfg,
-                            g_state.samples_written);
+            finalize_output_header(g_state.out_file, &g_state.cfg,
+                            g_state.segment_samples_written);
         CloseHandle(g_state.out_file);
         g_state.out_file = INVALID_HANDLE_VALUE;
-        if (g_state.samples_written > 0)
-            verify_recording(&g_state.cfg, g_state.samples_written);
+        if (g_state.segment_samples_written > 0)
+            verify_recording(&g_state.cfg, g_state.segment_samples_written);
     }
     close_and_verify_file_b(&g_state);
     if (g_state.master_slave_active)
@@ -7452,15 +8014,18 @@ repeat_schedule:
             LARGE_INTEGER fs;
             if (GetFileSizeEx(g_state.out_file, &fs))
                 g_state.frozen_file_mb = (LONG64)(fs.QuadPart / (1024 * 1024));
-            if (g_state.samples_written > 0 &&
+            /* segment_samples_written: see comment at the other close site
+             * above - matches samples_written unless a split occurred.   */
+            if (g_state.segment_samples_written > 0 &&
                     (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                     g_state.cfg.output_format == FORMAT_WINRAD ||
                      g_state.cfg.output_format == FORMAT_SDRCONNECT))
-                patch_wav_sizes(g_state.out_file, &g_state.cfg,
-                                g_state.samples_written);
+                finalize_output_header(g_state.out_file, &g_state.cfg,
+                                g_state.segment_samples_written);
             CloseHandle(g_state.out_file);
             g_state.out_file = INVALID_HANDLE_VALUE;
-            if (g_state.samples_written > 0)
-                verify_recording(&g_state.cfg, g_state.samples_written);
+            if (g_state.segment_samples_written > 0)
+                verify_recording(&g_state.cfg, g_state.segment_samples_written);
         }
         close_and_verify_file_b(&g_state);
         if (g_state.master_slave_active)
@@ -7469,6 +8034,8 @@ repeat_schedule:
         /* Reset per-recording counters */
         g_state.samples_received    = 0;
         g_state.samples_written     = 0;
+        g_state.segment_samples_written = 0;
+        g_state.output_part_number  = 1;
         g_state.zero_frames_written = 0;
         g_state.overflows           = 0;
         g_state.peak_dbfs           = -90.0f;
@@ -7499,6 +8066,8 @@ repeat_schedule:
         /* Reset counters for next recording */
         g_state.samples_received    = 0;
         g_state.samples_written     = 0;
+        g_state.segment_samples_written = 0;
+        g_state.output_part_number  = 1;
         g_state.zero_frames_written = 0;
         g_state.overflows           = 0;
         g_state.peak_dbfs           = -90.0f;
@@ -7597,6 +8166,8 @@ repeat_schedule:
         sched_idx                   = 0;
         g_state.samples_received    = 0;
         g_state.samples_written     = 0;
+        g_state.segment_samples_written = 0;
+        g_state.output_part_number  = 1;
         g_state.zero_frames_written = 0;
         g_state.overflows           = 0;
         g_state.peak_dbfs           = -90.0f;
@@ -7644,15 +8215,18 @@ cleanup_file:
         g_state.pipe_handle = INVALID_HANDLE_VALUE;
     }
     if (g_state.out_file != INVALID_HANDLE_VALUE) {
-        if (g_state.samples_written > 0 &&
+        /* segment_samples_written: see comment at the other close sites -
+         * matches samples_written unless a split occurred.               */
+        if (g_state.segment_samples_written > 0 &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                 g_state.cfg.output_format == FORMAT_WINRAD ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT))
-            patch_wav_sizes(g_state.out_file, &g_state.cfg,
-                            g_state.samples_written);
+            finalize_output_header(g_state.out_file, &g_state.cfg,
+                            g_state.segment_samples_written);
         CloseHandle(g_state.out_file);
         g_state.out_file = INVALID_HANDLE_VALUE;
-        if (g_state.samples_written > 0)
-            verify_recording(&g_state.cfg, g_state.samples_written);
+        if (g_state.segment_samples_written > 0)
+            verify_recording(&g_state.cfg, g_state.segment_samples_written);
     }
     close_and_verify_file_b(&g_state);
     if (g_state.master_slave_active)
@@ -8275,6 +8849,23 @@ static void draw_counter(HDC dc, int x, int y, int w, int h,
     draw_panel(dc, r);
     draw_text(dc, x + 10, y + 6, label, COL_TEXT_DIM, g_hFontUI);
     draw_text(dc, x + 10, y + 24, value, valcol, g_hFontBig);
+}
+
+/* Two-row variant for the SUN tile - "SUNRISE  HH:MM" on the top line,
+ * "SUNSET  HH:MM" on the line below, rather than draw_counter's usual
+ * single label + single value layout. SUNRISE and SUNSET share the same
+ * (dim, small) label font so the two rows read consistently; the times
+ * use the slightly larger/brighter value font, matching how every other
+ * tile emphasises its value over its label.                              */
+static void draw_suntile(HDC dc, int x, int y, int w, int h,
+                          const char *sunrise, const char *sunset)
+{
+    RECT r = { x, y, x + w, y + h };
+    draw_panel(dc, r);
+    draw_text(dc, x + 10, y + 8,  "SUNRISE", COL_TEXT_DIM, g_hFontUI);
+    draw_text(dc, x + 76, y + 6,  sunrise,   COL_SUNRISE, g_hFontVal);
+    draw_text(dc, x + 10, y + 32, "SUNSET",  COL_TEXT_DIM, g_hFontUI);
+    draw_text(dc, x + 76, y + 30, sunset,    COL_SUNSET, g_hFontVal);
 }
 
 /* =========================================================================
@@ -11055,7 +11646,7 @@ static void paint_window(HWND hwnd)
     int ctrTop = panelTop + 96;
     {
         int gap = 10;
-        int tiles = 5;
+        int tiles = g_state.cfg.show_sun_times ? 6 : 5;
         int totalW = cr.right - 24;
         int tw = (totalW - gap * (tiles - 1)) / tiles;
         int th = 56;
@@ -11090,6 +11681,14 @@ static void paint_window(HWND hwnd)
         COLORREF rc = s.ring_pct > 80.0f ? COL_SEG_RED
                     : s.ring_pct > 50.0f ? COL_SEG_AMBER : COL_SEG_GREEN;
         draw_counter(dc, x, ctrTop, tw, th, "RING BUFFER", v, rc);
+        x += tw + gap;
+
+        if (g_state.cfg.show_sun_times) {
+            char sunrise_str[16], sunset_str[16];
+            get_sun_times_str(&g_state.cfg, sunrise_str, sizeof(sunrise_str),
+                                             sunset_str,  sizeof(sunset_str));
+            draw_suntile(dc, x, ctrTop, tw, th, sunrise_str, sunset_str);
+        }
     }
 
     /* ---- Disk line: free space + AGC / HDR / overload indicators ---- */
@@ -12452,13 +13051,33 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
                       g_state.cfg.output_file, GetLastError());
             goto slave_free_ring;
         }
+        if (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                ((g_state.cfg.output_format == FORMAT_WINRAD ||
+                  g_state.cfg.output_format == FORMAT_SDRCONNECT) &&
+                 g_state.cfg.large_file_mode == LARGE_FILE_SPLIT)) {
+            g_state.output_part_number = 1;
+        }
+        g_state.segment_samples_written = 0;
+
         if (g_state.cfg.output_format == FORMAT_SDRUNO) {
+            /* SDRuno never gets RF64 - see the OutputFormat enum comment. */
             if (!write_sdruno_header(g_state.out_file, &g_state.cfg)) {
                 LOG_ERROR("Slave: header write failed.");
                 goto slave_close_file;
             }
+        } else if (g_state.cfg.output_format == FORMAT_WINRAD) {
+            int hdr_ok = (g_state.cfg.large_file_mode == LARGE_FILE_RF64)
+                         ? write_sdruno_header_rf64(g_state.out_file, &g_state.cfg)
+                         : write_sdruno_header(g_state.out_file, &g_state.cfg);
+            if (!hdr_ok) {
+                LOG_ERROR("Slave: header write failed.");
+                goto slave_close_file;
+            }
         } else if (g_state.cfg.output_format == FORMAT_SDRCONNECT) {
-            if (!write_sdrconnect_header(g_state.out_file, &g_state.cfg)) {
+            int hdr_ok = (g_state.cfg.large_file_mode == LARGE_FILE_RF64)
+                         ? write_sdrconnect_header_rf64(g_state.out_file, &g_state.cfg)
+                         : write_sdrconnect_header(g_state.out_file, &g_state.cfg);
+            if (!hdr_ok) {
                 LOG_ERROR("Slave: header write failed.");
                 goto slave_close_file;
             }
@@ -12604,15 +13223,18 @@ slave_stop_writer:
         CloseHandle(g_state.writer_ready_event);
 
     if (g_state.out_file != INVALID_HANDLE_VALUE) {
-        if (g_state.samples_written > 0 &&
+        /* segment_samples_written: see comment at the other close sites -
+         * matches samples_written unless a split occurred.               */
+        if (g_state.segment_samples_written > 0 &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                 g_state.cfg.output_format == FORMAT_WINRAD ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT))
-            patch_wav_sizes(g_state.out_file, &g_state.cfg, g_state.samples_written);
+            finalize_output_header(g_state.out_file, &g_state.cfg, g_state.segment_samples_written);
         CloseHandle(g_state.out_file);
         g_state.out_file = INVALID_HANDLE_VALUE;
     }
-    if (g_state.samples_written > 0)
-        verify_recording(&g_state.cfg, g_state.samples_written);
+    if (g_state.segment_samples_written > 0)
+        verify_recording(&g_state.cfg, g_state.segment_samples_written);
     rc = 0;
 
 slave_close_file:
@@ -12671,6 +13293,11 @@ static HWND   g_hSetLnaB      = NULL;
 static HWND   g_hSetLnaBSame  = NULL;
 static HWND   g_hSetDuration  = NULL;
 static HWND   g_hSetFormat    = NULL;
+static HWND   g_hSetLargeModeLbl = NULL;
+static HWND   g_hSetLargeMode    = NULL;
+static HWND   g_hSetLatitude     = NULL;
+static HWND   g_hSetLongitude    = NULL;
+static HWND   g_hSetShowSun      = NULL;
 static HWND   g_hSetPath      = NULL;
 static HWND   g_hSetHdr       = NULL;
 static HWND   g_hSetHdrHint   = NULL;
@@ -13202,6 +13829,24 @@ static void settings_set_edit_readonly(HWND h, int enabled)
     EnableWindow(h, enabled);
 }
 
+/* Shows the "large file handling" combo when Winrad or SDR Connect output
+ * format is selected AND the Recording tab (where it lives) is the active
+ * one. Not shown for Linrad/WavViewDX (no 4 GiB WAV header limit to work
+ * around) or for SDRuno - SDRuno itself doesn't support RF64 playback, so
+ * that format always splits at 4 GiB with no user-facing choice; Winrad
+ * exists specifically as the RF64-capable alternative. Format selection
+ * alone isn't enough to gate visibility: this control is tagged for tab 2
+ * like everything else on Recording, so switching to a different tab must
+ * still hide it even if the format condition would otherwise say "show". */
+static void settings_update_format_dependent_state(void)
+{
+    LRESULT fsel = g_hSetFormat ? SendMessageA(g_hSetFormat, CB_GETCURSEL, 0, 0) : CB_ERR;
+    int show = (fsel == FORMAT_WINRAD || fsel == FORMAT_SDRCONNECT)
+               && (g_settings_active_tab == 2);
+    if (g_hSetLargeModeLbl) ShowWindow(g_hSetLargeModeLbl, show ? SW_SHOW : SW_HIDE);
+    if (g_hSetLargeMode)    ShowWindow(g_hSetLargeMode,    show ? SW_SHOW : SW_HIDE);
+}
+
 static void settings_update_dual_enable_state(void)
 {
     LRESULT t1  = SendMessageA(g_hSetTuner1En, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -13501,6 +14146,12 @@ static void settings_load_controls(void)
                  g_settings_cfg.verbose ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(g_hSetLogAutoSave, BM_SETCHECK,
                  g_settings_cfg.log_auto_save ? BST_CHECKED : BST_UNCHECKED, 0);
+    snprintf(buf, sizeof(buf), "%.6f", g_settings_cfg.latitude);
+    SetWindowTextA(g_hSetLatitude, buf);
+    snprintf(buf, sizeof(buf), "%.6f", g_settings_cfg.longitude);
+    SetWindowTextA(g_hSetLongitude, buf);
+    SendMessageA(g_hSetShowSun, BM_SETCHECK,
+                 g_settings_cfg.show_sun_times ? BST_CHECKED : BST_UNCHECKED, 0);
     {
         int ms = g_settings_cfg.meter_style;
         SendMessageA(g_hSetMeterStyle, CB_SETCURSEL, (WPARAM)(ms >= 0 && ms <= 2 ? ms : 0), 0);
@@ -13560,6 +14211,10 @@ static void settings_load_controls(void)
     SetWindowTextA(g_hSetDualT1Antenna, g_settings_cfg.antenna);
 
     SendMessageA(g_hSetFormat, CB_SETCURSEL, (WPARAM)g_settings_cfg.output_format, 0);
+    if (g_hSetLargeMode)
+        SendMessageA(g_hSetLargeMode, CB_SETCURSEL,
+                     (WPARAM)g_settings_cfg.large_file_mode, 0);
+    settings_update_format_dependent_state();
     SetWindowTextA(g_hSetPath, g_settings_cfg.recording_path);
 
     {
@@ -13760,12 +14415,22 @@ static void settings_save(void)
     }
 
     {
-        static const char *fmt_names[4] = { "linrad", "wavviewdx", "sdruno", "sdrconnect" };
+        static const char *fmt_names[5] = { "linrad", "wavviewdx", "sdruno", "sdrconnect", "winrad" };
         LRESULT fsel = SendMessageA(g_hSetFormat, CB_GETCURSEL, 0, 0);
         if (fsel == CB_ERR) fsel = 0;
         entries[n].key = "output_format";
         snprintf(entries[n].value, sizeof(entries[n].value), "%s",
-                 fmt_names[fsel < 4 ? fsel : 0]);
+                 fmt_names[fsel < 5 ? fsel : 0]);
+        n++;
+    }
+
+    {
+        LRESULT lsel = g_hSetLargeMode
+                       ? SendMessageA(g_hSetLargeMode, CB_GETCURSEL, 0, 0)
+                       : LARGE_FILE_SPLIT;
+        if (lsel == CB_ERR) lsel = LARGE_FILE_SPLIT;
+        entries[n].key = "large_file_mode";
+        snprintf(entries[n].value, sizeof(entries[n].value), "%d", (int)lsel);
         n++;
     }
 
@@ -13904,6 +14569,21 @@ static void settings_save(void)
     entries[n].key = "log_auto_save";
     snprintf(entries[n].value, sizeof(entries[n].value), "%d",
              SendMessageA(g_hSetLogAutoSave, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
+    n++;
+
+    GetWindowTextA(g_hSetLatitude, buf, sizeof(buf));
+    entries[n].key = "latitude";
+    snprintf(entries[n].value, sizeof(entries[n].value), "%.6f", atof(buf));
+    n++;
+
+    GetWindowTextA(g_hSetLongitude, buf, sizeof(buf));
+    entries[n].key = "longitude";
+    snprintf(entries[n].value, sizeof(entries[n].value), "%.6f", atof(buf));
+    n++;
+
+    entries[n].key = "show_sun_times";
+    snprintf(entries[n].value, sizeof(entries[n].value), "%d",
+             SendMessageA(g_hSetShowSun, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
     n++;
 
     {
@@ -14542,6 +15222,21 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 settings_update_hdr_hint();
             }
             return 0;
+        case IDC_SET_FORMAT:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                /* Winrad's whole reason for existing is RF64 support (SDRuno
+                 * doesn't have it - see the OutputFormat enum comment), so
+                 * default the choice to RF64 the moment the user actively
+                 * picks Winrad here. This only fires on a live selection
+                 * change, not when the dialog loads a previously-saved
+                 * choice at open time, so it won't fight a value the user
+                 * deliberately set back to Split for Winrad in the past.  */
+                LRESULT fsel = SendMessageA(g_hSetFormat, CB_GETCURSEL, 0, 0);
+                if (fsel == FORMAT_WINRAD && g_hSetLargeMode)
+                    SendMessageA(g_hSetLargeMode, CB_SETCURSEL, LARGE_FILE_RF64, 0);
+                settings_update_format_dependent_state();
+            }
+            return 0;
         case IDC_SET_RATECOMBO:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 /* A different Sample Rate/IF/BW combo just got picked -
@@ -14983,6 +15678,12 @@ static void settings_select_tab(int tab_idx)
     for (i = 0; i < 7; i++)
         if (g_hSetTabBtn[i]) InvalidateRect(g_hSetTabBtn[i], NULL, TRUE);
     if (tab_idx == 0) settings_update_coherent_indicator();
+    /* Re-apply the format-dependent override on top of the generic tab
+     * show/hide above - settings_select_tab() alone would show this
+     * control on Recording regardless of output format, and hide it on
+     * every other tab regardless of format too; the format check has to
+     * run again after the tab switch to correct for both.               */
+    settings_update_format_dependent_state();
 }
 
 static void open_settings_dialog(HWND parent)
@@ -15339,9 +16040,26 @@ static void open_settings_dialog(HWND parent)
     SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"WavViewDX");
     SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"SDRuno");
     SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"SDRconnect");
+    SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"Winrad");
     if (g_hFontUI) SendMessageA(g_hSetFormat, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
     settings_apply_dark_theme(g_hSetFormat);
     settings_tag_tab(g_hSetFormat);
+    y0 += row;
+
+    /* SDRuno and SDR Connect only: how to handle a recording that would
+     * exceed the 4 GiB WAV data-size limit. Hidden for every other output
+     * format - shown/hidden live by settings_update_format_dependent_state(). */
+    g_hSetLargeModeLbl = settings_mk_label(g_hSettingsWnd, hInst,
+                                    ">4GB File Handling", x, y0, label_w);
+    g_hSetLargeMode = CreateWindowExA(0, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
+                ctl_x, y0 - 2, win_w - ctl_x - 16, 22 + 60,
+                g_hSettingsWnd, (HMENU)(INT_PTR)IDC_SET_LARGEMODE, hInst, NULL);
+    SendMessageA(g_hSetLargeMode, CB_ADDSTRING, 0, (LPARAM)"Split at 4GB (recommended)");
+    SendMessageA(g_hSetLargeMode, CB_ADDSTRING, 0, (LPARAM)"RF64 (single file)");
+    if (g_hFontUI) SendMessageA(g_hSetLargeMode, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    settings_apply_dark_theme(g_hSetLargeMode);
+    settings_tag_tab(g_hSetLargeMode);
     y0 += row;
 
     settings_mk_label(g_hSettingsWnd, hInst, "Recording Path", x, y0, label_w);
@@ -15593,6 +16311,25 @@ static void open_settings_dialog(HWND parent)
 
     g_hSetLogAutoSave = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_LOG_AUTOSAVE,
                                        "Auto-save session log to a file", x, y0, 260);
+    y0 += row;
+
+    settings_mk_label(g_hSettingsWnd, hInst, "Location (for sunrise/sunset)", x, y0, win_w - x - 16);
+    y0 += row;
+
+    settings_mk_label(g_hSettingsWnd, hInst, "Latitude", x, y0, label_w);
+    g_hSetLatitude = settings_mk_edit(g_hSettingsWnd, hInst, IDC_SET_LATITUDE, ctl_x, y0 - 2, 120);
+    settings_mk_label(g_hSettingsWnd, hInst, "Longitude", ctl_x + 130, y0, 80);
+    g_hSetLongitude = settings_mk_edit(g_hSettingsWnd, hInst, IDC_SET_LONGITUDE,
+                                        ctl_x + 210, y0 - 2, 120);
+    y0 += row;
+
+    settings_mk_label(g_hSettingsWnd, hInst,
+        "Decimal degrees - positive latitude is north, positive longitude is east "
+        "(e.g. -45.098, 170.966).", x, y0, win_w - x - 16);
+    y0 += row;
+
+    g_hSetShowSun = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_SHOW_SUN,
+                                       "Show Sunrise/Sunset on main window", x, y0, 300);
     y0 += row;
 
     y_misc = y0;
