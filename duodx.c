@@ -16055,7 +16055,7 @@ static void open_settings_dialog(HWND parent)
                 WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
                 ctl_x, y0 - 2, win_w - ctl_x - 16, 22 + 60,
                 g_hSettingsWnd, (HMENU)(INT_PTR)IDC_SET_LARGEMODE, hInst, NULL);
-    SendMessageA(g_hSetLargeMode, CB_ADDSTRING, 0, (LPARAM)"Split at 4GB (recommended)");
+    SendMessageA(g_hSetLargeMode, CB_ADDSTRING, 0, (LPARAM)"Split at 4GB");
     SendMessageA(g_hSetLargeMode, CB_ADDSTRING, 0, (LPARAM)"RF64 (single file)");
     if (g_hFontUI) SendMessageA(g_hSetLargeMode, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
     settings_apply_dark_theme(g_hSetLargeMode);
