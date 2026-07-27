@@ -8606,6 +8606,17 @@ static void gui_start_listening(void)
          * turn A=B on automatically so the two stay in sync from the
          * start, without overriding a later deliberate manual toggle. */
         g_monitor.freq_locked = 1;
+        /* Actually sync the two dial frequencies here too, not just the
+         * lock flag - otherwise Tuner B's dial frequency sits at its
+         * startup default (0.0, uninitialized) until the user happens to
+         * switch to it for the first time, at which point it snaps to
+         * Tuner B's own coverage centre rather than matching wherever
+         * Tuner A actually is - exactly the "A doesn't equal B when
+         * switching" symptom this auto-lock was supposed to prevent.    */
+        EnterCriticalSection(&g_monitor.settings_lock);
+        g_monitor.freq_hz   = g_state.cfg.frequency_hz;
+        g_monitor.freq_hz_b = g_state.cfg.frequency_hz;
+        LeaveCriticalSection(&g_monitor.settings_lock);
         if (g_hBtnFreqLock) InvalidateRect(g_hBtnFreqLock, NULL, TRUE);
     }
     g_ab_auto_pending = 0;   /* consumed either way - only ever fires once
@@ -11228,7 +11239,38 @@ static void monitor_apply_hpf_hz_from_slider(void)
  * so right-click now toggles directly instead.                        */
 static void monitor_toggle_tuner_sel(void)
 {
+    int old_sel = g_monitor.tuner_sel;
     g_monitor.tuner_sel = g_monitor.tuner_sel ? 0 : 1;
+
+    if (g_monitor.freq_locked) {
+        /* Keep A=B actually meaning "equal" across the switch too, not
+         * just when the dial is subsequently touched. Without this, the
+         * tuner just switched TO can still be sitting wherever it was
+         * last left (or at its own coverage centre, if this is the first
+         * switch to it this session) rather than matching the tuner just
+         * switched away from - so the lock silently stops holding the
+         * moment you look at the other side, even though the button
+         * still shows it as engaged. Same clamp-to-coverage approach as
+         * the dial-drag handler above, for the same reason: the two
+         * tuners' coverage can differ (e.g. Master/Slave at different
+         * CFs), so the synced value has to land somewhere that tuner can
+         * actually receive, not just be a raw copy.                     */
+        EnterCriticalSection(&g_monitor.settings_lock);
+        {
+            double old_freq   = (old_sel == 1) ? g_monitor.freq_hz_b : g_monitor.freq_hz;
+            double new_center = monitor_center_for_tuner(g_monitor.tuner_sel);
+            double clamped;
+            if (old_freq <= 0.0)
+                old_freq = monitor_center_for_tuner(old_sel);   /* never tuned this session yet */
+            clamped = monitor_clamp_to_coverage(old_freq, new_center);
+            if (g_monitor.tuner_sel == 1)
+                g_monitor.freq_hz_b = clamped;
+            else
+                g_monitor.freq_hz = clamped;
+        }
+        LeaveCriticalSection(&g_monitor.settings_lock);
+    }
+
     SetWindowTextA(g_hBtnMonitor, g_monitor.tuner_sel ? "Tuner B" : "Tuner A");
     InvalidateRect(g_hBtnMonitor, NULL, TRUE);
     if (g_hFreqDigits) InvalidateRect(g_hFreqDigits, NULL, TRUE);
