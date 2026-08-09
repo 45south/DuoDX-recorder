@@ -4,7 +4,23 @@ A Windows graphical IQ recorder for SDRplay RSP receivers, built primarily for m
 
 DuoDX's standout feature is native support for the RSPduo's two tuners recording **simultaneously**: either phase-coherent on the same frequency (for antenna phasing / diversity work in your own post-processing software), or on two genuinely independent frequencies — even different bands entirely — each to its own file.
 
-> This project was developed with the assistance of Claude (Anthropic), which contributed to the C programming, debugging, and documentation.
+---
+
+### ⚠️ A Quick Word of Warning: This is an AI-Assisted Project ⚠️
+
+**This project is a personal project for my dx hobby.**
+
+A large language model (AI) helped write a significant portion of this code, *if not most.* I guided it, reviewed its output the best I could, and tested the result, but this project didn't evolve through the typical trial-and-error of a human-only endeavor. Even this README you're reading was drafted by the AI based on the source code, then edited and refined by me.
+
+Second, it's worth knowing that this was a learning project for myself. The focus was always on getting a practical, working result, which means some of the solutions are probably not what you'd find in a textbook. 
+
+*What does this mean?*
+
+*   **This is experimental.** While it works, it hasn't been battle-tested across all possible options and hardware.
+*   **Design choices not stable.** You may see features etc. suddenly appear and disappear. You may also see large commits of lots of changes. 
+*   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. 
+
+---
 
 ## Features
 
@@ -21,6 +37,8 @@ DuoDX's standout feature is native support for the RSPduo's two tuners recording
 - In-app Settings dialog covering nearly all of `duodx.ini`, editing the file in place and applying changes immediately — no restart required for most settings.
 
 See the [User Guide](DuoDX_User_Guide_3_1_0.docx) for full documentation.
+
+<img width="1282" height="938" alt="image" src="https://github.com/user-attachments/assets/de74e89a-30e2-42d2-9b44-40ca7e83263a" />
 
 ## Supported Devices
 
