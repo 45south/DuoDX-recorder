@@ -1,81 +1,77 @@
 # DuoDX
 
-**RSP Dual Channel IQ Recorder** — a Windows native GUI application for recording raw I/Q data from SDRplay RSP receivers, with a live audio monitor, genuine dual-tuner support on RSPduo, and RSPduo Master/Slave mode for two entirely independent frequencies at once.
+A Windows graphical IQ recorder for SDRplay RSP receivers, built primarily for medium wave (MW) DX work, with support for adjacent bands and portions of shortwave.
 
-Version 3.0.0
+DuoDX's standout feature is native support for the RSPduo's two tuners recording **simultaneously**: either phase-coherent on the same frequency (for antenna phasing / diversity work in your own post-processing software), or on two genuinely independent frequencies — even different bands entirely — each to its own file.
 
----
-
-### ⚠️ A Quick Word of Warning: This is an AI-Assisted Project ⚠️
-
-**This project is a personal project for my dx hobby.**
-
-A large language model (AI) helped write a significant portion of this code, *if not most.* I guided it, reviewed its output the best I could, and tested the result, but this project didn't evolve through the typical trial-and-error of a human-only endeavor. Even this README you're reading was drafted by the AI based on the source code, then edited and refined by me.
-
-Second, it's worth knowing that this was a learning project for myself. The focus was always on getting a practical, working result, which means some of the solutions are probably not what you'd find in a textbook. 
-
-*What does this mean?*
-
-*   **This is experimental.** While it works, it hasn't been battle-tested across all possible options and hardware.
-*   **Design choices not stable.** You may see features etc. suddenly appear and disappear. You may also see large commits of lots of changes. 
-*   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. 
-
----
-
-<img width="1119" height="864" alt="Screenshot" src="https://github.com/user-attachments/assets/1ccf4846-4223-4458-8ea7-8bf5ff3cf0a8" />
-
+> This project was developed with the assistance of Claude (Anthropic), which contributed to the C programming, debugging, and documentation.
 
 ## Features
 
-- Records raw I/Q to Linrad-compatible format, plus SDRuno and SDR Connect WAV output
-- Full single-tuner support for all RSP models (RSP1, RSP1A, RSP1B, RSPdx, RSPdx-R2)
-- Genuine dual-channel recording on RSPduo — both tuners to one interleaved file
-- RSPduo Master/Slave mode — two independently tuned frequencies, each to its own file, including entirely different bands (e.g. medium wave on one tuner, shortwave on the other)
-- Live audio monitor, independent of the recording path: AM (6/4/2.4 kHz), FM-N, FM-W, LSB, USB, and CW demodulation, with its own AGC, volume, low-cut filter, and scrollable-digit frequency tuning
-- Carrier frequency offset display (AM mode) — measures how far a station's actual carrier sits from the dial, with adaptive integration time for weak/DX-level signals
-- Narrowband S-meter for the live monitor, showing the tuned station's own strength
-- In-app Settings dialog covering nearly every commonly-changed option, patching `duodx.ini` in place without disturbing anything not shown in the dialog
-- Multi-entry and hourly scheduling, with a live HTTP status dashboard and an optional named-pipe interface
-- HDR mode, Bias-T, antenna selection, IF notch, DC/IQ correction — all per-tuner where the hardware supports it
+- Native Win32 GUI — live signal meters, status readouts, colour-coded log, no installer or runtime dependencies beyond the SDRplay API itself.
+- Recording in **Linrad raw**, **WavViewDX-raw**, **SDRuno WAV**, **Winrad WAV**, **SDR Connect WAV**, **Perseus WAV**, and **Jaguar WAV** formats.
+- **RSPduo dual-tuner recording**:
+  - Same-frequency phase-coherent interleaved capture, for antenna phasing/diversity analysis (Linrad raw and WavViewDX-raw).
+  - Master/Slave mode — genuinely independent Tuner 1 / Tuner 2 frequencies, each to its own file, in any output format.
+- **Low-IF mode** optimised for MW DX (1620/2048 kHz IF, eliminates the DC spike at centre frequency), alongside Zero-IF for wider and shortwave captures.
+- Scheduling: single deferred start, hourly recording windows, and up to 32-entry multi-recording overnight schedules that repeat automatically each night.
+- Live audio monitor, entirely separate from the recording path — AM/LSB/USB/CW/FM demodulation, adaptive AGC, scrollable per-digit tuning, IF notch, and a narrowband S-meter — for listening to and adjusting a session without generating throwaway test files.
+- Lock-free ring buffer with automatic zero-fill gap compensation, so a disk overflow never desyncs the recording's timeline.
+- Built-in HTTP status dashboard for monitoring from a phone or browser on the local network.
+- In-app Settings dialog covering nearly all of `duodx.ini`, editing the file in place and applying changes immediately — no restart required for most settings.
 
-See `DuoDX_User_Guide_3_0_0.docx` for full usage documentation, and `DuoDX_Version_History.docx` for the complete changelog back to the original 1.x console version.
+See the [User Guide](DuoDX_User_Guide_3_1_0.docx) for full documentation.
+
+## Supported Devices
+
+| Device | Antenna Inputs | Notes |
+|---|---|---|
+| RSP1 | 1 × SMA | Basic single-channel device |
+| RSP1A / RSP1B | 1 × SMA | RF notch, DAB notch, Bias-T |
+| RSP2 | A + B (SMA) | RF notch, antenna switching, Bias-T on Port B |
+| RSPduo | T1: Hi-Z + 50 Ω SMA; T2: 50 Ω SMA | Dual-tuner mode, Hi-Z AM notch, Bias-T on Tuner 2 only |
+| RSPdx / RSPdxR2 | A, B (SMA), C (BNC) | HDR mode, RF notch, DAB notch, Bias-T on Port B only |
 
 ## Requirements
 
-- Windows 10 or 11 (x64)
-- [SDRplay API](https://www.sdrplay.com/api/) (v3.x) installed, with the appropriate device drivers
-- An SDRplay RSP-series receiver (RSP1, RSP1A, RSP1B, RSPdx, RSPdx-R2, or RSPduo)
+- Windows 10 (version 1511+) or Windows 11.
+- [SDRplay API](https://www.sdrplay.com/api/) 3.0 or later, installed and running as a service.
+- SDRplay device drivers (installed as part of the SDRplay software package).
 
-## Building
+## Getting Started
 
-Requires MinGW-w64 (via [MSYS2](https://www.msys2.org/) is the easiest route) and the SDRplay API's headers and import library.
+1. Download `duodx.exe` and `duodx.ini` and place them together in any folder.
+2. Edit `duodx.ini` (or use the in-app Settings dialog once it's running) to set your frequency, output format, gain, and antenna.
+3. Launch `duodx.exe`. Press **Record** to start, or **Monitor** to listen live without recording.
 
-```sh
-gcc -O2 -o duodx.exe duodx.c -I"C:\Program Files\SDRplay\API\inc" \
-    -L"C:\Program Files\SDRplay\API\x64" -lsdrplay_api -lwinmm -mthreads
+If DuoDX fails to start with a missing-DLL error, copy `sdrplay_api.dll` from `C:\Program Files\SDRplay\API\x64\` into the same folder as `duodx.exe`.
+
+## Building from Source
+
+DuoDX is a single C source file (`duodx.c`), cross-compiled from Linux with MinGW-w64, or natively with MSYS2/MinGW on Windows.
+
+```bash
+x86_64-w64-mingw32-gcc -Wall -O2 duodx.c -o duodx.exe \
+    -I/path/to/sdrplay_api/headers \
+    -lgdi32 -lcomctl32 -lwinmm -lws2_32
 ```
 
-Or with MSVC:
+You'll need the SDRplay API headers (`sdrplay_api.h` and friends) available on your include path — these ship with the SDRplay API installer, or can be sourced from SDRplay's own developer documentation. The exact link flags above are indicative rather than a verified build command — adjust to match whichever libraries your toolchain actually needs; every compile check during this project's development was compile-only (`-c`), not a full link against the real Windows import libraries.
 
-```bat
-cl /O2 duodx.c /I"C:\Program Files\SDRplay\API\inc" ^
-   /link "C:\Program Files\SDRplay\API\x64\sdrplay_api.lib" winmm.lib
-```
+## Configuration Reference
 
-Adjust the include/library paths if the SDRplay API is installed somewhere other than the default location. No other third-party dependencies are required — everything else is drawn from the standard Windows API.
-
-## Running
-
-Place `duodx.exe` and `sdrplay_api.dll` (or ensure the SDRplay API is installed so the DLL is on the system path) in the same folder, and run it. A `duodx.ini` will be created alongside the executable on first run with sensible defaults; see the User Guide for the full list of settings, both those exposed in the in-app Settings dialog and the smaller number that are INI-only.
-
-## Output formats
-
-DuoDX writes raw, uncompressed 16-bit interleaved I/Q samples in a Linrad-compatible format by default, and can optionally write directly in SDRuno or SDR Connect WAV format instead. See the User Guide's Recording section for the exact byte layout of each.
-
-## License
-
-Not yet specified — see the repository owner before reusing this code.
+Nearly every setting is editable from the in-app Settings dialog. A handful of advanced or list-shaped settings (device selection by serial, log file path, AGC feedback-loop tuning, and the multi-entry schedule itself) remain INI-only — see the User Guide's Appendix and INI Key Quick Reference for the complete list.
 
 ## Acknowledgements
 
-Built against the [SDRplay API](https://www.sdrplay.com/api/). SDRplay and RSP are trademarks of SDRplay Limited; this project is not affiliated with or endorsed by SDRplay.
+- Linrad is copyright © Leif Åsbrink, SM5BSZ. The Linrad raw file format is documented at [sm5bsz.com](https://www.sm5bsz.com/linuxdsp/linrad.htm).
+- WavViewDX is copyright © Reinhard Weiß; its file naming convention is used by the `wavviewdx` output format.
+- Perseus is copyright © Microtelecom S.r.l.; the Perseus and Jaguar output formats match the file layout their respective software produces.
+- DuoDX was inspired by [rsp-recorder](https://github.com/fventuri/rsp-recorder) by Franco Venturi.
+- SDRplay, RSPduo, RSPdx, and related names are trademarks of SDRplay Ltd. DuoDX uses the SDRplay API, copyright SDRplay Ltd.
+
+DuoDX is an independent, unofficial project and is not affiliated with or endorsed by SDRplay Ltd, Leif Åsbrink, Reinhard Weiß, or Microtelecom S.r.l.
+
+## License
+
+*(Not yet specified — add your chosen license here, e.g. MIT, GPL-3.0.)*

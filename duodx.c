@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include <time.h>
 #include <math.h>
+#include <limits.h>   /* INT_MIN - Settings window position sentinel */
 #include <signal.h>
 #include <commctrl.h>
 #include <richedit.h>
@@ -42,6 +43,9 @@
                          * dynamically at crash time, so no -ldbghelp needed. */
 #include <malloc.h>     /* _resetstkoflw() - reclaims stack space on a stack
                          * overflow so the crash handler itself has room to run. */
+#include <shellapi.h>   /* ShellExecuteA - opens the GitHub link and mailto: link
+                         * on the Miscellaneous tab in the user's default browser/
+                         * mail client. Requires -lshell32 at link time. */
 
 #include "sdrplay_api.h"
 /* RSP1B was added in API 3.14; older headers may not define this ID. */
@@ -53,7 +57,10 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "3.0.1"
+#define VERSION                 "3.1.0"
+#define SPINUP_BYTES_FIXED      (1024 * 1024)  /* 1 MB - see the spinup_bytes
+                                   field comment for why this doesn't need
+                                   to be user-configurable.                */
 
 #define CONFIG_FILE             "duodx.ini"
 #define DEFAULT_OUTPUT_FILE     "recording.raw"
@@ -91,9 +98,22 @@ typedef struct {
     char   start_time[16];     /* HH:MM:SS UTC, or "" = immediate after previous */
     int    duration_sec;       /* 0 = unlimited (run until next entry start) */
     double frequency_hz;       /* Centre frequency, 0.0 = keep current */
-    double freq_b_hz;          /* Tuner B frequency, 0.0 = keep current */
+    double freq_b_hz;          /* Tuner 2 frequency, 0.0 = keep current */
     char   output_file[MAX_PATH_LEN]; /* "" = auto-generate */
     char   antenna[8];         /* "" = keep current, else "A"/"B"/"C"/"Hi-Z" */
+    int    freq_sync;          /* 1 = ignore frequency_hz/freq_b_hz above
+                                 * entirely and use the Receiver tab's own
+                                 * baseline CF instead, re-read fresh at the
+                                 * moment this entry actually fires - see
+                                 * AppState's baseline_frequency_hz/
+                                 * baseline_freq_b_hz and apply_schedule_
+                                 * entry(). Deliberately a distinct flag
+                                 * rather than overloading "0 = keep
+                                 * current" above: that means "whatever the
+                                 * previous entry left tuned", which drifts
+                                 * as a schedule runs, not "always come
+                                 * back to my normal listening frequency"
+                                 * regardless of what other entries did. */
 } ScheduleEntry;
 
 /* =========================================================================
@@ -127,20 +147,35 @@ typedef enum {
                                format always splits at ~4 GiB - no choice
                                offered in Settings.                        */
     FORMAT_SDRCONNECT= 3,  /* RIFF/WAV with JUNK padding, 80-byte header    */
-    FORMAT_WINRAD    = 4   /* Same 216-byte fmt+auxi header/data layout as
+    FORMAT_WINRAD    = 4,  /* Same 216-byte fmt+auxi header/data layout as
                                FORMAT_SDRUNO (reuses its writer functions),
                                just a different filename prefix - for
                                software that does support RF64 for files
                                over 4 GiB, unlike SDRuno itself.            */
+    FORMAT_PERSEUS   = 5,  /* RIFF/WAV with a custom "rcvr" chunk (86-byte
+                               header), matching genuine Perseus SDR output.
+                               Like SDRuno, Perseus playback software doesn't
+                               support RF64, so this format always splits
+                               too - no choice offered in Settings.         */
+    FORMAT_JAGUAR    = 6   /* Same 86-byte "rcvr" header as FORMAT_PERSEUS
+                               (only the flags field differs, 5 vs 4) with a
+                               different filename convention -
+                               "YYYY-MM-DD HH'MM'SS.wav" (apostrophes in
+                               place of colons, since colons aren't valid in
+                               Windows filenames) - matching genuine Jaguar
+                               software's own naming. Always splits, same
+                               reasoning as Perseus.                        */
 } OutputFormat;
 
 /* Large-file handling for WAV-based output formats where it's actually
  * offered as a choice (SDR Connect and Winrad) - not meaningful for
  * Linrad or WavViewDX, which have no 4 GiB header limit to work around,
- * and not offered for SDRuno, which always splits (see FORMAT_SDRUNO
- * above - SDRuno itself doesn't support RF64 playback). A plain WAV
- * data_size field is 32-bit and cannot describe more than ~4 GiB of audio
- * data; these two modes are the alternatives:                            */
+ * and not offered for SDRuno, Perseus, or Jaguar, which always split
+ * (see the FORMAT_SDRUNO/FORMAT_PERSEUS/FORMAT_JAGUAR comments above -
+ * none of their own playback software supports RF64). A plain WAV
+ * data_size field is 32-bit and cannot describe more than ~4 GiB of
+ * audio data; these two modes are the alternatives for the formats
+ * that do offer the choice:                                              */
 #define LARGE_FILE_SPLIT 0   /* auto-split into numbered parts at ~4 GiB  */
 #define LARGE_FILE_RF64  1   /* single file, RF64 extended header        */
 
@@ -229,15 +264,26 @@ typedef struct {
     int      large_file_mode;  /* LARGE_FILE_SPLIT or LARGE_FILE_RF64 -
                                      consulted when output_format is
                                      FORMAT_WINRAD or FORMAT_SDRCONNECT.
-                                     Ignored for FORMAT_SDRUNO, which always
-                                     splits regardless of this value (it
-                                     can't play back RF64), and irrelevant
-                                     for Linrad/WavViewDX.                 */
+                                     Ignored for FORMAT_SDRUNO, FORMAT_PERSEUS,
+                                     and FORMAT_JAGUAR, which always split
+                                     regardless of this value (none of their
+                                     playback software supports RF64), and
+                                     irrelevant for Linrad/WavViewDX.       */
 
     /* ── Observer location, for the sunrise/sunset tile ─────────────────── */
     double   latitude;          /* Decimal degrees, +north / -south, 0.0 default */
     double   longitude;         /* Decimal degrees, +east  / -west,  0.0 default */
     int      show_sun_times;    /* Show the SUN tile on the main window if set   */
+    int      show_carrier_offset; /* Show the OFFSET display under the dial once
+                                      it settles (Monitor tab). On by default.   */
+    double   carrier_offset_calib_hz; /* Small manual correction (Hz), added to
+                                      the OFFSET display only - lets it be
+                                      calibrated against a known GPSDO
+                                      reference. Never touches the actual
+                                      IQ recording or the measurement itself,
+                                      purely a display-side adjustment. 0.0
+                                      default (Monitor tab, under Show Carrier
+                                      Offset once locked).                       */
 
 
     /* ── Antenna selection ──────────────────────────────────────────────── */
@@ -282,7 +328,7 @@ typedef struct {
 
 
     /* ── Per-tuner B overrides (RSPduo dual mode only) ─────────────────
-     * Each defaults to the corresponding Tuner A value if not set.
+     * Each defaults to the corresponding Tuner 1 value if not set.
      * tuner_b_settings_set tracks whether any _b key was explicitly     
      * provided, so we can log clearly which values are in effect.       */
     int      gain_reduction_b;
@@ -302,7 +348,15 @@ typedef struct {
     /* Write a small dummy block to wake a spinning disk before recording.
      * Skipped automatically when the output path is on the C: drive.    */
     int      spinup_enable;        /* 1=on (default), 0=off              */
-    int      spinup_bytes;         /* bytes to write for spin-up (default 1 MB) */
+    int      spinup_bytes;         /* Fixed at 1 MB (SPINUP_BYTES_FIXED) -
+                                       not user-configurable. FlushFileBuffers()
+                                       right after this write is what actually
+                                       forces real I/O through to the physical
+                                       drive/share regardless of size, so a
+                                       larger write was never really buying
+                                       extra reliability - just kept as a
+                                       config field since the write loop
+                                       already reads a byte count.        */
     int      pipe_enable;          /* 1=create named pipe for real-time monitoring   */
     char     pipe_name[128];       /* pipe name, default \\.\pipe\duodx              */
     int      http_port;            /* 0=disabled, else TCP port for status server    */
@@ -311,6 +365,23 @@ typedef struct {
     /* ── Multi-recording schedule ────────────────────────────────────── */
     ScheduleEntry schedule[MAX_SCHEDULE_ENTRIES];
     int           schedule_count;  /* number of entries parsed */
+    int           schedule_total_count; /* same value as schedule_count at the
+                                   moment config_load_ini() last ran, and
+                                   never decremented afterwards - unlike
+                                   schedule_count, which recording_worker()
+                                   pops down by one each time an entry is
+                                   "promoted" into the top-level start_time/
+                                   frequency/etc fields as it becomes the
+                                   current one. Used purely for display
+                                   (the "(N entries)" figure), so the
+                                   schedule status always shows the total
+                                   configured rather than however many
+                                   happen to remain un-promoted at that
+                                   moment - otherwise a fresh 2-entry
+                                   schedule reads "2 entries" before the
+                                   first one starts, but only "1 entry"
+                                   once the first has been promoted, which
+                                   looked like an entry had gone missing. */
     int           schedule_only;   /* 1 = skip top-level recording, start from schedule_1 */
 
     int           use_utc;         /* 1=UTC timestamps (default), 0=local time */
@@ -363,6 +434,20 @@ typedef struct {
     /* File output */
     HANDLE      out_file;
     HANDLE      pipe_handle;       /* named pipe for real-time monitoring (INVALID_HANDLE_VALUE if unused) */
+    /* Separate handle+state for the Master/Slave Tuner 2 monitor pipe
+     * (run_slave_b_session/writer_thread_func) - deliberately not sharing
+     * pipe_handle above, which is the general-purpose pipe_enable=1
+     * feature's own connection and already works reliably as-is with
+     * plain PIPE_NOWAIT. The monitor pipe needs proper overlapped I/O
+     * instead (see its own creation site's comment for why NOWAIT alone
+     * wasn't reliable enough there), which needs this extra per-handle
+     * state to track a write already in flight - keeping the two
+     * mechanisms fully separate means fixing one can't risk regressing
+     * the other, which already has real users depending on it working
+     * exactly as it does now.                                           */
+    HANDLE      mon_pipe_handle;
+    OVERLAPPED  mon_pipe_ov;
+    int         mon_pipe_write_pending;
 
     /* Dual-tuner, different CFs: written as two separate single-channel
      * files instead of one interleaved dual file (a Linrad-format dual
@@ -372,10 +457,10 @@ typedef struct {
     HANDLE      out_file_b;
     char        output_file_b[MAX_PATH_LEN];
 
-    /* RSPduo Master/Slave mode: Tuner A runs as Master in this process,
-     * Tuner B runs as Slave in a second, hidden child process (this is
+    /* RSPduo Master/Slave mode: Tuner 1 runs as Master in this process,
+     * Tuner 2 runs as Slave in a second, hidden child process (this is
      * the only combination that reliably applies an independent RF
-     * frequency to Tuner B on this hardware/driver - see notes at the
+     * frequency to Tuner 2 on this hardware/driver - see notes at the
      * launch site). */
     int         master_slave_active;
     HANDLE      slave_process;
@@ -417,9 +502,9 @@ typedef struct {
                                           * timeout handling.                */
     volatile LONG64 zero_frames_written;  /* Frames written as zero-fill gap compensation */
     volatile float  peak_dbfs;            /* Peak signal level dBFS, updated each callback */
-    volatile float  peak_dbfs_b;          /* Peak dBFS for Tuner B (dual mode only)        */
-    volatile int    overload_tuner_a;     /* 1=Tuner A overload active   */
-    volatile int    overload_tuner_b;     /* 1=Tuner B overload active   */
+    volatile float  peak_dbfs_b;          /* Peak dBFS for Tuner 2 (dual mode only)        */
+    volatile int    overload_tuner_a;     /* 1=Tuner 1 overload active   */
+    volatile int    overload_tuner_b;     /* 1=Tuner 2 overload active   */
     volatile int    stream_running;
     volatile int    listening;   /* 1 = device is streaming (Monitor-only
                                    * start) but no file is open yet. Kept
@@ -455,6 +540,13 @@ typedef struct {
     volatile int adhoc_recording;  /* 1 = Record Now ad-hoc, resume wait after */
     double   adhoc_frequency_hz;   /* top-level freq saved before schedule promotion */
     double   adhoc_freq_b_hz;
+    int      adhoc_dual_channel;   /* likewise - a schedule entry with a
+                                       blank Tuner 2 field forces dual_
+                                       channel off for that entry (see the
+                                       schedule promotion sites), which an
+                                       ad-hoc recording afterward should
+                                       not inherit - it should use the
+                                       Receiver tab's actual setting.      */
     int      adhoc_duration_sec;
     double   sched1_frequency_hz;  /* schedule_1 freq (after promotion) */
     double   sched1_freq_b_hz;
@@ -471,6 +563,11 @@ typedef struct {
     volatile int    session_complete;   /* 1 after all recordings finish */
     char            frozen_json[4096];  /* pre-built JSON served after session ends */
     char            next_start[16];     /* next schedule start time HH:MM:SS or empty */
+    char            next_stop[16];      /* matching stop time HH:MM:SS for next_start,
+                                          * when the upcoming entry has a known fixed
+                                          * duration - empty if unknown/unlimited
+                                          * (runs until the next entry, or hourly mode,
+                                          * which conveys its own window separately). */
 
     /* Antenna actually in effect for the current session, snapshotted at
      * session start (see the infobar pre-population in recording_worker).
@@ -501,13 +598,70 @@ typedef struct {
     double          live_expected_usable_bw_hz;    /* frozen alongside
                                                       * live_expected_output_rate_hz,
                                                       * same reasoning */
+    /* The Receiver tab's own baseline CF, exactly as loaded from
+     * duodx.ini at session start - set once and never touched again,
+     * deliberately separate from cfg.frequency_hz/freq_b_hz above, which
+     * a running schedule freely overwrites as its entries fire (see
+     * apply_schedule_entry()). A schedule entry with freq_sync set reads
+     * these instead of its own stored frequency, so it reliably comes
+     * back to "my normal listening frequency" regardless of what any
+     * other entry in the same schedule did in between - cfg.frequency_hz
+     * itself can't serve that purpose once a schedule's actually running,
+     * since by then it may already reflect a prior entry's override, not
+     * the Receiver tab's configured value.                               */
+    double          baseline_frequency_hz;
+    double          baseline_freq_b_hz;
 } AppState;
 
 static AppState g_state;
+/* Guards g_state.next_start and g_state.next_stop together. They're always
+ * meant to be read as a matching pair - a scheduled start time and its
+ * corresponding stop time - but are written as two separate strncpy/
+ * compute_stop_hms calls from the worker thread, one immediately after
+ * the other rather than as a single atomic operation. Without this, the
+ * periodic snapshot the main window reads from (a different thread) could
+ * land in the brief gap between those two writes and see the new start
+ * time paired with the previous (often empty) stop time, which showed up
+ * as the scheduling display flickering to a shorter "starts HH:MM:SS"
+ * variant for a fraction of a second before correcting itself back to the
+ * full "HH:MM:SS-HH:MM:SS" form on the next snapshot.                    */
+static CRITICAL_SECTION g_next_lock;
+/* Guards state->peak_dbfs and peak_dbfs_b specifically, across the streaming
+ * callback thread (which only ever raises them - "if louder than current
+ * peak, replace it") and the monitor thread's periodic read-then-reset for
+ * the level meters ("read the peak, then reset to silence so the next
+ * interval starts fresh"). That read-then-reset is two separate operations,
+ * not one atomic exchange - without this, a callback update landing in the
+ * gap between the monitor thread's read and its reset-to-silence write
+ * would simply be overwritten and lost, which showed up as the meter
+ * bar intermittently blanking even with a perfectly good signal present. */
+static CRITICAL_SECTION g_peak_lock;
 static volatile int g_running = 1;
 static volatile int g_recording = 0; /* 1 during recording: suppress console LOG */
 static volatile int g_http_running = 1; /* controls HTTP accept loop lifetime */
+static volatile int g_http_interval_ms_snapshot = 2000; /* set once when the
+    accept loop starts (see http_status_thread_func) - individual request
+    handlers (http_worker) read this instead of g_state.cfg.http_interval_ms
+    directly, so they never need to touch cfg live just to embed the poll
+    interval in the HTML page, which could otherwise race against a
+    concurrent config reload on another thread.                          */
 static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
+static HANDLE g_http_delayed_stop_handle = NULL; /* non-NULL while a previous
+    session's delayed HTTP shutdown (http_delayed_stop_thread_func) is still
+    in progress. recording_worker()'s own cold start waits on this before
+    resetting g_http_running and starting its own HTTP accept loop - without
+    this, starting a new session within the previous one's shutdown grace
+    period (up to 6s) left both an old and a new accept-loop thread racing
+    over the single shared g_http_running flag: the old delayed-stop thread
+    could fire mid-way through the new session, killing its HTTP server
+    unexpectedly, or worse, racing WSACleanup() against the new session's
+    own HTTP worker threads still actively using sockets - a plausible
+    crash, not just a lost dashboard connection. Waiting here instead
+    guarantees the old server has genuinely, fully stopped - socket closed,
+    thread exited - before the new one ever starts, so there's nothing left
+    for the two to race over. recording_worker() runs strictly one
+    generation at a time (the old instance's thread is fully joined before
+    a new one is created), so this handle needs no locking of its own.    */
 
 /* =========================================================================
  * Logging
@@ -532,6 +686,7 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 /* Live monitor bar control IDs */
 #define IDC_BTN_MONITOR      1020
 #define IDC_BTN_FREQ_LOCK    1177
+#define IDC_BTN_ANT          1178
 #define IDC_EDIT_MON_FREQ    1021
 #define IDC_COMBO_MON_MODE   1022
 #define IDC_BW_DIGITS        1023
@@ -540,6 +695,8 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 #define IDC_FREQ_DIGITS      1026
 #define IDC_SLIDER_MON_VOL   1032
 #define IDC_BTN_HPF_ENABLE   1033
+#define IDC_BTN_TUNER_A      1034
+#define IDC_BTN_TUNER_B      1035
 #define IDC_SLIDER_HPF_HZ    1034
 #define IDC_SMETER           1035
 #define FREQ_DIGITS_COUNT    9   /* up to 999,999,999 Hz - covers MW/HF/VHF */
@@ -584,6 +741,11 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 #define IDC_SET_LATITUDE  1205
 #define IDC_SET_LONGITUDE 1206
 #define IDC_SET_SHOW_SUN  1207
+#define IDC_SET_SHOW_OFFSET 1208
+#define IDC_SET_CARRIER_CALIB 1211
+#define IDC_BTN_AUTO_CAL 1212
+#define IDC_SET_GITHUB_LINK 1216
+#define IDC_SET_EMAIL_LINK  1217
 #define IDC_SET_COLOR_SCHEME  1179
 #define IDC_SET_VERBOSE       1180
 #define IDC_SET_LOG_AUTOSAVE  1181
@@ -596,6 +758,7 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 #define IDC_SET_SCHED_DURATION 1161
 #define IDC_SET_SCHED_FREQ    1162
 #define IDC_SET_SCHED_FREQ_B  1163
+#define IDC_SET_SCHED_FREQ_SYNC 1213
 #define IDC_SET_SCHED_ANTENNA 1164
 #define IDC_SET_SCHED_OUTFILE 1165
 #define IDC_SET_HOURLY_EN     1166
@@ -625,7 +788,6 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
 #define IDC_SET_NOTCH_DAB_B   1145
 #define IDC_SET_RING_SEC      1135
 #define IDC_SET_SPINUP_EN     1136
-#define IDC_SET_SPINUP_BYTES  1137
 #define IDC_SET_MON_INTERVAL  1138
 #define IDC_SET_SMETER_MODE   1139
 #define IDC_SET_SMETER_CAL    1140
@@ -672,6 +834,26 @@ static volatile int g_http_ready   = 0; /* set by HTTP thread when listening  */
                                                  * old session's cleanup (handle,
                                                  * UI state) has already run and
                                                  * it's safe to start fresh here. */
+#define WM_APP_TUNER_CONFIG_CHANGED (WM_APP + 8)  /* dual_channel/master_slave_
+                                                 * active just got finalised for
+                                                 * this session (recording_worker,
+                                                 * on its own thread - EnableWindow
+                                                 * needs the main thread) and the
+                                                 * Tuner 1/Tuner 2 buttons' enabled
+                                                 * state (monitor_tuner_config_
+                                                 * enabled()) needs to reflect it.
+                                                 * A narrower cousin of gui_refresh_
+                                                 * monitor_bar_visibility(), which
+                                                 * is explicitly never called while
+                                                 * g_worker_active - this is exactly
+                                                 * that situation, so without a
+                                                 * dedicated message the buttons'
+                                                 * enabled state stayed at whatever
+                                                 * it was from the last time the
+                                                 * app was genuinely idle, which
+                                                 * could easily disagree with what
+                                                 * this session turned out to
+                                                 * actually be. */
 
 /* 1-second timer drives the live clock display. */
 #define ID_TIMER_CLOCK   1
@@ -729,81 +911,74 @@ static const MonMode MON_MODE_DISPLAY_ORDER[MON_MODE_COUNT] = {
 #define MON_RING_BYTES         (2 * 1024 * 1024)   /* ~0.5s @ 2Msps, lossy */
 #define MON_WORK_RATE_NARROW   32000.0             /* complex rate: AM/SSB/CW/FM-N */
 #define MON_WORK_RATE_WIDE     250000.0            /* complex rate: FM-W           */
-#define CARRIER_WINDOW_SAMPLES_MIN   32000  /* 1s - strong signals (>= S9),
-                                             * tested down to ~0.3 Hz spread
-                                             * between windows on a strong
-                                             * local station                */
-#define CARRIER_WINDOW_SAMPLES_MAX  384000  /* 12s - weak DX-level signals.
-                                             * A DX recorder's actual use
-                                             * case is weak, distant
-                                             * catches, not just strong
-                                             * local stations - a fixed 1s
-                                             * window that's fine for the
-                                             * latter leaves far too little
-                                             * signal energy to average
-                                             * down the noise on the former,
-                                             * observed as visibly wider
-                                             * window-to-window scatter
-                                             * (~0.1-1.5 Hz on an S9-ish
-                                             * signal, vs ~0.3 Hz on a
-                                             * strong local one) even while
-                                             * still technically "locked".
-                                             * carrier_window_samples_for_
-                                             * signal() below scales
-                                             * between these two based on
-                                             * how far below S9 the current
-                                             * reading is, using the same
-                                             * band-aware S9 reference the
-                                             * S-meter already established -
-                                             * strong signals stay fast,
-                                             * weak ones trade speed for
-                                             * the averaging they actually
-                                             * need for a reliable reading. */
-#define CARRIER_LPF_CUTOFF_HZ  100.0  /* one-pole narrowband filter applied
-                                       * to sel specifically for carrier
-                                       * measurement, before the phase-
-                                       * difference calculation - see the
-                                       * field comment on carrier_lpf_state.
-                                       * Was 8 Hz - too tight, and this
-                                       * turned out to be a real bug, not
-                                       * just a tradeoff: it's a lowpass
-                                       * fixed at 0 Hz (the dial's own
-                                       * position), so a genuine dial-
-                                       * tuning error of ~100 Hz (not an
-                                       * edge case - confirmed as a real
-                                       * scenario) got attenuated by
-                                       * roughly 22 dB by the filter
-                                       * itself, either extinguishing the
-                                       * carrier's own contribution to the
-                                       * measurement or biasing it near
-                                       * the filter's rolloff - explaining
-                                       * reports of the readout either not
-                                       * appearing at all, or appearing
-                                       * tens of Hz wrong, specifically
-                                       * when the dial wasn't precisely on
-                                       * frequency. 100 Hz still delivers
-                                       * a large (~18 dB / 60x bandwidth)
-                                       * SNR improvement over the ~6 kHz
-                                       * channel bandwidth's worth of
-                                       * program audio and in-band noise
-                                       * the raw (unfiltered) approach was
-                                       * exposed to - none of that energy
-                                       * has anything to do with the
-                                       * carrier's own frequency.          */
-#define CARRIER_LOCK_TOLERANCE_HZ  5.0     /* max disagreement between two
-                                            * consecutive raw windows to
-                                            * still count as "the same
-                                            * carrier" - a live station's
-                                            * own window-to-window spread
-                                            * was observed at ~0.3 Hz, so
-                                            * this has a lot of headroom
-                                            * over normal measurement noise
-                                            * while still rejecting the much
-                                            * larger, essentially random
-                                            * disagreement pure noise gives */
-#define CARRIER_LOCK_MIN_AGREE     2       /* consecutive agreeing gaps
-                                            * required (3 total windows)
-                                            * before showing the readout    */
+#define CARRIER_FFT_SIZE       4096    /* samples per FFT block at
+                                        * MON_WORK_RATE_NARROW (32kHz) =
+                                        * 128ms; gives ~7.8Hz bin spacing,
+                                        * refined well under 1Hz by the
+                                        * parabolic interpolation below.
+                                        * Replaces the earlier phase-
+                                        * difference method entirely: that
+                                        * approach ran a narrow filter
+                                        * (fixed at the dial's own 0Hz
+                                        * position) ahead of the frequency
+                                        * measurement, which meant a real
+                                        * dial-tuning error of only ~100Hz
+                                        * (a genuine, reported scenario,
+                                        * not an edge case) could attenuate
+                                        * the carrier enough to bias the
+                                        * reading by tens of Hz or lose it
+                                        * outright. An FFT searches the
+                                        * whole channel at once instead of
+                                        * needing to already be pointed at
+                                        * the right spot - confirmed in
+                                        * testing to hold accuracy to a
+                                        * fraction of a Hz even under 95%
+                                        * AM modulation and several kHz of
+                                        * mistuning, which the old method
+                                        * could not do at all.               */
+#define CARRIER_SEARCH_HZ      4000.0  /* how far either side of the dial
+                                        * to search for the peak - wide
+                                        * enough for any realistic dial or
+                                        * station drift while staying
+                                        * safely inside one MW channel's
+                                        * own 9/10kHz spacing, so an
+                                        * adjacent station's carrier can't
+                                        * be mistaken for this one's.        */
+#define CARRIER_VALIDITY_DB    18.0    /* minimum peak-to-noise-floor ratio
+                                        * (dB) for a measurement to be
+                                        * trusted. Calibrated from testing:
+                                        * pure noise (no real signal) never
+                                        * exceeded ~13dB of apparent "peak"
+                                        * across many independent trials -
+                                        * this leaves a solid margin above
+                                        * that ceiling while still well
+                                        * below what even a fairly weak
+                                        * real carrier shows once enough
+                                        * blocks are averaged (see
+                                        * carrier_blocks_for_signal()).      */
+#define CARRIER_LOCK_MIN_AGREE     2       /* consecutive accepted (valid-
+                                            * peak) measurements required
+                                            * before showing the readout -
+                                            * same role and value as
+                                            * before, now driven directly
+                                            * by the peak-to-floor check
+                                            * rather than an indirect
+                                            * window-to-window agreement
+                                            * test.                         */
+#define CARRIER_LOSS_MIN_AGREE     3       /* consecutive REJECTED windows
+                                            * required before an already-
+                                            * showing reading is actually
+                                            * invalidated. One more than
+                                            * CARRIER_LOCK_MIN_AGREE
+                                            * deliberately - losing an
+                                            * existing reading should be a
+                                            * bit more conservative than
+                                            * acquiring a new one, so a
+                                            * single deep fade or a
+                                            * momentary null while
+                                            * switching tuners doesn't
+                                            * blank a reading that's
+                                            * genuinely still there.        */
 #define CARRIER_SETTLE_TOLERANCE_HZ 0.05   /* max change in the PUBLISHED
                                             * (smoothed) value between
                                             * windows to still count as
@@ -824,80 +999,24 @@ static const MonMode MON_MODE_DISPLAY_ORDER[MON_MODE_COUNT] = {
                                             * governs whether the smoothed
                                             * value has actually stopped
                                             * moving yet.                  */
-#define CARRIER_AGC_GUARD_SAMPLES  96000   /* 3s at MON_WORK_RATE_NARROW.
-                                            * agc_gain (see its own field
-                                            * comment) starts at a fixed
-                                            * 3.0 regardless of actual
-                                            * signal strength, with a slow-
-                                            * release time constant of
-                                            * roughly 0.8s - if the initial
-                                            * guess is badly wrong for a
-                                            * given station, the signal can
-                                            * ride into the soft-knee
-                                            * limiter while gain is still
-                                            * hunting for the right point,
-                                            * and a limiter is a nonlinear
-                                            * operation that can distort
-                                            * phase, not just amplitude.
-                                            * Observed as raw carrier
-                                            * measurements decaying smoothly
-                                            * from very wrong toward correct
-                                            * over several seconds after
-                                            * retuning - not noise, which
-                                            * would scatter randomly around
-                                            * the truth from the start.
-                                            * Simplest fix without touching
-                                            * AGC's own tuning (which was
-                                            * set for the primary listening
-                                            * experience, not this) is to
-                                            * just not trust phase data
-                                            * until it's had time to settle. */
-#define CARRIER_AGC_STABILITY_FRAC  1.0    /* if agc_gain moves by more than
-                                            * this fraction of its value
-                                            * during a single window, that
-                                            * window's phase data gets
-                                            * discarded. Was 0.15, loosened
-                                            * substantially: with the
-                                            * narrowband tracking filter and
-                                            * AGC envelope follower both now
-                                            * in place, real data showed raw
-                                            * measurements staying identical
-                                            * to within 0.002 Hz regardless
-                                            * of whether this check passed
-                                            * or failed - it had become a
-                                            * major source of slow lock
-                                            * (discarding good data, not bad)
-                                            * rather than genuine protection.
-                                            * Left in place as a loose
-                                            * backstop against truly extreme
-                                            * excursions rather than removed
-                                            * outright.                     */
-#define CARRIER_FADE_DROP_DB       8.0     /* if a window's own dbm is this
-                                            * far below the tracked
-                                            * baseline, it's treated as a
-                                            * fade in progress and
-                                            * discarded outright, same as
-                                            * an AGC-unstable window -
-                                            * confirmed with real data: a
-                                            * genuine ~20 dB fade lasting
-                                            * over a minute produced
-                                            * consecutive windows that
-                                            * agreed closely with EACH
-                                            * OTHER while both were wrong
-                                            * relative to the true value,
-                                            * which the agreement check
-                                            * alone can't catch (it can
-                                            * only tell "windows differ",
-                                            * not "windows agree but are
-                                            * both wrong"). 8 dB is well
-                                            * above ordinary window-to-
-                                            * window dbm jitter on a
-                                            * stable signal (~2-5 dB
-                                            * observed) but well below a
-                                            * genuine fade (~20 dB
-                                            * observed), so it shouldn't
-                                            * false-trigger on normal
-                                            * variation.                   */
+#define CARRIER_AGC_GUARD_SAMPLES  16000   /* 0.5s at MON_WORK_RATE_NARROW -
+                                            * brief skip right after a
+                                            * retune, before the very first
+                                            * FFT block is even collected.
+                                            * Much shorter than the old
+                                            * phase-difference method
+                                            * needed (that was 3s): a
+                                            * distorted/AGC-hunting signal
+                                            * spreads its energy across
+                                            * many bins rather than
+                                            * concentrating it in one, so
+                                            * the peak-to-floor validity
+                                            * check below already rejects
+                                            * that data on its own merits -
+                                            * this guard is just cheap
+                                            * insurance against wasting a
+                                            * block on the very first,
+                                            * roughest instant.             */
 #define MON_AUDIO_RATE_HZ      48000
 #define MON_AUDIO_BUF_SAMPLES  1024
 #define MON_AUDIO_NUM_BUFS     6
@@ -957,6 +1076,20 @@ static COLORREF COL_PANEL_EDGE = RGB(45, 80, 130);   /* panel border            
 #define COL_TEXT      RGB(232, 240, 255)  /* primary text - near white         */
 #define COL_TEXT_DIM  RGB(150, 175, 210)  /* labels - muted blue-grey          */
 #define COL_ACCENT    RGB(80, 200, 255)   /* cyan accent / values              */
+#define COL_ACCENT_CUSTOM RGB(180, 110, 255) /* purple - Custom tuning step border, vs
+                                              * cyan for a preset step (Section 10)*/
+#define COL_CF_VALUE     RGB(240, 210, 60)  /* yellow - Receiver tab CF fields and
+                                             * Scheduler's Frequency 1/2, distinct
+                                             * from the cyan already used for other
+                                             * values elsewhere                       */
+#define COL_CF_VALUE_DIM RGB(100, 88, 30)   /* same hue, darkened - the deselected
+                                             * Tuner's own CF field on the Receiver
+                                             * tab, replacing Windows' own default
+                                             * disabled-edit grey (too light/bright
+                                             * against this dark theme, same class
+                                             * of problem the checkbox dimming fix
+                                             * (settings_set_check_dim()) already
+                                             * addressed for checkboxes)             */
 #define COL_LED_OFF   RGB(60, 40, 40)     /* recording LED when idle           */
 #define COL_LED_ON    RGB(255, 0, 0)      /* recording LED when active         */
 #define COL_BAR_BG    RGB(8, 16, 32)      /* meter track background            */
@@ -1038,6 +1171,11 @@ static char g_last_infostrip_text[64] = {0};   /* tracks whichever of
 static HWND   g_hBtnSettings = NULL;
 static HFONT  g_hFontLog    = NULL;
 static HFONT  g_hFontUI     = NULL;   /* labels                              */
+static HFONT  g_hFontTiny   = NULL;   /* the small "ANTENNA" label above the
+                                       * antenna button - g_hFontUI is too
+                                       * tall to fit above a button that's
+                                       * already been kept deliberately
+                                       * short (Section 13.1)               */
 static HFONT  g_hFontVal    = NULL;   /* bold values / counters              */
 static HFONT  g_hFontBig    = NULL;   /* big 7-seg-ish counters              */
 static HFONT  g_hFontCarrier = NULL;  /* carrier readout digits - sized to
@@ -1076,6 +1214,29 @@ static volatile unsigned char g_last_known_hwVer = 0;
  * whatever gain is currently applied, since the same RF signal reads
  * completely differently at different GR/LNA settings. */
 static volatile double g_curr_gain_a = 0.0, g_curr_gain_b = 0.0;
+/* Bridges Tuner 2's actual applied gain (currGain) from the Master/Slave
+ * slave process to the master, for the S-meter's dBm calculation - see
+ * the comment where g_gain_b_shmem_view is used for why this exists at
+ * all. Named-mapping name is derived from the master's PID, same
+ * convention as the DuoDXMonB_<pid> monitor pipe.                       */
+static HANDLE g_gain_b_shmem      = NULL;
+static double *g_gain_b_shmem_view = NULL;
+/* Separate from the gain-sharing mapping above (different name, different
+ * struct, own handle/view) - relays Tuner 2's final samples-written count
+ * from the slave process to the master once its recording ends, so the
+ * master can verify Tuner 2's own file itself (Section 6) after the slave
+ * process has exited. Previously only the slave's own verify_recording()
+ * call checked Tuner 2's file, and its result went to the slave's own log
+ * - which, being a headless background process with no visible window,
+ * meant that result was never actually seen by anyone. Kept deliberately
+ * separate from the gain-sharing mechanism above rather than folded into
+ * it, so a change here can't risk that already-working feature.          */
+typedef struct {
+    volatile LONG64 samples_written;
+    volatile LONG   ready;   /* 1 once samples_written holds its final value */
+} VerifyBShared;
+static HANDLE g_verify_b_shmem      = NULL;
+static VerifyBShared *g_verify_b_shmem_view = NULL;
 /* Record/Stop button colour, set synchronously by gui_set_recording_ui()
  * and gui_set_listening_ui() at the exact moment each triggers the
  * button's repaint - not derived at paint time from g_worker_active/
@@ -1151,12 +1312,14 @@ typedef struct {
     int    agc_on;        /* 1 = AGC currently enabled on tuner A            */
     int    hdr_on;        /* 1 = HDR mode enabled                            */
     int    coherent;      /* 1 = RSPduo dual-channel, both tuners same freq  */
-    int    master_slave;  /* 1 = RSPduo Master/Slave mode (Tuner B via slave process) */
+    int    master_slave;  /* 1 = RSPduo Master/Slave mode (Tuner 2 via slave process) */
     long   overflows;
     long long dropped;    /* zero-fill frames                                */
     float  ring_pct;      /* ring buffer fill 0..100 (percent, one decimal)  */
     char   state[48];
     char   next[32];
+    char   next_stop[16];  /* matching stop time for next[], when known -
+                             * see AppState.next_stop */
     char   freq[48];
     char   span[96];      /* coverage range, e.g. "150 - 1750 kHz (~150 kHz usable)" */
     char   sched[96];     /* scheduling status line for the bottom bar       */
@@ -1164,11 +1327,26 @@ typedef struct {
 } UiSnapshot;
 
 static UiSnapshot g_ui;   /* zero-initialised                                */
+/* Guards every read and write of g_ui. It's exchanged between the monitor
+ * thread (which publishes a freshly-built snapshot, in gui_monitor_thread_func
+ * and a handful of one-off state-transition points) and the main UI thread
+ * (which reads it every WM_PAINT) with no synchronisation of its own -
+ * UiSnapshot is too large for the compiler-generated struct assignment on
+ * either side to be atomic, so without this a repaint landing mid-publish
+ * could read a torn mix of old and new field values. Ordinarily rare enough
+ * not to notice, but a repaint driven purely by the once-a-second clock
+ * tick (rather than only whenever something visible actually changed) hits
+ * this window far more often, which was surfacing as the level meters
+ * intermittently blanking for a frame about once a second.               */
+static CRITICAL_SECTION g_ui_lock;
 
 /* =========================================================================
  * Live monitor - DSP helper types
  * ========================================================================= */
 typedef struct { float re, im; } MCplx;
+typedef struct { double re, im; } DCplx;  /* double precision, used only for
+                                             the carrier FFT scratch buffer -
+                                             everything else stays MCplx     */
 
 /* Real-coefficient decimating FIR stage (anti-alias low-pass + decimate).
  * Used twice in cascade to bring the native IQ rate down to a working
@@ -1204,14 +1382,14 @@ typedef struct {
 typedef struct {
     /* --- settings, written by the GUI thread, read by the monitor thread --- */
     volatile LONG   enabled;      /* 1 = monitor on                          */
-    volatile LONG   tuner_sel;    /* 0 = Tuner A, 1 = Tuner B                */
-    volatile LONG   freq_locked;  /* 1 = keep Tuner A/B monitor frequencies
+    volatile LONG   tuner_sel;    /* 0 = Tuner 1, 1 = Tuner 2                */
+    volatile LONG   freq_locked;  /* 1 = keep Tuner 1/2 monitor frequencies
                                     * in sync - tuning either one moves both,
                                     * for quick side-by-side antenna/tuner
                                     * comparisons at the same frequency.      */
     volatile LONG   mode;         /* MonMode                                 */
-    double          freq_hz;      /* Tuner A dial / suppressed-carrier freq  */
-    double          freq_hz_b;    /* Tuner B's own remembered frequency -
+    double          freq_hz;      /* Tuner 1 dial / suppressed-carrier freq  */
+    double          freq_hz_b;    /* Tuner 2's own remembered frequency -
                                     * kept separate so switching Monitor A/B
                                     * doesn't lose your place on either one,
                                     * particularly important when the two
@@ -1284,115 +1462,86 @@ typedef struct {
                                           * regardless of which bandwidth
                                           * mode (and therefore working
                                           * sample rate) is selected       */
-    /* Carrier frequency offset - AM only. `sel` is already NCO-shifted so
-     * the dial frequency sits at 0 Hz; a real AM carrier is otherwise
-     * phase-continuous (only its amplitude carries the audio), so any
-     * residual rotation of `sel` from one sample to the next is the
-     * carrier's true frequency minus the dial setting, not programme
-     * content - amplitude modulation alone doesn't perturb the carrier's
-     * own phase. Tracked as a magnitude-weighted average of the per-
-     * sample instantaneous frequency (the weighting is what keeps this
-     * stable through envelope nulls near 100% negative modulation,
-     * where phase is momentarily undefined but the product magnitude
-     * that weights it is naturally near zero too, self-selecting for
-     * the reliable segments) over an adaptive-length window (see
-     * carrier_window_samples_for_signal()),
-     * then smoothed window-to-window with a slow EMA for display
-     * stability - see the main per-sample loop for where this runs.    */
-    MCplx          carrier_prev_sample;
-    int            carrier_prev_valid;
-    MCplx          carrier_lpf_state;   /* one-pole narrowband tracking
-                                        * filter, applied to sel before
-                                        * phase-difference measurement -
-                                        * separate from the actual AM
-                                        * demod path (audio still uses the
-                                        * full 6/4/2.4kHz-filtered sel
-                                        * unchanged). The carrier is a
-                                        * narrow, concentrated spectral
-                                        * line; the rest of the channel
-                                        * bandwidth (program audio
-                                        * sidebands, in-band noise) is
-                                        * pure dead weight for measuring
-                                        * ITS frequency specifically, and
-                                        * was contaminating every phase-
-                                        * difference sample up to now.
-                                        * See CARRIER_LPF_CUTOFF_HZ.       */
-    double         carrier_phase_accum;
-    double         carrier_weight_accum;
-    int            carrier_accum_samples;
-    int            carrier_window_target;   /* this window's target length -
-                                             * see carrier_window_samples_
-                                             * for_signal(); set once when
-                                             * the window starts, not
-                                             * recomputed mid-window        */
-    float          carrier_agc_gain_at_start;  /* AGC gain snapshotted when
-                                                * this window began - if
-                                                * agc_gain has moved a lot
-                                                * by the time the window
-                                                * completes, that window's
-                                                * phase data likely rode
-                                                * through active AGC
-                                                * hunting (a fading/
-                                                * fluctuating signal keeps
-                                                * this happening the whole
-                                                * session, not just at
-                                                * startup) and gets
-                                                * discarded rather than
-                                                * treated as a trustworthy
-                                                * measurement.               */
-    float          carrier_dbm_baseline;    /* slow EMA of dbm, updated only
-                                             * from windows that already
-                                             * passed every other quality
-                                             * check - a genuine deep fade
-                                             * (confirmed with real data:
-                                             * a ~20 dB drop lasting over a
-                                             * minute) can still produce
-                                             * consecutive windows that
-                                             * agree with EACH OTHER while
-                                             * both are wrong relative to
-                                             * the true value, since the
-                                             * agreement check alone can't
-                                             * tell "consistently right"
-                                             * from "consistently wrong in
-                                             * the same way" - a direct
-                                             * signal-strength check catches
-                                             * what the agreement check
-                                             * missed. int, not bool: 0
-                                             * means "not established yet". */
-    int            carrier_dbm_baseline_valid;
-    volatile float carrier_offset_hz_pub;   /* dial-relative, +/- Hz       */
-    volatile int   carrier_offset_valid_pub;
+    /* Carrier frequency offset - AM only (SSB/CW have no steady carrier to
+     * track, and FM's "carrier" is the deliberately-varying thing being
+     * demodulated). `sel` is already NCO-shifted so the dial frequency
+     * sits at 0 Hz; a real AM carrier is otherwise phase-continuous (only
+     * its amplitude carries the audio), so it shows up as a strong, sharp
+     * spectral line at its own true offset from the dial - not programme
+     * content, which spreads energy across the channel instead.
+     *
+     * FFT-based measurement: sel is buffered into blocks of
+     * CARRIER_FFT_SIZE samples; each block is windowed and FFT'd, and the
+     * resulting power spectra are averaged together (periodogram/Welch
+     * averaging) across however many blocks the current signal strength
+     * calls for - weaker signals need more blocks averaged to beat noise
+     * down (see carrier_blocks_for_signal()). Once enough blocks have
+     * accumulated, the strongest peak within CARRIER_SEARCH_HZ of the
+     * dial is found and its exact position refined via parabolic
+     * interpolation on the (log) power spectrum. This replaced an earlier
+     * phase-difference method that ran a narrow filter fixed at the
+     * dial's own position ahead of the measurement - accurate only when
+     * already very close to on-frequency. Searching the whole channel
+     * via FFT instead has no such requirement: tested accurate to a
+     * fraction of a Hz even under heavy AM modulation and several kHz of
+     * mistuning, which the old method could not do at all.               */
+    MCplx          carrier_fft_buf[CARRIER_FFT_SIZE];  /* block currently filling */
+    int            carrier_fft_fill;                   /* samples buffered so far */
+    DCplx          carrier_fft_work[CARRIER_FFT_SIZE];  /* double-precision FFT scratch */
+    double         carrier_avg_pwr[CARRIER_FFT_SIZE];   /* summed power spectrum, across
+                                                            carrier_blocks_accum blocks */
+    int            carrier_blocks_accum;    /* blocks summed into carrier_avg_pwr so far */
+    int            carrier_blocks_target;   /* blocks needed before checking - see
+                                                carrier_blocks_for_signal(); set once
+                                                when accumulation starts, not
+                                                recomputed mid-accumulation             */
+    /* carrier_offset_hz_pub and the rest of the "published" fields below are
+     * per tuner (0=A/single, 1=B) - deliberately, so switching tuners shows
+     * that tuner's own last measurement immediately, not whatever the
+     * previously-active tuner last measured re-labelled with the new
+     * tuner's dial frequency. Everything ABOVE this point is shared, not
+     * per-tuner: it's the in-flight accumulation for whichever measurement
+     * is currently running, which already restarts from scratch on any
+     * reconfigure - including a tuner switch - so there's nothing
+     * meaningful in it to preserve separately per tuner; only the
+     * finished, published result needs to be remembered per tuner.       */
+    volatile float carrier_offset_hz_pub[2]; /* dial-relative, +/- Hz       */
+    volatile int   carrier_offset_valid_pub[2];
     int            carrier_window_count;    /* windows completed since the
                                               * last reset - drives the
                                               * fast-then-settling smoothing
                                               * below */
     int            carrier_agc_guard_remaining;  /* samples left to skip
-                                                   * before trusting phase
-                                                   * data - see
-                                                   * CARRIER_AGC_GUARD_SAMPLES */
-    /* Lock detection: a real carrier gives tightly-clustered raw
-     * measurements window to window (observed: ~0.3 Hz spread on a live
-     * station); noise on a dead channel has no coherent tone to track,
-     * so consecutive windows disagree by a lot, essentially at random.
-     * Requiring several consecutive windows to agree within a tight
-     * tolerance is a self-calibrating "is this real" test, rather than
-     * an absolute signal-strength threshold that would need its own
-     * per-band tuning the same way the S-meter's S9 reference did.     */
-    double         carrier_last_raw_hz;
-    int            carrier_last_raw_valid;
-    int            carrier_consec_agree;
-    volatile int   carrier_locked_pub;
+                                                   * before starting to fill
+                                                   * the first FFT block -
+                                                   * see CARRIER_AGC_GUARD_SAMPLES */
+    /* Validity: a real carrier stands out as a clear, narrow spectral
+     * peak; noise (or a dead channel) has no such concentrated energy
+     * anywhere, so its "peak" barely rises above the rest of the
+     * spectrum. Requiring several consecutive blocks-worth of
+     * measurement to each clear this bar is a direct, self-calibrating
+     * "is this real" test - see CARRIER_VALIDITY_DB.                     */
+    int            carrier_consec_valid;
+    /* Mirror of carrier_consec_valid for the opposite outcome - counts
+     * consecutive REJECTED (no-carrier-found) windows. Used to decide
+     * when a previously-good reading should actually be invalidated
+     * (Section 13.8: "signal has disappeared") rather than left showing
+     * a stale value forever - see CARRIER_LOSS_MIN_AGREE. Reset to 0 the
+     * moment a window is accepted again.                                */
+    int            carrier_consec_rejected;
+    volatile int   carrier_locked_pub[2];
     /* Settle indicator ("(lock)" suffix) - tracks the PUBLISHED
      * (smoothed) value's own recent stability, separate from
      * carrier_locked_pub (which only means the raw measurement is
      * trustworthy enough to show at all). The smoothing keeps refining
      * for a while after that, so there's a real difference between
      * "showing a genuine reading" and "that reading has stopped
-     * changing" - this tracks the latter.                               */
-    float          carrier_last_published_hz;
-    int            carrier_last_published_valid;
-    int            carrier_settled_count;
-    volatile int   carrier_settled_pub;
+     * changing" - this tracks the latter. Per tuner, same reason as
+     * carrier_offset_hz_pub above.                                      */
+    float          carrier_last_published_hz[2];
+    int            carrier_last_published_valid[2];
+    int            carrier_settled_count[2];
+    volatile int   carrier_settled_pub[2];
     double        resamp_acc;
     float         resamp_prev, resamp_cur;
     float         agc_gain;      /* smoothed, persistent gain - feedback loop,
@@ -1442,10 +1591,37 @@ static int    g_ab_auto_pending = 1;    /* 1 = eligible to auto-enable A=B
 
 /* Monitor bar GUI controls */
 static HWND g_hBtnMonitor    = NULL;
+static HWND g_hBtnTunerA     = NULL;
+static HWND g_hBtnTunerB     = NULL;
 static HWND g_hBtnFreqLock   = NULL;
+/* Antenna quick-select buttons (Section 13.1) - up to 3, stacked
+ * vertically to the left of Tuner 1/Monitor. How many actually apply
+ * (0-3) depends on the connected device - see antenna_slot_info().      */
+/* Antenna quick-select (Section 13.1) - a single small button to the
+ * left of Tuner 1/Monitor, showing the current antenna (e.g. "Ant: A").
+ * Left-click brings up a menu of whatever the connected device actually
+ * offers - see antenna_slot_info() - same pattern as the Tuning Step and
+ * Mode menus.                                                           */
+static HWND g_hBtnAnt        = NULL;
+static HWND g_hAntLbl        = NULL;   /* small "ANTENNA" label above it */
 static HWND   g_hFreqDigits    = NULL;
 static HFONT  g_hFontFreqDigits = NULL;
 static int    g_freqDigitsHover = -1;   /* which digit the mouse is over, -1 = none */
+/* Tuning step: when non-zero, the mouse wheel (and Page Up/Down) move the
+ * whole displayed frequency by this amount, regardless of which digit the
+ * cursor happens to be over - rather than the normal per-digit behaviour.
+ * Set via left-click on the frequency digits, which brings up a menu of
+ * step sizes appropriate to the current band (Section 10, "Tuning Step").
+ * 0.0 means "Default" - the ordinary per-digit scroll behaviour, exactly
+ * as it's always worked. Deliberately not saved to duodx.ini - a runtime-
+ * only choice for the current session, the same as the Settings window's
+ * remembered position.                                                   */
+static double g_freqStepHz = 0.0;
+/* Values offered on the Custom submenu are remembered per band group for
+ * the rest of the session too, so picking Custom once and typing e.g.
+ * 4 kHz for an odd MW allocation doesn't need retyping every time -
+ * indexed by freqstep_band_group().                                      */
+static double g_freqStepCustomHz[3] = { 0.0, 0.0, 0.0 };
 static HWND g_hMonHzLbl      = NULL;
 static HWND g_hMonModeLbl    = NULL;
 static HWND g_hMonMode       = NULL;
@@ -1466,6 +1642,13 @@ static HWND g_hBtnHpfEnable  = NULL;
 static HWND g_hHpfSlider     = NULL;
 static HWND g_hHpfVal        = NULL;
 static HWND g_hSMeter        = NULL;
+/* Bounding rect of the OFFSET readout, cached by paint_window() each time
+ * it draws it (or cleared when it isn't shown) - lets WM_LBUTTONDOWN hit-
+ * test against exactly what's on screen without a second, separately-
+ * measured copy of the same text-layout logic that could drift out of
+ * sync with the paint code over time.                                    */
+static RECT g_carrierOffsetRect;
+static int  g_carrierOffsetRectValid = 0;
 static int  g_monitorVolPercent = 15;  /* Windows waveOut volume, 0-100,
                                           * kept here so re-opening the audio
                                           * device (monitor toggled off/on)
@@ -1491,6 +1674,7 @@ static void refresh_known_device_type(void);
 static int  launch_slave_b_process(AppState *state, const char *outfile_b,
                                     int duration_sec, int listen_only);
 static void stop_slave_b_process(AppState *state);
+static void verify_slave_b_recording(AppState *state);
 static void setup_slave_channel_b(AppState *state);
 static void apply_slave_biast_b(AppState *state);
 static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param);
@@ -1498,11 +1682,21 @@ static void layout_children(HWND hwnd);
 static void gui_refresh_monitor_bar_visibility(void);
 static void monitor_create_controls(HWND parent, HINSTANCE hInst);
 static void monitor_layout(HWND hwnd, int right_edge, int bar_y, int bar_h);
-static void monitor_apply_mode_from_combo(void);
+static void monitor_apply_mode(MonMode mode);
 static void monitor_apply_volume_from_slider(void);
 static void monitor_apply_hpf_hz_from_slider(void);
 static void monitor_toggle_tuner_sel(void);
 static void monitor_switch_single_tuner_live(void);
+static int  monitor_tuner_b_active(void);
+static int  monitor_tuner_switch_available(void);
+static int  monitor_use_single_button(void);
+static int  monitor_tuner_greyed(int is_b);
+static void monitor_select_tuner(int want_b);
+static int  monitor_tuner_config_enabled(int is_b);
+static int  antenna_slot_info(const char *labels[3], const char *values[3]);
+static void monitor_ab_button_click(HWND hwnd, int is_b);
+static void antenna_apply(const char *value);
+static void antenna_show_menu(HWND hwnd, int screen_x, int screen_y);
 static void monitor_sync_button_label(void);
 static double monitor_center_for_tuner(int tuner_sel);
 static double monitor_clamp_to_coverage(double freq, double center);
@@ -1515,9 +1709,14 @@ static LRESULT CALLBACK notchdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPAR
 static HWND notchdigits_create(HWND parent, HINSTANCE hInst);
 static LRESULT CALLBACK smeter_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static float smeter_s9_dbm_for_current_tuner(void);
-static int   carrier_window_samples_for_signal(void);
+static void carrier_fft(DCplx *a, int n, int invert);
+static double carrier_bin_to_hz(double bin, int n, double fs);
+static double carrier_find_peak(const double *pwr, int n, double fs, double search_hz,
+                                 double *out_peak_to_floor_db);
+static int carrier_blocks_for_signal(void);
 static HWND smeter_create(HWND parent, HINSTANCE hInst);
 static int  monitor_draw_button(LPDRAWITEMSTRUCT di);
+static int  tuner_ab_draw_button(LPDRAWITEMSTRUCT di, int is_b);
 static int  notch_draw_button(LPDRAWITEMSTRUCT di);
 static int  hpf_draw_button(LPDRAWITEMSTRUCT di);
 
@@ -1527,6 +1726,8 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param);
 static void  gui_apply_agc_toggle(AppState *state);
 static inline SIZE_T ring_available(const RingBuffer *rb);
 static void  apply_reversed_wheel_subclass(HWND h);
+static void  compute_stop_hms(const char *start_hms, int duration_sec,
+                               char *out, size_t out_sz);
 
 /* -------------------------------------------------------------------------
  * log_write - GUI version. Formats the message and posts a heap-allocated
@@ -1824,10 +2025,11 @@ static void gui_apply_live_gain(AppState *state)
                                   sdrplay_api_Update_Tuner_Gr,
                                   sdrplay_api_Update_Ext1_None);
     }
-    if (err == sdrplay_api_Success)
-        LOG_INFO("Gain applied live: GR=%d dB  LNA=%d",
-                 state->cfg.gain_reduction, state->cfg.lna_state);
-    else
+    if (err == sdrplay_api_Success) {
+        if (state->cfg.verbose)
+            LOG_INFO("Gain applied live: GR=%d dB  LNA=%d",
+                     state->cfg.gain_reduction, state->cfg.lna_state);
+    } else
         LOG_WARN("Live gain update failed: %s", sdrplay_api_GetErrorString(err));
 }
 
@@ -1836,7 +2038,8 @@ static void gui_apply_agc_toggle(AppState *state)
     int is_dual = state->cfg.dual_channel;
 
     if (state->cfg.hdr_enable) {
-        LOG_INFO("AGC control disabled in HDR mode (fixed gain path).");
+        if (state->cfg.verbose)
+            LOG_INFO("AGC control disabled in HDR mode (fixed gain path).");
         return;
     }
     if (!state->ch_a_params) return;
@@ -1880,10 +2083,12 @@ static void gui_apply_agc_toggle(AppState *state)
                 sdrplay_api_Update_Ext1_None);
         }
         if (err == sdrplay_api_Success) {
-            if (is_dual)
-                LOG_INFO("AGC off - T1=%d dB  T2=%d dB", gr_a, gr_b);
-            else
-                LOG_INFO("AGC off - GR=%d dB", gr_a);
+            if (state->cfg.verbose) {
+                if (is_dual)
+                    LOG_INFO("AGC off - T1=%d dB  T2=%d dB", gr_a, gr_b);
+                else
+                    LOG_INFO("AGC off - GR=%d dB", gr_a);
+            }
         } else {
             state->ch_a_params->ctrlParams.agc.enable = cur_agc;
             if (is_dual && state->ch_b_params)
@@ -1901,7 +2106,8 @@ static void gui_apply_agc_toggle(AppState *state)
                 sdrplay_api_Update_Ctrl_Agc, sdrplay_api_Update_Ext1_None);
         }
         if (err == sdrplay_api_Success) {
-            LOG_INFO(is_dual ? "AGC on (both tuners)" : "AGC on");
+            if (state->cfg.verbose)
+                LOG_INFO(is_dual ? "AGC on (both tuners)" : "AGC on");
         } else {
             state->ch_a_params->ctrlParams.agc.enable = cur_agc;
             if (is_dual && state->ch_b_params)
@@ -1925,7 +2131,7 @@ static void gui_apply_agc_toggle(AppState *state)
 static void gui_compute_cf_text(char *out, size_t out_size)
 {
     if (g_state.cfg.dual_channel || g_state.master_slave_active)
-        snprintf(out, out_size, "A %.3f / B %.3f MHz",
+        snprintf(out, out_size, "T1 %.3f / T2 %.3f MHz",
                  g_state.cfg.frequency_hz / 1e6,
                  g_state.cfg.freq_b_hz / 1e6);
     else
@@ -1975,14 +2181,14 @@ static void gui_compute_coverage_span(char *out, size_t out_size)
         if (lo_b < 0.0) lo_b = 0.0;
 
         if (g_state.cfg.frequency_hz < 3.0e6)
-            snprintf(span_a, sizeof(span_a), "A %.0f-%.0f kHz", lo_a / 1e3, hi_a / 1e3);
+            snprintf(span_a, sizeof(span_a), "T1 %.0f-%.0f kHz", lo_a / 1e3, hi_a / 1e3);
         else
-            snprintf(span_a, sizeof(span_a), "A %.3f-%.3f MHz", lo_a / 1e6, hi_a / 1e6);
+            snprintf(span_a, sizeof(span_a), "T1 %.3f-%.3f MHz", lo_a / 1e6, hi_a / 1e6);
 
         if (g_state.cfg.freq_b_hz < 3.0e6)
-            snprintf(span_b, sizeof(span_b), "B %.0f-%.0f kHz", lo_b / 1e3, hi_b / 1e3);
+            snprintf(span_b, sizeof(span_b), "T2 %.0f-%.0f kHz", lo_b / 1e3, hi_b / 1e3);
         else
-            snprintf(span_b, sizeof(span_b), "B %.3f-%.3f MHz", lo_b / 1e6, hi_b / 1e6);
+            snprintf(span_b, sizeof(span_b), "T2 %.3f-%.3f MHz", lo_b / 1e6, hi_b / 1e6);
 
         snprintf(out, out_size, "%s  /  %s", span_a, span_b);
     } else {
@@ -2087,13 +2293,18 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
         s.disk_free_mb = (double)state->disk_free_mb;
 
         /* Peak dBFS - read the current peak, then reset to silence so the
-         * next interval captures a fresh peak from the callbacks. The
-         * callback only ever raises the stored value, so this read/reset is
-         * safe for a level display.                                         */
+         * next interval captures a fresh peak from the callbacks. This
+         * read-then-reset is two operations, not one atomic exchange, so
+         * it's wrapped in g_peak_lock (see that lock's own comment) -
+         * without it, a callback's update landing in the gap between the
+         * read and the reset-to-silence write below would be silently
+         * overwritten and lost, rather than making it into s.peak_a/b.   */
+        EnterCriticalSection(&g_peak_lock);
         s.peak_a = state->peak_dbfs;
         s.peak_b = state->peak_dbfs_b;
         state->peak_dbfs   = -90.0f;
         state->peak_dbfs_b = -90.0f;
+        LeaveCriticalSection(&g_peak_lock);
 
         s.overload_a = state->overload_tuner_a;
         s.overload_b = state->overload_tuner_b;
@@ -2128,35 +2339,84 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
         else
             strncpy(s.state, "IDLE", sizeof(s.state) - 1);
 
-        strncpy(s.next, state->next_start, sizeof(s.next) - 1);
+        /* Taken together, under the lock, as a single consistent pair -
+         * see g_next_lock's own comment for why. Every use of the next
+         * start/stop time below reads these local copies, never
+         * state->next_start/next_stop directly, so the whole block
+         * (state text, the near-clock scheduling line) is built from one
+         * matching snapshot rather than several independent re-reads
+         * that could straddle a write on the worker thread.             */
+        {
+        char ns[sizeof(state->next_start)], nst[sizeof(state->next_stop)];
+        EnterCriticalSection(&g_next_lock);
+        strncpy(ns, state->next_start, sizeof(ns) - 1);
+        ns[sizeof(ns) - 1] = '\0';
+        strncpy(nst, state->next_stop, sizeof(nst) - 1);
+        nst[sizeof(nst) - 1] = '\0';
+        LeaveCriticalSection(&g_next_lock);
 
-        /* Scheduling status for the bottom info line.
-         * Only shown while waiting, not during active recording
-         * (the recording LED makes it obvious what state we're in). */
+        strncpy(s.next, ns, sizeof(s.next) - 1);
+        strncpy(s.next_stop, nst, sizeof(s.next_stop) - 1);
+
+        /* Unified scheduling status - this is now the single place this
+         * information is built, drawn to the left of the clock (Section
+         * 3.2) rather than split between a bottom-bar line that vanished
+         * whenever Monitor/Listening was on and a separate, shorter
+         * near-clock line that only ever showed the start time. Covers
+         * every state (idle preview, active wait, listening) the same
+         * way, and - because it's rebuilt fresh from live cfg on every
+         * snapshot pass rather than cached - can't go stale after a
+         * Settings save the way the old split version could. Not shown
+         * during active recording, same as before (the recording LED
+         * already makes the state obvious).                             */
         if (s.recording) {
             s.sched[0] = '\0';
         } else if (state->cfg.hourly_enable) {
             /* Both hourly and schedule (below) repeat unconditionally
              * once armed - see the loop-back logic in recording_worker -
              * so there's nothing conditional worth calling out in the
-             * text here.                                                */
+             * text here. Hourly's window length already conveys its own
+             * span, so there's no separate stop time to show here the
+             * way the schedule branch below has.                        */
             snprintf(s.sched, sizeof(s.sched),
-                     "Hourly %d min%s%s",
+                     "Scheduled (hourly): %d min%s%s",
                      state->cfg.hourly_window_min,
-                     state->next_start[0] ? "  starts " : "",
-                     state->next_start[0] ? state->next_start : "");
-        } else if (state->cfg.schedule_only && state->cfg.schedule_count > 0) {
-            snprintf(s.sched, sizeof(s.sched),
-                     "Schedule: %d entr%s%s%s",
-                     state->cfg.schedule_count,
-                     state->cfg.schedule_count == 1 ? "y" : "ies",
-                     state->next_start[0] ? "  starts " : "",
-                     state->next_start[0] ? state->next_start : "");
-        } else if (state->next_start[0]) {
-            snprintf(s.sched, sizeof(s.sched), "Start at %s",
-                     state->next_start);
+                     ns[0] ? "  next " : "",
+                     ns[0] ? ns : "");
+        } else if (state->cfg.schedule_only && state->cfg.schedule_total_count > 0) {
+            if (ns[0] && nst[0]) {
+                snprintf(s.sched, sizeof(s.sched),
+                         "Scheduled: %s-%s  (%d entr%s)",
+                         ns, nst,
+                         state->cfg.schedule_total_count,
+                         state->cfg.schedule_total_count == 1 ? "y" : "ies");
+            } else {
+                snprintf(s.sched, sizeof(s.sched),
+                         "Scheduled: %s%s  (%d entr%s)",
+                         ns[0] ? "starts " : "",
+                         ns[0] ? ns : "",
+                         state->cfg.schedule_total_count,
+                         state->cfg.schedule_total_count == 1 ? "y" : "ies");
+            }
+        } else if (state->cfg.schedule_only) {
+            /* Schedule mode is armed, but every entry has been removed -
+             * previously this fell straight through to the bare
+             * next_start branch below, which could still be showing a
+             * stale time left over from before the entries were deleted
+             * (see the Settings Save handler, which now also clears
+             * next_start/next_stop in this situation - this branch
+             * exists as a second line of defence either way).           */
+            snprintf(s.sched, sizeof(s.sched), "Scheduled: no entries configured");
+        } else if (ns[0]) {
+            if (nst[0])
+                snprintf(s.sched, sizeof(s.sched), "Start at %s-%s",
+                         ns, nst);
+            else
+                snprintf(s.sched, sizeof(s.sched), "Start at %s",
+                         ns);
         } else {
             s.sched[0] = '\0';
+        }
         }
 
         gui_compute_cf_text(s.freq, sizeof(s.freq));
@@ -2167,7 +2427,9 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
          * so a single combined range wouldn't mean anything.              */
         gui_compute_coverage_span(s.span, sizeof(s.span));
 
+        EnterCriticalSection(&g_ui_lock);
         g_ui = s;   /* publish */
+        LeaveCriticalSection(&g_ui_lock);
 
         /* Repaint only the dynamic area above the log control, not the whole
          * window. Painting behind the child log every tick caused a visible
@@ -2175,13 +2437,41 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
         if (g_hwnd) {
             RECT cr, lr;
             GetClientRect(g_hwnd, &cr);
-            /* top region: from top down to just above the log */
+            /* top region: from top down to just above the log. Gated on the
+             * meter readings (and elapsed/file-size, which live here too)
+             * actually having changed since the last tick - this region
+             * used to be invalidated unconditionally on every single
+             * monitor tick regardless of whether anything in it was
+             * different, unlike the sched/carrier strips further down
+             * which already only repaint on an actual change. Repainting
+             * this much real estate that often, whether needed or not, was
+             * a plausible contributor to the level meter intermittently
+             * appearing to blink even when the underlying reading was
+             * fine - GDI churn on every tick rather than only when the
+             * numbers actually moved.                                     */
             if (g_hLog) {
+                static float last_top_peak_a = -999.0f, last_top_peak_b = -999.0f;
+                static double last_top_elapsed = -1.0, last_top_file_mb = -1.0;
+                static char last_top_state[48] = {0};
+                int top_changed =
+                    (fabs(s.peak_a - last_top_peak_a) > 0.05) ||
+                    (fabs(s.peak_b - last_top_peak_b) > 0.05) ||
+                    (fabs(s.elapsed_sec - last_top_elapsed) >= 1.0) ||
+                    (fabs(s.file_mb - last_top_file_mb) > 0.001) ||
+                    strncmp(s.state, last_top_state, sizeof(last_top_state)) != 0;
+
                 GetWindowRect(g_hLog, &lr);
                 POINT tl = { lr.left, lr.top };
                 ScreenToClient(g_hwnd, &tl);
-                RECT top = { 0, 0, cr.right, tl.y };
-                InvalidateRect(g_hwnd, &top, FALSE);
+                if (top_changed) {
+                    RECT top = { 0, 0, cr.right, tl.y };
+                    InvalidateRect(g_hwnd, &top, FALSE);
+                    last_top_peak_a   = s.peak_a;
+                    last_top_peak_b   = s.peak_b;
+                    last_top_elapsed  = s.elapsed_sec;
+                    last_top_file_mb  = s.file_mb;
+                    strncpy(last_top_state, s.state, sizeof(last_top_state) - 1);
+                }
                 /* bottom region: only the scheduling-text strip between the
                  * log and the button bar. Exclude the button row itself so
                  * the owner-drawn buttons don't flicker every monitor tick.
@@ -2215,13 +2505,13 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
                 {
                     char cur[64];
                     cur[0] = '\0';
-                    if (g_monitor.enabled && g_monitor.carrier_offset_valid_pub &&
-                            g_monitor.carrier_locked_pub) {
+                    if (g_monitor.enabled && g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] &&
+                            g_monitor.carrier_settled_pub[g_monitor.tuner_sel] && g_state.cfg.show_carrier_offset) {
                         double dial_hz = (g_monitor.tuner_sel == 1)
                                        ? g_monitor.freq_hz_b : g_monitor.freq_hz;
-                        double carrier_hz = dial_hz + (double)g_monitor.carrier_offset_hz_pub;
+                        double carrier_hz = dial_hz + (double)g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel];
                         snprintf(cur, sizeof(cur), "OFFSET %.4f %d", carrier_hz / 1000.0,
-                                 g_monitor.carrier_settled_pub);
+                                 g_monitor.carrier_settled_pub[g_monitor.tuner_sel]);
                     }
                     if (strncmp(cur, g_last_infostrip_text, sizeof(g_last_infostrip_text)) != 0) {
                         RECT ib_strip2 = { 0, btn_top, cr.right, cr.bottom };
@@ -2246,23 +2536,26 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
         }
         /* Timer button: reflects either timer mode being active (schedule_only
          * OR hourly_enable - see the unified button's own click handler).
-         * Always enabled now - turning it off is meaningful both while
-         * listening (cancels an active wait) and while actually recording
-         * (stops the hourly/schedule sequence repeating afterward, without
-         * touching the file currently being written) - unlike the old
-         * Schedule button this replaced, where toggling schedule_only
-         * mid-session genuinely couldn't do anything. Still only repaints
-         * when the label actually changes, using the session-reset
+         * Disabled while a genuine ad-hoc recording (Timer not armed) is
+         * actually in progress, same rule as gui_set_recording_ui() uses -
+         * this loop runs once a second regardless of what set g_last_
+         * sched_on last, so leaving this unconditionally TRUE (its
+         * original behaviour, from before Timer and Record/Stop became
+         * mutually exclusive during a recording) was overriding that
+         * disable within about a second of it taking effect, on every
+         * single ad-hoc recording. Still only repaints when the label or
+         * this enabled state actually changes, using the session-reset
          * globals above, to avoid needless flicker on every tick.        */
         if (g_hBtnSchedToggle) {
             int sched_on = (g_state.cfg.schedule_only || g_state.cfg.hourly_enable) ? 1 : 0;
+            int sched_should_enable = !g_toggle_btn_recording || sched_on;
             if (sched_on != g_last_sched_on) {
                 SetWindowTextA(g_hBtnSchedToggle,
                                sched_on ? "Timer: ON" : "Timer: OFF");
-                EnableWindow(g_hBtnSchedToggle, TRUE);
                 InvalidateRect(g_hBtnSchedToggle, NULL, FALSE);
                 g_last_sched_on = sched_on;
             }
+            EnableWindow(g_hBtnSchedToggle, sched_should_enable);
         }
         monitor_sync_button_label();
 
@@ -2435,10 +2728,9 @@ static void generate_output_filename(Config *cfg, int num_channels)
                  st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond);
     } else if (cfg->output_format == FORMAT_SDRUNO || cfg->output_format == FORMAT_WINRAD) {
-        /* SDRuno and Winrad share the same WAV layout and naming pattern -
-         * Winrad just gets a different filename prefix so it's obvious at
-         * a glance which files are RF64-capable and which are SDRuno's
-         * plain-WAV split segments. Keep Z regardless of use_utc for
+        /* SDRuno and Winrad share the same filename pattern - only the
+         * prefix differs, so it's obvious at a glance which files came
+         * from which format. Keep Z regardless of use_utc for
          * compatibility.                                                 */
         long long freq_khz = (long long)(cfg->frequency_hz / 1000.0 + 0.5);
         char freq_str[32];
@@ -2451,6 +2743,30 @@ static void generate_output_filename(Config *cfg, int num_channels)
                  "%s_%04d%02d%02d_%02d%02d%02dZ_%s.wav",
                  prefix, st.wYear, st.wMonth, st.wDay,
                  st.wHour, st.wMinute, st.wSecond, freq_str);
+    } else if (cfg->output_format == FORMAT_PERSEUS) {
+        /* Same date/time/frequency pattern as SDRuno/Winrad, just with no
+         * prefix - genuine Perseus recordings don't carry one either.    */
+        long long freq_khz = (long long)(cfg->frequency_hz / 1000.0 + 0.5);
+        char freq_str[32];
+        if (fabs(cfg->frequency_hz - (double)(freq_khz * 1000)) < 1.0)
+            snprintf(freq_str, sizeof(freq_str), "%lldkHz", freq_khz);
+        else
+            snprintf(freq_str, sizeof(freq_str), "%.1fkHz", cfg->frequency_hz / 1000.0);
+        snprintf(cfg->output_file, MAX_PATH_LEN,
+                 "%04d%02d%02d_%02d%02d%02dZ_%s.wav",
+                 st.wYear, st.wMonth, st.wDay,
+                 st.wHour, st.wMinute, st.wSecond, freq_str);
+    } else if (cfg->output_format == FORMAT_JAGUAR) {
+        /* Jaguar's own naming convention: "YYYY-MM-DD HH'MM'SS.wav" -
+         * apostrophes standing in for colons (not valid in Windows
+         * filenames), no prefix, no frequency - matches the exact format
+         * genuine Jaguar software produces. Deliberately a fully separate
+         * branch rather than folded into the SDRuno/Winrad/Perseus one
+         * above, since the pattern itself is unrelated.                  */
+        snprintf(cfg->output_file, MAX_PATH_LEN,
+                 "%04d-%02d-%02d %02d'%02d'%02d.wav",
+                 st.wYear, st.wMonth, st.wDay,
+                 st.wHour, st.wMinute, st.wSecond);
     } else if (cfg->output_format == FORMAT_SDRCONNECT) {
         /* SDR Connect WAV - no Z suffix in this format */
         long long freq_hz = (long long)(cfg->frequency_hz + 0.5);
@@ -2497,15 +2813,15 @@ static void insert_tuner_tag(char *path, size_t path_size, const char *tag)
     path[path_size - 1] = '\0';
 }
 
-/* Builds cfg->output_file (Tuner A) and state->output_file_b (Tuner B) as
+/* Builds cfg->output_file (Tuner 1) and state->output_file_b (Tuner 2) as
  * two separate, correctly-frequency-labelled single-channel filenames. */
 static void generate_dual_separate_filenames(AppState *state)
 {
     Config *cfg = &state->cfg;
     double freq_a_saved = cfg->frequency_hz;
 
-    /* File B first: temporarily borrow the generator with Tuner B's own
-     * frequency, then stash the result and restore Tuner A's frequency. */
+    /* File B first: temporarily borrow the generator with Tuner 2's own
+     * frequency, then stash the result and restore Tuner 1's frequency. */
     cfg->frequency_hz = cfg->freq_b_hz;
     generate_output_filename(cfg, 1);
     strncpy(state->output_file_b, cfg->output_file, MAX_PATH_LEN - 1);
@@ -2513,7 +2829,7 @@ static void generate_dual_separate_filenames(AppState *state)
     insert_tuner_tag(state->output_file_b, sizeof(state->output_file_b), "_TunerB");
     cfg->frequency_hz = freq_a_saved;
 
-    /* File A: normal generation, using Tuner A's own (real) frequency. */
+    /* File A: normal generation, using Tuner 1's own (real) frequency. */
     generate_output_filename(cfg, 1);
     insert_tuner_tag(cfg->output_file, sizeof(cfg->output_file), "_TunerA");
 }
@@ -2690,6 +3006,31 @@ typedef struct {
     uint16_t block_align, bits_per_sample;
     char data_id[4]; uint32_t data_size;                     /* 0xFFFFFFFF sentinel        */
 } SDRConnectRF64Header;  /* 116 bytes */
+
+/* Perseus SDR WAV header (86 bytes) - reverse-engineered from genuine
+ * Perseus recordings during the SDR Trim project: RIFF/WAVE -> fmt (16
+ * bytes, standard PCM) -> rcvr (34-byte custom chunk) -> data. Verified
+ * against real Perseus files byte-for-byte, including the two Perseus
+ * WAV quirks that matter here: num_channels is 2 (I/Q as stereo, same
+ * convention as every other format here, NOT a second physical tuner -
+ * Perseus itself is single-tuner), and rcvr's centre_freq/flags/timestamp
+ * fields sit at fixed offsets 0/4/8 within the chunk body regardless of
+ * sample rate, which itself is a genuinely arbitrary value (not drawn
+ * from a fixed set) in real Perseus output.                              */
+typedef struct {
+    char riff_id[4]; uint32_t riff_size; char wave_id[4];
+    char fmt_id[4];  uint32_t fmt_size;
+    uint16_t audio_format, num_channels;
+    uint32_t sample_rate, byte_rate;
+    uint16_t block_align, bits_per_sample;
+    char rcvr_id[4]; uint32_t rcvr_size;
+    uint32_t centre_freq_hz;   /* rcvr[0:4] */
+    uint32_t flags;            /* rcvr[4:8] - 4 = Perseus, 5 = Jaguar (not used here) */
+    uint32_t unix_timestamp;   /* rcvr[8:12] */
+    uint8_t  reserved[22];     /* rcvr[12:34] - zero-filled; unused by DuoDX or, as far
+                                   as this was tested, by anything reading these files  */
+    char data_id[4]; uint32_t data_size;
+} PerseusHeader;  /* 86 bytes */
 #pragma pack(pop)
 
 /* =========================================================================
@@ -2834,15 +3175,154 @@ static int write_sdrconnect_header_rf64(HANDLE fh, const Config *cfg)
 }
 
 /* =========================================================================
+ * Perseus header writer (86 bytes). Perseus format always splits at ~4GB
+ * like SDRuno - genuine Perseus playback software doesn't support RF64 -
+ * so there's no RF64 counterpart to this function, only the plain header.
+ * ========================================================================= */
+static int write_perseus_header(HANDLE fh, const Config *cfg)
+{
+    PerseusHeader hdr; DWORD written;
+    FILETIME ft; ULARGE_INTEGER ull; int64_t unix_ts;
+
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.riff_id, "RIFF", 4);  hdr.riff_size = 0;
+    memcpy(hdr.wave_id, "WAVE", 4);
+    memcpy(hdr.fmt_id,  "fmt ", 4);  hdr.fmt_size  = 16;
+    hdr.audio_format = 1;  hdr.num_channels = 2;
+    hdr.sample_rate  = (uint32_t)cfg->expected_output_rate_hz;
+    hdr.byte_rate    = hdr.sample_rate * 4;
+    hdr.block_align  = 4;  hdr.bits_per_sample = 16;
+    memcpy(hdr.rcvr_id, "rcvr", 4);  hdr.rcvr_size = 34;
+    hdr.centre_freq_hz = (uint32_t)(cfg->frequency_hz + 0.5);
+    hdr.flags          = 4;   /* Perseus - see the format comment above PerseusHeader */
+    /* Genuine Perseus files always carry 0x01 at rcvr bytes 14, 16, and 17
+     * (reserved[2], reserved[4], reserved[5] here - reserved[] starts at
+     * rcvr byte 12). Confirmed against SDR Trim's own file-format
+     * detection, which treats flags=4 with a zero byte at rcvr[16] (i.e.
+     * an all-zero reserved area, like a naive writer's memset(0) would
+     * produce) as "Jaguar 2MHz" specifically when the sample rate is
+     * exactly 2,000,000 Hz - exactly the false identification this was
+     * causing before these three bytes were set.                        */
+    hdr.reserved[2] = 0x01;
+    hdr.reserved[4] = 0x01;
+    hdr.reserved[5] = 0x01;
+
+    /* Unix timestamp - always genuine UTC regardless of the app's own
+     * use_utc display setting, since an absolute epoch value interpreted
+     * as local time would record the wrong actual moment.               */
+    GetSystemTimeAsFileTime(&ft);
+    ull.LowPart  = ft.dwLowDateTime;
+    ull.HighPart = ft.dwHighDateTime;
+    unix_ts = ((int64_t)ull.QuadPart - 116444736000000000LL) / 10000000LL;
+    hdr.unix_timestamp = (uint32_t)unix_ts;
+
+    memcpy(hdr.data_id, "data", 4);  hdr.data_size = 0;
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writing Perseus header: SR=%u Hz  CF=%u Hz",
+             hdr.sample_rate, hdr.centre_freq_hz);
+    if (!WriteFile(fh, &hdr, (DWORD)sizeof(hdr), &written, NULL)
+            || written != (DWORD)sizeof(hdr)) {
+        LOG_ERROR("Perseus header write failed: %lu bytes, error %lu",
+                  written, GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+/* =========================================================================
+ * Jaguar header writer (86 bytes) - identical layout to write_perseus_header()
+ * above (same PerseusHeader struct, same "rcvr" chunk), differing only in
+ * the flags field (5 = Jaguar, vs 4 = Perseus). Deliberately kept as its
+ * own separate function rather than adding a parameter to
+ * write_perseus_header() and updating every call site - lower risk of
+ * disturbing the already-working Perseus path for the sake of one field.
+ * Jaguar always splits at ~4GB too, same reasoning as Perseus/SDRuno.
+ * ========================================================================= */
+static int write_jaguar_header(HANDLE fh, const Config *cfg)
+{
+    PerseusHeader hdr; DWORD written;
+    FILETIME ft; ULARGE_INTEGER ull; int64_t unix_ts;
+
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.riff_id, "RIFF", 4);  hdr.riff_size = 0;
+    memcpy(hdr.wave_id, "WAVE", 4);
+    memcpy(hdr.fmt_id,  "fmt ", 4);  hdr.fmt_size  = 16;
+    hdr.audio_format = 1;  hdr.num_channels = 2;
+    hdr.sample_rate  = (uint32_t)cfg->expected_output_rate_hz;
+    hdr.byte_rate    = hdr.sample_rate * 4;
+    hdr.block_align  = 4;  hdr.bits_per_sample = 16;
+    memcpy(hdr.rcvr_id, "rcvr", 4);  hdr.rcvr_size = 34;
+    hdr.centre_freq_hz = (uint32_t)(cfg->frequency_hz + 0.5);
+    /* flags is NOT simply "5 for Jaguar" - genuine Jaguar hardware only
+     * ever runs at 1,600,000 Hz or 2,000,000 Hz, and the two variants
+     * are tagged differently: flags=4 for the 2,000,000 Hz variant,
+     * flags=5 otherwise (nominally "native" 1.6MHz). Confirmed against
+     * SDR Trim's own Jaguar writer, which uses exactly this rule -
+     * getting it backwards (always writing flags=5) meant a 2,000,000 Hz
+     * recording was internally tagged as if it were the 1.6MHz variant,
+     * which some readers use instead of the fmt chunk's actual rate for
+     * duration/continuity calculations - explaining files that opened
+     * fine individually but weren't recognised as a continuous sequence.
+     * The three padding bytes that follow are similarly rate-dependent,
+     * again matching SDR Trim's own writer exactly (including its
+     * fallback for any DuoDX-configured rate that's neither 1.6 nor 2.0
+     * MHz, which real Jaguar hardware never actually produces).         */
+    if (hdr.sample_rate == 2000000) {
+        hdr.flags = 4;
+        hdr.reserved[2] = 0x01;   /* rcvr+14 */
+        hdr.reserved[5] = 0x01;   /* rcvr+17 */
+        /* reserved[4] (rcvr+16) deliberately stays 0x00 - that is exactly
+         * what distinguishes this from a Perseus file also using flags=4. */
+    } else {
+        hdr.flags = 5;
+        if (hdr.sample_rate == 1600000) {
+            hdr.reserved[2] = 0x01;   /* rcvr+14 */
+            hdr.reserved[3] = 0x01;   /* rcvr+15 */
+            hdr.reserved[5] = 0x01;   /* rcvr+17 */
+        } else {
+            hdr.reserved[2] = 0x01;   /* rcvr+14 */
+            hdr.reserved[4] = 0x01;   /* rcvr+16 */
+            hdr.reserved[5] = 0x01;   /* rcvr+17 */
+        }
+    }
+
+    /* Unix timestamp - always genuine UTC regardless of the app's own
+     * use_utc display setting, since an absolute epoch value interpreted
+     * as local time would record the wrong actual moment.               */
+    GetSystemTimeAsFileTime(&ft);
+    ull.LowPart  = ft.dwLowDateTime;
+    ull.HighPart = ft.dwHighDateTime;
+    unix_ts = ((int64_t)ull.QuadPart - 116444736000000000LL) / 10000000LL;
+    hdr.unix_timestamp = (uint32_t)unix_ts;
+
+    memcpy(hdr.data_id, "data", 4);  hdr.data_size = 0;
+    if (g_state.cfg.verbose)
+        LOG_INFO("Writing Jaguar header: SR=%u Hz  CF=%u Hz",
+             hdr.sample_rate, hdr.centre_freq_hz);
+    if (!WriteFile(fh, &hdr, (DWORD)sizeof(hdr), &written, NULL)
+            || written != (DWORD)sizeof(hdr)) {
+        LOG_ERROR("Jaguar header write failed: %lu bytes, error %lu",
+                  written, GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+/* =========================================================================
  * RIFF size patcher -- seeks back and updates riff_size and data_size.
- * Called before CloseHandle for SDRuno and SDR Connect formats.
- * Both fields were written as 0 in the initial header.
+ * Called before CloseHandle for SDRuno, Winrad, Perseus, and SDR Connect
+ * formats. Both fields were written as 0 in the initial header.
  * ========================================================================= */
 static void patch_wav_sizes(HANDLE fh, const Config *cfg, LONG64 samples_written)
 {
     int64_t  data_bytes  = samples_written * 4;
-    int64_t  header_size = (cfg->output_format == FORMAT_SDRUNO ||
-                             cfg->output_format == FORMAT_WINRAD) ? 216 : 80;
+    int64_t  header_size;
+    if (cfg->output_format == FORMAT_SDRUNO || cfg->output_format == FORMAT_WINRAD)
+        header_size = 216;
+    else if (cfg->output_format == FORMAT_PERSEUS || cfg->output_format == FORMAT_JAGUAR)
+        header_size = (int64_t)sizeof(PerseusHeader);
+    else
+        header_size = 80;   /* FORMAT_SDRCONNECT */
     int64_t  riff_total  = header_size - 8 + data_bytes;
     /* Clamp to 0xFFFFFFFF rather than wrapping mod 2^32 - this matches
      * genuine SDRuno's own behaviour for oversized files (confirmed via
@@ -2859,7 +3339,8 @@ static void patch_wav_sizes(HANDLE fh, const Config *cfg, LONG64 samples_written
     li.QuadPart = header_size - 4;
     if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
         WriteFile(fh, &data_size32, 4, &written, NULL);
-    LOG_INFO("WAV sizes patched: riff_size=%u  data_size=%u", riff_size32, data_size32);
+    if (cfg->verbose)
+        LOG_INFO("WAV sizes patched: riff_size=%u  data_size=%u", riff_size32, data_size32);
 
     /* Patch the auxi chunk's StopTime field (SDRuno/Winrad only - SDR
      * Connect's header has no auxi chunk). This was never being written
@@ -2886,9 +3367,10 @@ static void patch_wav_sizes(HANDLE fh, const Config *cfg, LONG64 samples_written
         li.QuadPart = offsetof(SDRunoHeader, stop_time);
         if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
             WriteFile(fh, &stop_time, sizeof(stop_time), &written, NULL);
-        LOG_INFO("StopTime patched: %04d-%02d-%02d %02d:%02d:%02d",
-                 stop_time.wYear, stop_time.wMonth, stop_time.wDay,
-                 stop_time.wHour, stop_time.wMinute, stop_time.wSecond);
+        if (cfg->verbose)
+            LOG_INFO("StopTime patched: %04d-%02d-%02d %02d:%02d:%02d",
+                     stop_time.wYear, stop_time.wMonth, stop_time.wDay,
+                     stop_time.wHour, stop_time.wMinute, stop_time.wSecond);
     }
 }
 
@@ -2924,8 +3406,9 @@ static void patch_wav_sizes_rf64(HANDLE fh, const Config *cfg, LONG64 samples_wr
     li.QuadPart = offsetof(SDRunoRF64Header, sample_count64);
     if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
         WriteFile(fh, &sample_count64, 8, &written, NULL);
-    LOG_INFO("RF64 ds64 sizes patched: riff_size64=%llu  data_size64=%llu",
-             (unsigned long long)riff_size64, (unsigned long long)data_size64);
+    if (cfg->verbose)
+        LOG_INFO("RF64 ds64 sizes patched: riff_size64=%llu  data_size64=%llu",
+                 (unsigned long long)riff_size64, (unsigned long long)data_size64);
 
     /* The classic 32-bit riff_size/data_size fields were written as the
      * RF64 spec's 0xFFFFFFFF sentinel at file-open time (real size wasn't
@@ -2950,15 +3433,16 @@ static void patch_wav_sizes_rf64(HANDLE fh, const Config *cfg, LONG64 samples_wr
         li.QuadPart = header_size - 4; /* data_size32, right before audio data */
         if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
             WriteFile(fh, &data_size32, 4, &written, NULL);
-        LOG_INFO("RF64 classic 32-bit fields also patched with real values "
-                 "(file stayed under 4GB): riff_size=%u  data_size=%u",
-                 riff_size32, data_size32);
+        if (cfg->verbose)
+            LOG_INFO("RF64 classic 32-bit fields also patched with real values "
+                     "(file stayed under 4GB): riff_size=%u  data_size=%u",
+                     riff_size32, data_size32);
     }
 
     /* Same StopTime fix as patch_wav_sizes() - Winrad's auxi chunk had
      * never had StopTime written, only SDR Connect RF64 has no auxi chunk
-     * to patch here (SDRuno itself never reaches this RF64 patcher at all
-     * - see the OutputFormat enum comment).                              */
+     * to patch here (SDRuno and Perseus never reach this RF64 patcher at
+     * all - see the OutputFormat enum comment).                          */
     if (cfg->output_format == FORMAT_WINRAD) {
         SYSTEMTIME st;
         WavSystime stop_time;
@@ -2974,9 +3458,10 @@ static void patch_wav_sizes_rf64(HANDLE fh, const Config *cfg, LONG64 samples_wr
         li.QuadPart = offsetof(SDRunoRF64Header, stop_time);
         if (SetFilePointerEx(fh, li, NULL, FILE_BEGIN))
             WriteFile(fh, &stop_time, sizeof(stop_time), &written, NULL);
-        LOG_INFO("StopTime patched: %04d-%02d-%02d %02d:%02d:%02d",
-                 stop_time.wYear, stop_time.wMonth, stop_time.wDay,
-                 stop_time.wHour, stop_time.wMinute, stop_time.wSecond);
+        if (cfg->verbose)
+            LOG_INFO("StopTime patched: %04d-%02d-%02d %02d:%02d:%02d",
+                     stop_time.wYear, stop_time.wMonth, stop_time.wDay,
+                     stop_time.wHour, stop_time.wMinute, stop_time.wSecond);
     }
 }
 
@@ -3060,12 +3545,12 @@ static int write_gap_fill(AppState *state, LONG64 bytes_to_fill)
             DWORD half = (DWORD)(chunk / 2);
             ok = WriteFile(state->out_file, g_zero_chunk, half, &written, NULL);
             if (!ok || written != half) {
-                LOG_ERROR("Gap fill WriteFile (A) failed: error %lu", GetLastError());
+                LOG_ERROR("Gap fill WriteFile (Tuner 1) failed: error %lu", GetLastError());
                 return 0;
             }
             ok = WriteFile(state->out_file_b, g_zero_chunk, half, &written, NULL);
             if (!ok || written != half) {
-                LOG_ERROR("Gap fill WriteFile (B) failed: error %lu", GetLastError());
+                LOG_ERROR("Gap fill WriteFile (Tuner 2) failed: error %lu", GetLastError());
                 return 0;
             }
         } else {
@@ -3133,6 +3618,30 @@ static void check_split_rollover(AppState *state)
      * only, so the placeholder value has no effect on the name produced. */
     generate_output_filename(&state->cfg, 1);
 
+    /* generate_output_filename() only ever produces a bare filename - the
+     * recording_path directory is normally prepended once, right after
+     * the very first call to it, by the initial-open code elsewhere. That
+     * one-time step doesn't run again here, so without this, every part
+     * after the first would silently land in the process's current
+     * working directory instead of the configured recording folder.
+     * Same logic as that initial-open prepending, so the two stay
+     * consistent.                                                        */
+    if (state->cfg.recording_path[0]) {
+        const char *f = state->cfg.output_file;
+        int has_dir = (strrchr(f, '\\') != NULL || strrchr(f, '/') != NULL);
+        if (!has_dir) {
+            char full_path[MAX_PATH_LEN];
+            char *rp = state->cfg.recording_path;
+            int rlen = (int)strlen(rp);
+            if (rlen > 0 && rp[rlen-1] != '\\' && rp[rlen-1] != '/')
+                snprintf(full_path, MAX_PATH_LEN, "%s\\%s", rp, f);
+            else
+                snprintf(full_path, MAX_PATH_LEN, "%s%s", rp, f);
+            strncpy(state->cfg.output_file, full_path, MAX_PATH_LEN-1);
+            state->cfg.output_file[MAX_PATH_LEN-1] = '\0';
+        }
+    }
+
     new_file = CreateFileA(state->cfg.output_file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (new_file == INVALID_HANDLE_VALUE) {
@@ -3143,9 +3652,14 @@ static void check_split_rollover(AppState *state)
         return;
     }
 
-    hdr_ok = (state->cfg.output_format == FORMAT_SDRCONNECT)
-             ? write_sdrconnect_header(new_file, &state->cfg)
-             : write_sdruno_header(new_file, &state->cfg);
+    if (state->cfg.output_format == FORMAT_SDRCONNECT)
+        hdr_ok = write_sdrconnect_header(new_file, &state->cfg);
+    else if (state->cfg.output_format == FORMAT_PERSEUS)
+        hdr_ok = write_perseus_header(new_file, &state->cfg);
+    else if (state->cfg.output_format == FORMAT_JAGUAR)
+        hdr_ok = write_jaguar_header(new_file, &state->cfg);
+    else
+        hdr_ok = write_sdruno_header(new_file, &state->cfg);
     if (!hdr_ok) {
         LOG_ERROR("Split mode: header write failed for '%s' - recording will stop.",
                   state->cfg.output_file);
@@ -3159,6 +3673,42 @@ static void check_split_rollover(AppState *state)
     state->out_file = new_file;
     state->segment_samples_written = 0;
     LOG_OK("Part %d started: %s", state->output_part_number, state->cfg.output_file);
+}
+
+/* Non-blocking write to the Master/Slave Tuner 2 monitor pipe (mon_pipe_
+ * handle - see its own field comment in AppState). Never waits: if a
+ * previous write is still in flight, this chunk is simply dropped rather
+ * than queued, exactly the same "best-effort, meter catches up on
+ * whatever comes next" philosophy the old PIPE_NOWAIT approach aimed for
+ * - the difference is this actually works reliably, using real
+ * overlapped I/O instead of relying on PIPE_NOWAIT's quirks to get the
+ * same non-blocking behaviour.                                          */
+static void mon_pipe_write_nonblocking(AppState *state, const void *data, DWORD len)
+{
+    if (state->mon_pipe_handle == INVALID_HANDLE_VALUE) return;
+
+    if (state->mon_pipe_write_pending) {
+        DWORD transferred;
+        if (!GetOverlappedResult(state->mon_pipe_handle, &state->mon_pipe_ov,
+                                  &transferred, FALSE)) {
+            if (GetLastError() == ERROR_IO_INCOMPLETE)
+                return;   /* still busy - drop this chunk */
+            /* Some other error (broken pipe, client gone) - fall through
+             * and attempt a fresh write below anyway; if the pipe is
+             * genuinely gone it'll just fail harmlessly again.          */
+        }
+        state->mon_pipe_write_pending = 0;
+    }
+
+    ResetEvent(state->mon_pipe_ov.hEvent);
+    if (!WriteFile(state->mon_pipe_handle, data, len, NULL, &state->mon_pipe_ov)) {
+        if (GetLastError() == ERROR_IO_PENDING)
+            state->mon_pipe_write_pending = 1;
+        /* Any other error (no client connected yet, broken pipe) - skip
+         * silently, same as the general monitor pipe feature does.      */
+    }
+    /* WriteFile returning TRUE means it completed synchronously already -
+     * nothing pending, nothing further to do here.                      */
 }
 
 static DWORD WINAPI writer_thread_func(LPVOID param)
@@ -3322,7 +3872,7 @@ static DWORD WINAPI writer_thread_func(LPVOID param)
             ok = WriteFile(state->out_file, g_split_chunk_a,
                            (DWORD)split_bytes, &written, NULL);
             if (!ok || written != (DWORD)split_bytes) {
-                LOG_ERROR("Write failed (Tuner A file): Windows error %lu "
+                LOG_ERROR("Write failed (Tuner 1 file): Windows error %lu "
                           "(wrote %lu of %zu bytes)",
                           GetLastError(), written, split_bytes);
                 state->writer_error = 1;
@@ -3331,7 +3881,7 @@ static DWORD WINAPI writer_thread_func(LPVOID param)
             ok = WriteFile(state->out_file_b, g_split_chunk_b,
                            (DWORD)split_bytes, &written, NULL);
             if (!ok || written != (DWORD)split_bytes) {
-                LOG_ERROR("Write failed (Tuner B file): Windows error %lu "
+                LOG_ERROR("Write failed (Tuner 2 file): Windows error %lu "
                           "(wrote %lu of %zu bytes)",
                           GetLastError(), written, split_bytes);
                 state->writer_error = 1;
@@ -3344,6 +3894,7 @@ static DWORD WINAPI writer_thread_func(LPVOID param)
                 WriteFile(state->pipe_handle, g_write_chunk, (DWORD)to_read,
                           &pipe_written, NULL);
             }
+            mon_pipe_write_nonblocking(state, g_write_chunk, (DWORD)to_read);
         } else {
             /* out_file is INVALID_HANDLE_VALUE in the slave's listen-only
              * mode (no file is ever created there) - skip the write
@@ -3370,6 +3921,7 @@ static DWORD WINAPI writer_thread_func(LPVOID param)
                           &pipe_written, NULL);
                 /* Ignore return value intentionally - pipe is best-effort. */
             }
+            mon_pipe_write_nonblocking(state, g_write_chunk, (DWORD)to_read);
         }
 
         InterlockedAdd64(&state->samples_written,
@@ -3379,7 +3931,9 @@ static DWORD WINAPI writer_thread_func(LPVOID param)
 
         {
             int split_active =
-                (state->cfg.output_format == FORMAT_SDRUNO) ||
+                (state->cfg.output_format == FORMAT_SDRUNO ||
+                 state->cfg.output_format == FORMAT_PERSEUS ||
+                 state->cfg.output_format == FORMAT_JAGUAR) ||
                 ((state->cfg.output_format == FORMAT_WINRAD ||
                   state->cfg.output_format == FORMAT_SDRCONNECT) &&
                  state->cfg.large_file_mode == LARGE_FILE_SPLIT);
@@ -3433,8 +3987,10 @@ static void stream_callback_single(
         if (peak > 0) {
             float db = 20.0f * log10f((float)peak / 32767.0f);
             /* Only update if louder than current peak */
+            EnterCriticalSection(&g_peak_lock);
             if (db > state->peak_dbfs)
                 state->peak_dbfs = db;
+            LeaveCriticalSection(&g_peak_lock);
         }
     }
 
@@ -3461,12 +4017,12 @@ static void stream_callback_single(
             }
             ring_write(&state->ring, tmp, batch * 4);
         }
-        /* This callback only ever carries Tuner A's real ADC data - for a
+        /* This callback only ever carries Tuner 1's real ADC data - for a
          * true single-tuner recording that's the only tuner anyway, so
-         * feed unconditionally. But in Master/Slave mode, Tuner B's real
+         * feed unconditionally. But in Master/Slave mode, Tuner 2's real
          * data lives entirely in the separate slave process and never
-         * reaches this one - feeding it here when "Tuner B" is selected
-         * would silently play Tuner A's signal mislabelled as B's, with
+         * reaches this one - feeding it here when "Tuner 2" is selected
+         * would silently play Tuner 1's signal mislabelled as B's, with
          * NCO math for the wrong centre frequency. Stay silent instead. */
         if (!state->master_slave_active || g_monitor.tuner_sel == 0)
             monitor_feed(&xi[offset], &xq[offset], batch);
@@ -3589,13 +4145,17 @@ static void stream_callback_dual_b(
 
         if (peak_a > 0) {
             float db = 20.0f * log10f((float)peak_a / 32767.0f);
+            EnterCriticalSection(&g_peak_lock);
             if (db > state->peak_dbfs)
                 state->peak_dbfs = db;
+            LeaveCriticalSection(&g_peak_lock);
         }
         if (peak_b > 0) {
             float db = 20.0f * log10f((float)peak_b / 32767.0f);
+            EnterCriticalSection(&g_peak_lock);
             if (db > state->peak_dbfs_b)
                 state->peak_dbfs_b = db;
+            LeaveCriticalSection(&g_peak_lock);
         }
 
         if (!state->listening) {
@@ -3642,20 +4202,32 @@ static void event_callback(
          * behaviour regardless of any AGC guard condition.               */
         if (tuner == sdrplay_api_Tuner_B)
             g_curr_gain_b = params->gainParams.currGain;
+            if (g_gain_b_shmem_view) *g_gain_b_shmem_view = params->gainParams.currGain;
         else
             g_curr_gain_a = params->gainParams.currGain;
         if (state->cfg.verbose) {
-            static DWORD last_log_a = 0, last_log_b = 0;
-            DWORD now = GetTickCount();
-            DWORD *last = (tuner == sdrplay_api_Tuner_B) ? &last_log_b : &last_log_a;
-            if (now - *last >= 3000) {
-                *last = now;
-                LOG_INFO("Gain change [%s]: lnaGRdB=%d, grDb=%d, currGain=%.1f",
-                         tuner == sdrplay_api_Tuner_A ? "T1" :
-                         tuner == sdrplay_api_Tuner_B ? "T2" : "Both",
-                         params->gainParams.lnaGRdB,
-                         params->gainParams.gRdB,
-                         params->gainParams.currGain);
+            /* AGC continuously nudges gain by design - with AGC on for
+             * this tuner, this event fires every few seconds indefinitely
+             * and never reflects anything worth looking at in the log,
+             * just AGC doing its job. Log it only with AGC off, where a
+             * gain change is genuinely notable (gain shouldn't move on
+             * its own without AGC).                                      */
+            int this_agc = (tuner == sdrplay_api_Tuner_B)
+                ? ((state->cfg.agc_enable_b >= 0) ? state->cfg.agc_enable_b : state->cfg.agc_enable)
+                : state->cfg.agc_enable;
+            if (!this_agc) {
+                static DWORD last_log_a = 0, last_log_b = 0;
+                DWORD now = GetTickCount();
+                DWORD *last = (tuner == sdrplay_api_Tuner_B) ? &last_log_b : &last_log_a;
+                if (now - *last >= 3000) {
+                    *last = now;
+                    LOG_INFO("Gain change [%s]: lnaGRdB=%d, grDb=%d, currGain=%.1f",
+                             tuner == sdrplay_api_Tuner_A ? "T1" :
+                             tuner == sdrplay_api_Tuner_B ? "T2" : "Both",
+                             params->gainParams.lnaGRdB,
+                             params->gainParams.gRdB,
+                             params->gainParams.currGain);
+                }
             }
         }
         break;
@@ -3697,7 +4269,8 @@ static void event_callback(
         break;
 
     case sdrplay_api_RspDuoModeChange:
-        LOG_INFO("RSPduo mode change event");
+        if (state->cfg.verbose)
+            LOG_INFO("RSPduo mode change event");
         break;
 
     default:
@@ -3775,46 +4348,84 @@ typedef struct {
     double adc_rate_hz;     /* Required ADC sample rate */
     int    decimation;      /* Internal decimation factor */
     double output_rate_hz;  /* Resulting output sample rate */
-    int    dual_ok;         /* Valid for RSPduo dual-tuner mode */
     const char *note;
 } ValidCombo;
 
+/* RSPduo dual-tuner restrictions, confirmed by direct hardware testing
+ * (Linrad output, all combos below tried on real hardware, decimation
+ * not exercised) - see the results table and MASTER_SLAVE_SR_OK() below:
+ *
+ *   Coherent (Dual_Tuner mode, same CF on both tuners): every combo in
+ *   this table works. No IF/BW/SR restriction at all.
+ *
+ *   Master/Slave (different CF on each tuner): works ONLY when the ADC
+ *   sample rate is exactly 6 or 8 Msps - any IF/BW combo AT that rate is
+ *   fine (Zero-IF included). Every other ADC rate (2/3/4/5/7/10 Msps, and
+ *   Low-IF 450 kHz which is fixed at 2 Msps) fails outright.
+ *
+ * This replaces an earlier, unverified assumption (removed) that Master/
+ * Slave was restricted to two specific Low-IF combos and that Coherent
+ * shared the same restriction - neither part of that held up against
+ * actual testing.                                                      */
+#define MASTER_SLAVE_SR_OK(sr) \
+    (fabs((sr) - 6000000.0) < 1000.0 || fabs((sr) - 8000000.0) < 1000.0)
+
 static const ValidCombo VALID_COMBOS[] = {
     /* Zero-IF - output rate = ADC rate, any BW <= SR */
-    {    0,  200, 2000000.0, 1, 2000000.0, 0, "Zero-IF 2Msps/200kHz BW"},
-    {    0,  300, 2000000.0, 1, 2000000.0, 0, "Zero-IF 2Msps/300kHz BW"},
-    {    0,  600, 2000000.0, 1, 2000000.0, 0, "Zero-IF 2Msps/600kHz BW"},
-    {    0, 1536, 2000000.0, 1, 2000000.0, 0, "Zero-IF 2Msps/1536kHz BW"},
-    {    0,  300, 3000000.0, 1, 3000000.0, 0, "Zero-IF 3Msps/300kHz BW"},
-    {    0,  600, 3000000.0, 1, 3000000.0, 0, "Zero-IF 3Msps/600kHz BW"},
-    {    0, 1536, 3000000.0, 1, 3000000.0, 0, "Zero-IF 3Msps/1536kHz BW"},
-    {    0,  600, 4000000.0, 1, 4000000.0, 0, "Zero-IF 4Msps/600kHz BW"},
-    {    0, 1536, 4000000.0, 1, 4000000.0, 0, "Zero-IF 4Msps/1536kHz BW"},
-    {    0, 5000, 5000000.0, 1, 5000000.0, 0, "Zero-IF 5Msps/5000kHz BW"},
-    {    0, 1536, 5000000.0, 1, 5000000.0, 0, "Zero-IF 5Msps/1536kHz BW"},
-    {    0, 5000, 6000000.0, 1, 6000000.0, 0, "Zero-IF 6Msps/5000kHz BW"},
-    {    0, 6000, 6000000.0, 1, 6000000.0, 0, "Zero-IF 6Msps/6000kHz BW"},
-    {    0, 1536, 6000000.0, 1, 6000000.0, 0, "Zero-IF 6Msps/1536kHz BW"},
-    {    0, 6000, 7000000.0, 1, 7000000.0, 0, "Zero-IF 7Msps/6000kHz BW"},
-    {    0, 7000, 7000000.0, 1, 7000000.0, 0, "Zero-IF 7Msps/7000kHz BW"},
-    {    0, 6000, 8000000.0, 1, 8000000.0, 0, "Zero-IF 8Msps/6000kHz BW"},
-    {    0, 7000, 8000000.0, 1, 8000000.0, 0, "Zero-IF 8Msps/7000kHz BW"},
-    {    0, 8000, 8000000.0, 1, 8000000.0, 0, "Zero-IF 8Msps/8000kHz BW"},
-    {    0, 8000,10000000.0, 1,10000000.0, 0, "Zero-IF 10Msps/8000kHz BW"},
-    /* Low-IF 450 kHz - single-tuner only, not RSPduo dual-tuner compatible */
-    {  450,  200, 2000000.0, 4,  500000.0, 0, "Low-IF 450/200kHz 2Msps->0.5Msps"},
-    {  450,  300, 2000000.0, 4,  500000.0, 0, "Low-IF 450/300kHz 2Msps->0.5Msps"},
-    {  450,  600, 2000000.0, 2, 1000000.0, 0, "Low-IF 450/600kHz 2Msps->1Msps"},
-    /* Low-IF 1620 kHz - internal decimation /3 at 6Msps, /4 at 8Msps, output always 2 Msps */
-    { 1620,  200, 6000000.0, 3, 2000000.0, 1, "Low-IF 1620/200kHz 6Msps->2Msps (dual)"},
-    { 1620,  300, 6000000.0, 3, 2000000.0, 1, "Low-IF 1620/300kHz 6Msps->2Msps (dual)"},
-    { 1620,  600, 6000000.0, 3, 2000000.0, 1, "Low-IF 1620/600kHz 6Msps->2Msps (dual)"},
-    { 1620, 1536, 6000000.0, 3, 2000000.0, 1, "Low-IF 1620/1536kHz 6Msps->2Msps (dual, MW)"},
-    { 1620, 1536, 8000000.0, 4, 2000000.0, 0, "Low-IF 1620/1536kHz 8Msps->2Msps"},
-    /* Low-IF 2048 kHz - internal decimation /4, output always 2 Msps */
-    { 2048, 1536, 8000000.0, 4, 2000000.0, 1, "Low-IF 2048/1536kHz 8Msps->2Msps (dual)"},
+    {    0,  200, 2000000.0, 1, 2000000.0, "Zero-IF 2Msps/200kHz BW"},
+    {    0,  300, 2000000.0, 1, 2000000.0, "Zero-IF 2Msps/300kHz BW"},
+    {    0,  600, 2000000.0, 1, 2000000.0, "Zero-IF 2Msps/600kHz BW"},
+    {    0, 1536, 2000000.0, 1, 2000000.0, "Zero-IF 2Msps/1536kHz BW"},
+    {    0,  300, 3000000.0, 1, 3000000.0, "Zero-IF 3Msps/300kHz BW"},
+    {    0,  600, 3000000.0, 1, 3000000.0, "Zero-IF 3Msps/600kHz BW"},
+    {    0, 1536, 3000000.0, 1, 3000000.0, "Zero-IF 3Msps/1536kHz BW"},
+    {    0,  600, 4000000.0, 1, 4000000.0, "Zero-IF 4Msps/600kHz BW"},
+    {    0, 1536, 4000000.0, 1, 4000000.0, "Zero-IF 4Msps/1536kHz BW"},
+    {    0, 5000, 5000000.0, 1, 5000000.0, "Zero-IF 5Msps/5000kHz BW"},
+    {    0, 1536, 5000000.0, 1, 5000000.0, "Zero-IF 5Msps/1536kHz BW"},
+    {    0, 5000, 6000000.0, 1, 6000000.0, "Zero-IF 6Msps/5000kHz BW"},
+    {    0, 6000, 6000000.0, 1, 6000000.0, "Zero-IF 6Msps/6000kHz BW"},
+    {    0, 1536, 6000000.0, 1, 6000000.0, "Zero-IF 6Msps/1536kHz BW"},
+    {    0, 6000, 7000000.0, 1, 7000000.0, "Zero-IF 7Msps/6000kHz BW"},
+    {    0, 7000, 7000000.0, 1, 7000000.0, "Zero-IF 7Msps/7000kHz BW"},
+    {    0, 6000, 8000000.0, 1, 8000000.0, "Zero-IF 8Msps/6000kHz BW"},
+    {    0, 7000, 8000000.0, 1, 8000000.0, "Zero-IF 8Msps/7000kHz BW"},
+    {    0, 8000, 8000000.0, 1, 8000000.0, "Zero-IF 8Msps/8000kHz BW"},
+    {    0, 8000,10000000.0, 1,10000000.0, "Zero-IF 10Msps/8000kHz BW"},
+    /* Low-IF 450 kHz - fixed 2 Msps ADC, so it fails Master/Slave's
+     * 6/8 Msps requirement; fine for single-tuner or Coherent.          */
+    {  450,  200, 2000000.0, 4,  500000.0, "Low-IF 450/200kHz 2Msps->0.5Msps"},
+    {  450,  300, 2000000.0, 4,  500000.0, "Low-IF 450/300kHz 2Msps->0.5Msps"},
+    {  450,  600, 2000000.0, 2, 1000000.0, "Low-IF 450/600kHz 2Msps->1Msps"},
+    /* Low-IF 1620 kHz - internal decimation /3 at 6Msps, output always 2 Msps.
+     * 1620 kHz IF only ever pairs with 6 Msps in SDRplay's own documented
+     * down-conversion conditions - there is no 1620/8Msps combination in
+     * that list (8 Msps only ever pairs with 2048 kHz IF below). An
+     * 1620/1536kHz/8Msps entry previously existed here on the mistaken
+     * assumption that IF pairs freely with any of its BW's sample rates;
+     * confirmed by ear (noise, not the tuned station) rather than any API
+     * error, since the API accepts the combination without complaint even
+     * though the hardware's down-conversion never actually engages for
+     * it - removed entirely, not just gated out of dual mode.            */
+    { 1620,  200, 6000000.0, 3, 2000000.0, "Low-IF 1620/200kHz 6Msps->2Msps"},
+    { 1620,  300, 6000000.0, 3, 2000000.0, "Low-IF 1620/300kHz 6Msps->2Msps"},
+    { 1620,  600, 6000000.0, 3, 2000000.0, "Low-IF 1620/600kHz 6Msps->2Msps"},
+    { 1620, 1536, 6000000.0, 3, 2000000.0, "Low-IF 1620/1536kHz 6Msps->2Msps (dual, MW)"},
+    /* Low-IF 2048 kHz - internal decimation /4 for the 1536 kHz filter,
+     * output 2 Msps. A wider 5000 kHz filter is also a documented
+     * down-conversion condition at the same 8 Msps ADC rate, but its
+     * actual output rate/decimation isn't known - an earlier attempt to
+     * add it here assumed no decimation (output = full 8 Msps), which
+     * turned out to be wrong (confirmed by ear: chipmunk-pitched,
+     * chugging audio, meaning the real data rate is something other than
+     * what was declared). Not re-added without an actually-measured rate
+     * to put here - a wrong output_rate_hz doesn't just glitch the
+     * monitor, it also writes the wrong sample rate into the recorded
+     * file's own header.                                                 */
+    { 2048, 1536, 8000000.0, 4, 2000000.0, "Low-IF 2048/1536kHz 8Msps->2Msps (dual)"},
 };
 #define NUM_VALID_COMBOS (int)(sizeof(VALID_COMBOS)/sizeof(VALID_COMBOS[0]))
+
 
 /* The only centre frequencies HDR mode actually supports on RSPdx/RSPdx R2.
  * Single source of truth - used both for the live Settings dialog hint and
@@ -3851,6 +4462,23 @@ static int validate_config(Config *cfg)
         return 0;
     }
 
+    /* http_port=1 (or any other value below the traditional reserved-port
+     * threshold) almost certainly isn't what was intended - this is a
+     * genuine typo or a truncated value far more often than a deliberate
+     * choice, and the HTTP status server previously bound to it silently,
+     * with nothing to indicate anything was wrong beyond the resulting
+     * page simply being unreachable from a browser (some of these ports
+     * need administrator privileges to bind at all, and even where they
+     * don't, nothing meaningful is normally listening on them). Not
+     * treated as fatal - only warned about - since it's a monitoring
+     * convenience, not something recording itself depends on.           */
+    if (cfg->http_port > 0 && cfg->http_port < 1024) {
+        LOG_WARN("http_port=%d looks like a mistake - ports below 1024 are "
+                 "reserved and not normally usable for this. If you meant "
+                 "to enable the HTTP status server, use a port like 8080 "
+                 "instead.", cfg->http_port);
+    }
+
     /* Software decimation: validated up front (not just in the "combo not
      * found" fallback below) because it applies on top of ANY valid combo,
      * and expected_output_rate_hz below depends on it being sane. */
@@ -3862,19 +4490,50 @@ static int validate_config(Config *cfg)
         }
     }
 
+    /* Zero-IF is architecturally single-tuner only on the RSPduo: the two
+     * ADCs can only be fed simultaneously when both tuners run in Low-IF
+     * mode (SDRplay's own "Introduction to the RSPduo" documentation is
+     * explicit that dual operation is only possible if both tuners are in
+     * Low-IF mode) - there is no simultaneous-Zero-IF path at all,
+     * Coherent or Master/Slave alike. The API doesn't reject a dual
+     * Zero-IF request outright, but confirmed by ear (noise instead of
+     * the tuned station) rather than an error, so this is a hard block
+     * here rather than leaving it to be discovered mid-recording.        */
+    if (ifreq == 0 && dual) {
+        LOG_ERROR("Zero-IF (if_khz=0) cannot be used with both tuners "
+                  "active - the RSPduo can only run two tuners "
+                  "simultaneously in Low-IF mode. Use a Low-IF combination "
+                  "(if_khz=1620 or 2048), or uncheck Tuner 2 for a "
+                  "single-tuner Zero-IF session.");
+        return 0;
+    }
+
+    /* Confirmed by direct hardware testing (see MASTER_SLAVE_SR_OK's
+     * comment above VALID_COMBOS): Coherent (Dual_Tuner, same CF on both
+     * tuners) has no restriction beyond the table itself (now Low-IF only,
+     * per the check above). Master/Slave (different CF on each tuner)
+     * additionally requires the ADC rate to be exactly 6 or 8 Msps - any
+     * IF/BW at that rate is fine. Derived from frequency_hz/freq_b_hz
+     * directly (matching the same test used later once the device is
+     * open, in device setup) rather than trusting dual_channel/
+     * master_slave_active, which aren't finalised for this session at
+     * every one of validate_config()'s call sites.                       */
+    {
+        int is_master_slave = dual &&
+            (fabs(cfg->frequency_hz - cfg->freq_b_hz) > 100.0);
+
     for (i = 0; i < NUM_VALID_COMBOS; i++) {
         const ValidCombo *c = &VALID_COMBOS[i];
         if (c->if_khz == ifreq &&
             c->bw_khz == bw &&
             fabs(c->adc_rate_hz - sr) < 1000.0) {
 
-            if (dual && !c->dual_ok) {
+            if (is_master_slave && !MASTER_SLAVE_SR_OK(c->adc_rate_hz)) {
                 LOG_ERROR("Combination IF=%d kHz, BW=%d kHz, SR=%.0f sps "
-                          "is NOT valid for RSPduo dual-tuner mode.",
-                          ifreq, bw, sr);
-                LOG_ERROR("For RSPduo dual mode use:");
-                LOG_ERROR("  IF=1620 kHz, BW=1536 kHz, SR=6000000 sps  -> 2 Msps output");
-                LOG_ERROR("  IF=2048 kHz, BW=1536 kHz, SR=8000000 sps  -> 2 Msps output");
+                          "is NOT valid for RSPduo Master/Slave mode "
+                          "(different CF on each tuner) - the ADC rate "
+                          "must be exactly 6 or 8 Msps. Any IF/BW at "
+                          "6 or 8 Msps works.", ifreq, bw, sr);
                 return 0;
             }
 
@@ -3907,16 +4566,19 @@ static int validate_config(Config *cfg)
                                               : cfg->expected_output_rate_hz;
             }
 
-            LOG_INFO("Config validated: %s", c->note);
+            if (cfg->verbose)
+                LOG_INFO("Config validated: %s", c->note);
             if (c->decimation > 1)
                 if (g_state.cfg.verbose)
                     LOG_INFO("  Internal decimation /%d: output will be %.0f sps",
                          c->decimation, c->output_rate_hz);
             if (cfg->decimation > 1)
-                LOG_INFO("  Software decimation /%d: final output rate %.0f sps",
-                         cfg->decimation, cfg->expected_output_rate_hz);
+                if (cfg->verbose)
+                    LOG_INFO("  Software decimation /%d: final output rate %.0f sps",
+                             cfg->decimation, cfg->expected_output_rate_hz);
             return 1;
         }
+    }
     }
 
     /* Not found in table */
@@ -3978,6 +4640,8 @@ static void config_set_defaults(Config *cfg)
     cfg->latitude        = 0.0;
     cfg->longitude       = 0.0;
     cfg->show_sun_times  = 0;
+    cfg->show_carrier_offset = 1;
+    cfg->carrier_offset_calib_hz = 0.0;
 
     strncpy(cfg->antenna, "A", 7);  /* default to Antenna A / 50 ohm */
     cfg->bias_t         = 0;
@@ -3990,7 +4654,7 @@ static void config_set_defaults(Config *cfg)
 
     cfg->expected_output_rate_hz = 0.0; /* set by validate_config */
     cfg->expected_usable_bw_hz = 0.0;   /* set by validate_config */
-    /* Tuner B defaults - mirror Tuner A until explicitly overridden */
+    /* Tuner 2 defaults - mirror Tuner 1 until explicitly overridden */
     cfg->gain_reduction_b = -1;  /* -1 = use gain_reduction value */
     cfg->lna_state_b      = -1;  /* -1 = use lna_state value */
     cfg->agc_enable_b     = -1;
@@ -4001,7 +4665,7 @@ static void config_set_defaults(Config *cfg)
     cfg->tuner_b_settings_set = 0;
     cfg->start_time[0]    = '\0';
     cfg->spinup_enable        = 1;
-    cfg->spinup_bytes         = 1024 * 1024;
+    cfg->spinup_bytes         = SPINUP_BYTES_FIXED;
     cfg->pipe_enable          = 0;
     strncpy(cfg->pipe_name, "\\\\.\\pipe\\duodx", 127);
     cfg->http_port            = 0;
@@ -4019,7 +4683,7 @@ static void config_set_defaults(Config *cfg)
     cfg->window_w = 930;
     cfg->window_h = 660;
     cfg->window_maximized = 0;
-    strncpy(cfg->color_scheme, "navy", sizeof(cfg->color_scheme) - 1);
+    strncpy(cfg->color_scheme, "grey", sizeof(cfg->color_scheme) - 1);
     strncpy(cfg->timer_last_mode, "schedule", sizeof(cfg->timer_last_mode) - 1);
 }
 
@@ -4042,11 +4706,13 @@ static void config_load_ini(Config *cfg, const char *path)
     char line[256], key[128], val[128];
 
     if (!fp) {
-        LOG_INFO("No config file found at '%s', using defaults", path);
+        if (cfg->verbose)
+            LOG_INFO("No config file found at '%s', using defaults", path);
         return;
     }
 
-    LOG_INFO("Loading config from '%s'", path);
+    if (cfg->verbose)
+        LOG_INFO("Loading config from '%s'", path);
 
     while (fgets(line, sizeof(line), fp)) {
         trim(line);
@@ -4112,19 +4778,10 @@ static void config_load_ini(Config *cfg, const char *path)
         else if (!strcmp(key, "start_time") ||
                  !strcmp(key, "start_time_utc")) strncpy(cfg->start_time, val, 15);
         else if (!strcmp(key, "spinup_enable"))        cfg->spinup_enable = atoi(val);
-        else if (!strcmp(key, "spinup_bytes")) {
-            /* Accept plain integers or values with KB/MB suffix,
-             * e.g. "1 MB", "4MB", "512 KB", "1048576"              */
-            char *end;
-            long v = strtol(val, &end, 10);
-            while (*end == ' ') end++;
-            if (_strnicmp(end, "MB", 2) == 0)
-                v *= 1024 * 1024;
-            else if (_strnicmp(end, "KB", 2) == 0)
-                v *= 1024;
-            if (v > 0)
-                cfg->spinup_bytes = (int)v;
-        }
+        else if (!strcmp(key, "spinup_bytes"))
+            ; /* removed - spin-up size is now fixed (SPINUP_BYTES_FIXED),
+               * silently ignore rather than warn for anyone with an
+               * older ini that still has this key saved.               */
         else if (!strcmp(key, "pipe_enable"))        cfg->pipe_enable = atoi(val);
         else if (!strcmp(key, "pipe_name"))          strncpy(cfg->pipe_name, val, 127);
         else if (!strcmp(key, "http_port"))          cfg->http_port = atoi(val);
@@ -4181,6 +4838,8 @@ static void config_load_ini(Config *cfg, const char *path)
                         strncpy(e->output_file, val, MAX_PATH_LEN - 1);
                     else if (!strcmp(field, "antenna"))
                         strncpy(e->antenna, val, 7);
+                    else if (!strcmp(field, "freq_sync"))
+                        e->freq_sync = atoi(val);
                 }
             }
         }
@@ -4213,6 +4872,10 @@ static void config_load_ini(Config *cfg, const char *path)
                 cfg->output_format = FORMAT_SDRCONNECT;
             else if (!strcmp(val, "winrad") || !strcmp(val, "Winrad"))
                 cfg->output_format = FORMAT_WINRAD;
+            else if (!strcmp(val, "perseus") || !strcmp(val, "Perseus"))
+                cfg->output_format = FORMAT_PERSEUS;
+            else if (!strcmp(val, "jaguar") || !strcmp(val, "Jaguar"))
+                cfg->output_format = FORMAT_JAGUAR;
             else
                 cfg->output_format = FORMAT_LINRAD;
         }
@@ -4227,11 +4890,24 @@ static void config_load_ini(Config *cfg, const char *path)
             cfg->longitude = atof(val);
         else if (!strcmp(key, "show_sun_times"))
             cfg->show_sun_times = atoi(val) ? 1 : 0;
+        else if (!strcmp(key, "show_carrier_offset"))
+            cfg->show_carrier_offset = atoi(val) ? 1 : 0;
+        else if (!strcmp(key, "carrier_offset_calib_hz"))
+            cfg->carrier_offset_calib_hz = atof(val);
+        else if (!strcmp(key, "legacy_tuner_button"))
+            ; /* removed - Tuner 1/2 button style is no longer a choice,
+               * silently ignore rather than warn for anyone with an
+               * older ini that still has this key saved.               */
         else
             LOG_WARN("Unknown config key: '%s'", key);
     }
 
     fclose(fp);
+
+    /* Snapshot the raw parsed count before anything else (recording_worker's
+     * entry-promotion logic) has a chance to start popping schedule_count
+     * down - see the field comment on schedule_total_count for why.      */
+    cfg->schedule_total_count = cfg->schedule_count;
 }
 
 
@@ -4278,7 +4954,7 @@ static int setup_device_single(AppState *state)
     /* PPM frequency correction (0.0 = no correction; not needed with GPSDO) */
     dev->ppm = cfg->ppm;
 
-    /* Tuner A frequency */
+    /* Tuner 1 frequency */
     ch->tunerParams.rfFreq.rfHz = cfg->frequency_hz;
 
     /* IF bandwidth */
@@ -4337,7 +5013,7 @@ static int setup_device_single(AppState *state)
  * session; setup_device_single() dereferences it unconditionally, which is
  * exactly what was crashing the slave process silently (nothing logged
  * after channel selection - a NULL dereference, not a clean API error).
- * This sets only Tuner B's own channel-level fields.
+ * This sets only Tuner 2's own channel-level fields.
  * ------------------------------------------------------------------------- */
 static void setup_slave_channel_b(AppState *state)
 {
@@ -4380,7 +5056,7 @@ static int setup_device_rspduo_dual(AppState *state)
     /* PPM correction (applied device-wide) */
     dev->ppm = cfg->ppm;
 
-    /* --- Tuner A --- */
+    /* --- Tuner 1 --- */
     chA->tunerParams.rfFreq.rfHz  = cfg->frequency_hz;
     chA->tunerParams.bwType       = select_bandwidth(cfg->bw_khz);
     chA->tunerParams.ifType       = select_if(cfg->if_khz);
@@ -4394,9 +5070,9 @@ static int setup_device_rspduo_dual(AppState *state)
     chA->ctrlParams.dcOffset.DCenable = cfg->dc_correct ? 1 : 0;
     chA->ctrlParams.dcOffset.IQenable = cfg->iq_correct ? 1 : 0;
 
-    /* --- Tuner B ---
-     * Use per-tuner B overrides where set; fall back to Tuner A values.
-     * A value of -1 means "not explicitly set - use Tuner A value".       */
+    /* --- Tuner 2 ---
+     * Use per-tuner B overrides where set; fall back to Tuner 1 values.
+     * A value of -1 means "not explicitly set - use Tuner 1 value".       */
     {
         int gr_b  = (cfg->gain_reduction_b >= 0) ? cfg->gain_reduction_b : cfg->gain_reduction;
         int lna_b = (cfg->lna_state_b      >= 0) ? cfg->lna_state_b      : cfg->lna_state;
@@ -4604,7 +5280,7 @@ static void apply_antenna_and_biast(AppState *state)
         if (err != sdrplay_api_Success) {
             LOG_WARN("RSP2 antenna select failed: %s", sdrplay_api_GetErrorString(err));
         } else {
-            LOG_INFO("RSP2 antenna set to: %s", cfg->antenna);
+            if (cfg->verbose) LOG_INFO("RSP2 antenna set to: %s", cfg->antenna);
             strncpy(state->live_antenna, cfg->antenna, sizeof(state->live_antenna) - 1);
             state->live_antenna[sizeof(state->live_antenna) - 1] = '\0';
         }
@@ -4621,7 +5297,7 @@ static void apply_antenna_and_biast(AppState *state)
          * are genuinely Tuner-1-only hardware, not just a Tuner-A default:
          * the API's own field names (tuner1AmPortSel, tuner1AmNotchEnable)
          * say as much. Tuner 2 has a single fixed 50-ohm SMA input with no
-         * port-select relay at all, so none of this applies when Tuner B
+         * port-select relay at all, so none of this applies when Tuner 2
          * is the active single tuner - warn only if the user configured
          * something that assumes Tuner 1's Hi-Z port, rather than
          * silently ignoring it.                                          */
@@ -4630,17 +5306,33 @@ static void apply_antenna_and_biast(AppState *state)
                               !strcmp(cfg->antenna, "hi-z") ||
                               !strcmp(cfg->antenna, "HIZ"));
             if (wanted_hiz)
-                LOG_WARN("antenna=Hi-Z ignored - Tuner 2 (B) has no Hi-Z "
-                         "port, only Tuner 1 (A) does.");
+                LOG_WARN("antenna=Hi-Z ignored - Tuner 2 has no Hi-Z "
+                         "port, only Tuner 1 does.");
             if (cfg->hiz_notch)
                 LOG_WARN("hiz_notch=1 ignored - only meaningful on Tuner "
-                         "1 (A)'s Hi-Z port.");
+                         "1's Hi-Z port.");
             strncpy(state->live_antenna, "50ohm", sizeof(state->live_antenna) - 1);
             state->live_antenna[sizeof(state->live_antenna) - 1] = '\0';
         } else {
         int use_hiz = (!strcmp(cfg->antenna, "Hi-Z") ||
                        !strcmp(cfg->antenna, "hi-z") ||
                        !strcmp(cfg->antenna, "HIZ"));
+
+        /* Hi-Z is not available in Coherent (Dual_Tuner) mode - confirmed
+         * by SDRplay's own SDRuno documentation for the equivalent
+         * same-frequency "Diversity" mode: attempting to use the Hi-Z port
+         * there produces an error rather than being silently accepted.
+         * cfg->dual_channel is reliably 1 only for genuine Coherent mode
+         * at this point - Master/Slave already sets it back to 0 once
+         * master_slave_active is determined (see the dual_channel
+         * assignment earlier in device setup), so this check doesn't
+         * need its own separate frequency comparison.                    */
+        if (use_hiz && cfg->dual_channel) {
+            LOG_WARN("antenna=Hi-Z ignored - the Hi-Z port is not "
+                     "available in Coherent (same-frequency dual-tuner) "
+                     "mode, only the 50 ohm port. Forcing Tuner 1 to 50 ohm.");
+            use_hiz = 0;
+        }
 
         chA->rspDuoTunerParams.tuner1AmPortSel = use_hiz
             ? sdrplay_api_RspDuo_AMPORT_1   /* Hi-Z */
@@ -4654,7 +5346,11 @@ static void apply_antenna_and_biast(AppState *state)
         } else {
             if (cfg->verbose)
                 LOG_INFO("RSPduo Tuner 1 port: %s", use_hiz ? "Hi-Z" : "50 ohm");
-            strncpy(state->live_antenna, cfg->antenna, sizeof(state->live_antenna) - 1);
+            /* Reflects use_hiz (post Coherent-mode override above), not
+             * cfg->antenna directly - otherwise the status line would
+             * still claim Hi-Z after being silently forced to 50 ohm.    */
+            strncpy(state->live_antenna, use_hiz ? "Hi-Z" : "50ohm",
+                    sizeof(state->live_antenna) - 1);
             state->live_antenna[sizeof(state->live_antenna) - 1] = '\0';
         }
 
@@ -4670,7 +5366,7 @@ static void apply_antenna_and_biast(AppState *state)
                 if (err != sdrplay_api_Success)
                     LOG_WARN("RSPduo Hi-Z notch failed: %s", sdrplay_api_GetErrorString(err));
                 else
-                    LOG_INFO("RSPduo Hi-Z AM notch enabled");
+                    if (cfg->verbose) LOG_INFO("RSPduo Hi-Z AM notch enabled");
             }
         }
         }
@@ -4679,7 +5375,7 @@ static void apply_antenna_and_biast(AppState *state)
          * dual-channel mode (chB populated), or single-tuner mode with B
          * selected (chB stays NULL there regardless of which physical
          * tuner is active, same as everywhere else in this function -
-         * Tuner B's real channel struct is chA, aliased, in that case). */
+         * Tuner 2's real channel struct is chA, aliased, in that case). */
         if (cfg->bias_t) {
             if (chB != NULL) {
                 chB->rspDuoTunerParams.biasTEnable = 1;
@@ -4726,7 +5422,7 @@ static void apply_antenna_and_biast(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSP1A Bias-T failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSP1A Bias-T enabled");
+                if (cfg->verbose) LOG_INFO("RSP1A Bias-T enabled");
         }
         return;
     }
@@ -4742,13 +5438,13 @@ static void apply_antenna_and_biast(AppState *state)
 }
 
 /* -------------------------------------------------------------------------
- * apply_slave_biast_b - RSPduo Slave (Tuner B) session only.
+ * apply_slave_biast_b - RSPduo Slave (Tuner 2) session only.
  *
- * Tuner B has no AM port selector or Hi-Z notch - those are Tuner 1-only
- * concepts (Tuner B is always the plain 50-ohm SMA port). The generic
+ * Tuner 2 has no AM port selector or Hi-Z notch - those are Tuner 1-only
+ * concepts (Tuner 2 is always the plain 50-ohm SMA port). The generic
  * apply_antenna_and_biast() unconditionally applies the Tuner 1 AM port
  * setting to whatever ch_a_params points at, which for a Slave session is
- * actually Tuner B's own channel struct - producing a harmless but
+ * actually Tuner 2's own channel struct - producing a harmless but
  * confusing sdrplay_api_OutOfRange warning. Only Bias-T applies here.
  * ------------------------------------------------------------------------- */
 static void apply_slave_biast_b(AppState *state)
@@ -4764,7 +5460,7 @@ static void apply_slave_biast_b(AppState *state)
             LOG_WARN("Slave: RSPduo Tuner 2 Bias-T failed: %s",
                      sdrplay_api_GetErrorString(err));
         else
-            LOG_INFO("Slave: RSPduo Tuner 2 Bias-T enabled");
+            if (cfg->verbose) LOG_INFO("Slave: RSPduo Tuner 2 Bias-T enabled");
     }
 }
 
@@ -4809,7 +5505,7 @@ static void apply_notch_filters(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSP1A RF notch failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSP1A RF notch enabled");
+                if (cfg->verbose) LOG_INFO("RSP1A RF notch enabled");
         }
         if (cfg->notch_dab) {
             dp->rsp1aParams.rfDabNotchEnable = 1;
@@ -4819,7 +5515,7 @@ static void apply_notch_filters(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSP1A DAB notch failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSP1A DAB notch enabled");
+                if (cfg->verbose) LOG_INFO("RSP1A DAB notch enabled");
         }
         return;
     }
@@ -4835,7 +5531,7 @@ static void apply_notch_filters(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSP2 RF notch failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSP2 RF notch enabled");
+                if (cfg->verbose) LOG_INFO("RSP2 RF notch enabled");
         }
         if (cfg->notch_dab)
             LOG_WARN("RSP2 does not support DAB notch filter - ignored");
@@ -4843,15 +5539,15 @@ static void apply_notch_filters(AppState *state)
     }
 
     /* --- RSPduo ---
-     * Tuner A and Tuner B notch filters are independent.              */
+     * Tuner 1 and Tuner 2 notch filters are independent.              */
     if (hw == SDRPLAY_RSPduo_ID) {
-        /* Resolve Tuner B notch values (fall back to A if not set) */
+        /* Resolve Tuner 2 notch values (fall back to A if not set) */
         int rf_b  = (cfg->notch_rf_b  >= 0) ? cfg->notch_rf_b  : cfg->notch_rf;
         int dab_b = (cfg->notch_dab_b >= 0) ? cfg->notch_dab_b : cfg->notch_dab;
 
-        /* Primary tuner's notches (ch_a_params) - Tuner B only when
-         * single-tuner mode has selected it; Tuner A in every other case,
-         * including dual mode, where the Tuner B block below handles the
+        /* Primary tuner's notches (ch_a_params) - Tuner 2 only when
+         * single-tuner mode has selected it; Tuner 1 in every other case,
+         * including dual mode, where the Tuner 2 block below handles the
          * other channel via its own explicit selector.                   */
         sdrplay_api_TunerSelectT prim_tuner =
             (state->device.tuner == sdrplay_api_Tuner_B)
@@ -4880,7 +5576,7 @@ static void apply_notch_filters(AppState *state)
                 if (cfg->verbose)
                     LOG_INFO("RSPduo Tuner %s DAB notch enabled", prim_name);
         }
-        /* Tuner B notches (only meaningful in dual-channel mode) */
+        /* Tuner 2 notches (only meaningful in dual-channel mode) */
         if (cfg->dual_channel && state->ch_b_params) {
             if (rf_b) {
                 state->ch_b_params->rspDuoTunerParams.rfNotchEnable = 1;
@@ -4891,7 +5587,7 @@ static void apply_notch_filters(AppState *state)
                     LOG_WARN("RSPduo T2 RF notch failed: %s", sdrplay_api_GetErrorString(err));
                 else
                     if (cfg->verbose)
-                        LOG_INFO("RSPduo Tuner B RF notch enabled");
+                        LOG_INFO("RSPduo Tuner 2 RF notch enabled");
             }
             if (dab_b) {
                 state->ch_b_params->rspDuoTunerParams.rfDabNotchEnable = 1;
@@ -4902,7 +5598,7 @@ static void apply_notch_filters(AppState *state)
                     LOG_WARN("RSPduo T2 DAB notch failed: %s", sdrplay_api_GetErrorString(err));
                 else
                     if (cfg->verbose)
-                        LOG_INFO("RSPduo Tuner B DAB notch enabled");
+                        LOG_INFO("RSPduo Tuner 2 DAB notch enabled");
             }
         }
         return;
@@ -4920,7 +5616,7 @@ static void apply_notch_filters(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSPdx RF notch failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSPdx RF notch enabled");
+                if (cfg->verbose) LOG_INFO("RSPdx RF notch enabled");
         }
         if (cfg->notch_dab) {
             dp->rspDxParams.rfDabNotchEnable = 1;
@@ -4930,7 +5626,7 @@ static void apply_notch_filters(AppState *state)
             if (err != sdrplay_api_Success)
                 LOG_WARN("RSPdx DAB notch failed: %s", sdrplay_api_GetErrorString(err));
             else
-                LOG_INFO("RSPdx DAB notch enabled");
+                if (cfg->verbose) LOG_INFO("RSPdx DAB notch enabled");
         }
         return;
     }
@@ -4969,6 +5665,32 @@ static void format_duration_hms(int total_sec, char *out, size_t out_size)
     m = (total_sec % 3600) / 60;
     s = total_sec % 60;
     snprintf(out, out_size, "%02d:%02d:%02d", h, m, s);
+}
+
+/* Formats a frequency in Hz as MHz for display in a Frequency field
+ * (Receiver tab, Schedule tab), always showing at least 3 decimal
+ * places - so 1 MHz reads "1.000" rather than a bare "1", matching the
+ * kHz-level precision this hobby normally tunes to - while still
+ * showing genuine extra precision beyond that rather than truncating
+ * it: 1.6115 MHz stays "1.6115", not rounded down to "1.612" or "1.611".
+ * %.6f (6 decimal places = 1 Hz resolution, comfortably beyond anything
+ * meaningful here) is the starting point; trailing zeros are then
+ * stripped back down to, but never past, 3 decimal places.             */
+static void format_mhz_min3(double hz, char *buf, size_t bufsize)
+{
+    char tmp[32];
+    char *dot;
+    int len;
+    snprintf(tmp, sizeof(tmp), "%.6f", hz / 1e6);
+    dot = strchr(tmp, '.');
+    len = (int)strlen(tmp);
+    if (dot) {
+        int min_len = (int)(dot - tmp) + 1 + 3;   /* dot + 3 decimal digits */
+        while (len > min_len && tmp[len - 1] == '0')
+            tmp[--len] = '\0';
+    }
+    strncpy(buf, tmp, bufsize - 1);
+    buf[bufsize - 1] = '\0';
 }
 
 static int time_already_passed(const char *time_str)
@@ -5035,8 +5757,12 @@ static int wait_until_time(const char *time_str, int between_recordings)
         }
 
         /* GUI build: countdown shown via g_state.next_start in status bar */
+        EnterCriticalSection(&g_next_lock);
         snprintf(g_state.next_start, sizeof(g_state.next_start),
                  "%02d:%02d:%02d", target_h, target_m, target_s);
+        compute_stop_hms(g_state.next_start, g_state.cfg.duration_sec,
+                          g_state.next_stop, sizeof(g_state.next_stop));
+        LeaveCriticalSection(&g_next_lock);
         if (!g_worker_active) {
             snprintf(g_ui.sched, sizeof(g_ui.sched),
                      "Waiting: scheduled start %02d:%02d:%02d",
@@ -5058,52 +5784,77 @@ static int wait_until_time(const char *time_str, int between_recordings)
 /* =========================================================================
  * Apply a schedule entry to the live hardware
  *
- * Updates frequency (and Tuner B frequency in dual mode) via
+ * Updates frequency (and Tuner 2 frequency in dual mode) via
  * sdrplay_api_Update() without stopping the stream. Called between
  * recordings in a multi-recording schedule.
  * ========================================================================= */
 static void apply_schedule_entry(AppState *state, const ScheduleEntry *e)
 {
     sdrplay_api_ErrT err;
+    /* freq_sync means "ignore this entry's own stored frequency and use
+     * the Receiver tab's baseline CF instead, re-read fresh right now" -
+     * substituted in before anything below even looks at e->frequency_hz/
+     * freq_b_hz, so the rest of this function doesn't need its own
+     * special-casing for it. See baseline_frequency_hz's own comment on
+     * AppState for why that, and not cfg.frequency_hz, is the right
+     * thing to read here.                                                */
+    double eff_frequency_hz = e->freq_sync ? state->baseline_frequency_hz : e->frequency_hz;
+    double eff_freq_b_hz    = e->freq_sync ? state->baseline_freq_b_hz   : e->freq_b_hz;
 
-    if (e->frequency_hz > 0.0) {
-        const char *tname = (state->device.tuner == sdrplay_api_Tuner_B) ? "B" : "A";
-        state->cfg.frequency_hz = e->frequency_hz;
+    if (eff_frequency_hz > 0.0) {
+        const char *tname = (state->device.tuner == sdrplay_api_Tuner_B) ? "2" : "1";
+        state->cfg.frequency_hz = eff_frequency_hz;
         if (state->stream_running) {
-            state->ch_a_params->tunerParams.rfFreq.rfHz = e->frequency_hz;
+            state->ch_a_params->tunerParams.rfFreq.rfHz = eff_frequency_hz;
             err = sdrplay_api_Update(state->device.dev, state->device.tuner,
                                      sdrplay_api_Update_Tuner_Frf,
                                      sdrplay_api_Update_Ext1_None);
             if (err == sdrplay_api_Success)
-                LOG_INFO("Schedule: Tuner %s frequency set to %.6f MHz",
-                         tname, e->frequency_hz / 1e6);
+                LOG_INFO("Schedule: Tuner %s frequency set to %.6f MHz%s",
+                         tname, eff_frequency_hz / 1e6, e->freq_sync ? " (synced to Receiver tab)" : "");
             else
                 LOG_WARN("Schedule: Tuner %s frequency update failed: %s",
                          tname, sdrplay_api_GetErrorString(err));
         } else {
-            LOG_INFO("Schedule: Tuner %s frequency will be %.6f MHz",
-                     tname, e->frequency_hz / 1e6);
+            LOG_INFO("Schedule: Tuner %s frequency will be %.6f MHz%s",
+                     tname, eff_frequency_hz / 1e6, e->freq_sync ? " (synced to Receiver tab)" : "");
         }
     }
 
-    if (state->cfg.dual_channel && e->freq_b_hz > 0.0
+    if (state->cfg.dual_channel && eff_freq_b_hz > 0.0
             && state->ch_b_params) {
-        state->cfg.freq_b_hz = e->freq_b_hz;
+        state->cfg.freq_b_hz = eff_freq_b_hz;
         if (state->stream_running) {
-            state->ch_b_params->tunerParams.rfFreq.rfHz = e->freq_b_hz;
+            state->ch_b_params->tunerParams.rfFreq.rfHz = eff_freq_b_hz;
             err = sdrplay_api_Update(state->device.dev, sdrplay_api_Tuner_B,
                                      sdrplay_api_Update_Tuner_Frf,
                                      sdrplay_api_Update_Ext1_None);
             if (err == sdrplay_api_Success)
-                LOG_INFO("Schedule: Tuner B frequency set to %.6f MHz",
-                         e->freq_b_hz / 1e6);
+                LOG_INFO("Schedule: Tuner 2 frequency set to %.6f MHz%s",
+                         eff_freq_b_hz / 1e6, e->freq_sync ? " (synced to Receiver tab)" : "");
             else
-                LOG_WARN("Schedule: Tuner B frequency update failed: %s",
+                LOG_WARN("Schedule: Tuner 2 frequency update failed: %s",
                          sdrplay_api_GetErrorString(err));
         } else {
-            LOG_INFO("Schedule: Tuner B frequency will be %.6f MHz",
-                     e->freq_b_hz / 1e6);
+            LOG_INFO("Schedule: Tuner 2 frequency will be %.6f MHz%s",
+                     eff_freq_b_hz / 1e6, e->freq_sync ? " (synced to Receiver tab)" : "");
         }
+    } else if (state->cfg.dual_channel && eff_freq_b_hz <= 0.0) {
+        /* Same reasoning as the identical fix at the schedule_1
+         * promotion site (Section 8) - a blank Tuner 2 field for this
+         * entry means "record Tuner 1 only", not "keep using whatever
+         * Tuner 2 frequency the previous entry (or the base config) left
+         * behind". stream_running is always false here (the stream is
+         * stopped between schedule entries, per this function's own
+         * comment), so there's nothing live to unwind - the next Init
+         * at Step 8 picks this up correctly on its own. Also clears
+         * master_slave_active if a preceding entry had it set - this
+         * entry's own blank Tuner 2 field means single-tuner for real,
+         * not Master/Slave continuing with a stale flag.                */
+        state->cfg.dual_channel = 0;
+        state->master_slave_active = 0;
+        LOG_INFO("Schedule: Tuner 2 frequency not specified - recording "
+                 "Tuner 1 only.");
     }
 
     /* Update antenna if specified */
@@ -5134,10 +5885,13 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
         return;
     }
 
-    /* SDRuno, Winrad, and SDR Connect: RIFF ChunkSize was patched before
-     * CloseHandle. Read it back and compare to expected from sample count. */
+    /* SDRuno, Winrad, Perseus, Jaguar, and SDR Connect: RIFF ChunkSize was
+     * patched before CloseHandle. Read it back and compare to expected
+     * from sample count.                                                   */
     if (cfg->output_format == FORMAT_SDRUNO ||
             cfg->output_format == FORMAT_WINRAD ||
+            cfg->output_format == FORMAT_PERSEUS ||
+            cfg->output_format == FORMAT_JAGUAR ||
             cfg->output_format == FORMAT_SDRCONNECT) {
         HANDLE fh2 = CreateFileA(cfg->output_file, GENERIC_READ, FILE_SHARE_READ,
                                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -5160,6 +5914,8 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
         else if (cfg->output_format == FORMAT_WINRAD)
             hdr_sz = (cfg->large_file_mode == LARGE_FILE_RF64)
                      ? (int64_t)sizeof(SDRunoRF64Header) : 216;
+        else if (cfg->output_format == FORMAT_PERSEUS || cfg->output_format == FORMAT_JAGUAR)
+            hdr_sz = (int64_t)sizeof(PerseusHeader); /* never RF64 either */
         else /* FORMAT_SDRCONNECT */
             hdr_sz = (cfg->large_file_mode == LARGE_FILE_RF64)
                      ? (int64_t)sizeof(SDRConnectRF64Header) : 80;
@@ -5224,31 +5980,17 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
      * Dual   = 4 channels (IA,QA,IB,QB) * 2 = 8 bytes              */
     int     bytes_per_frame  = hdr.rx_ad_channels * 2;
     int64_t header_bytes     = (int64_t)sizeof(LinradRawHeader);
-    int64_t data_bytes       = file_size.QuadPart - header_bytes;
-    int64_t actual_samples   = (bytes_per_frame > 0)
-                               ? data_bytes / bytes_per_frame : 0;
-    double  actual_duration  = (hdr.rx_ad_speed > 0)
-                               ? (double)actual_samples / hdr.rx_ad_speed : 0.0;
 
     /* Expected file size from the writer's sample count */
     int64_t expected_data    = samples_written * bytes_per_frame;
     int64_t expected_total   = header_bytes + expected_data;
     int64_t diff             = file_size.QuadPart - expected_total;
 
-    /* Round (not truncate) the reported total: a 40 s recording captures very
-     * slightly under 40 s of samples (the loop stops at the threshold), so
-     * truncation would display 39. Rounding restores the requested figure. */
-    long total_s = (long)(actual_duration + 0.5);
-    int exp_h = (int)(total_s / 3600);
-    int exp_m = (int)((total_s % 3600) / 60);
-    int exp_s = (int)(total_s % 60);
-
     if (cfg->verbose)
         LOG_INFO("Verifying file: %s", cfg->output_file);
 
     if (diff == 0) {
-        LOG_OK("Verification PASSED - Total duration: %02d:%02d:%02d.",
-               exp_h, exp_m, exp_s);
+        LOG_OK("Verification PASSED (%lld bytes).", (long long)expected_total);
     } else if (diff < 0) {
         LOG_WARN("Verification WARNING - file is %lld bytes SHORT of expected "
                  "(%lld). Recording may be truncated.",
@@ -5260,7 +6002,7 @@ static void verify_recording(const Config *cfg, LONG64 samples_written)
     }
 }
 
-/* Closes and verifies output_file_b (Tuner B's separate file, dual-separate-
+/* Closes and verifies output_file_b (Tuner 2's separate file, dual-separate-
  * files mode only). verify_recording() is fully self-describing from the
  * file's own header, so it just needs cfg->output_file pointed at file B
  * momentarily - restored afterwards. Safe to call unconditionally; no-ops
@@ -5329,7 +6071,6 @@ static DWORD WINAPI http_worker(LPVOID param)
     int    dwarn      = state->disk_warn_issued;
     int    dstop      = state->disk_stop;
     LONG64 disk_free  = state->disk_free_mb;
-    int    dual       = state->cfg.dual_channel;
 
     LONG64 file_bytes = 0;
     if (state->stream_running) {
@@ -5362,6 +6103,7 @@ static DWORD WINAPI http_worker(LPVOID param)
             /* Serve the pre-built frozen JSON - safe after SDRplay cleanup */
             body = state->frozen_json;
         } else {
+            int dual = state->cfg.dual_channel;
             snprintf(live_body, sizeof(live_body),
                 "{\"elapsed_sec\":%.1f,\"file_mb\":%.1f,\"disk_free_mb\":%lld,"
                 "\"overflows\":%ld,\"zero_frames\":%lld,"
@@ -5410,9 +6152,9 @@ static DWORD WINAPI http_worker(LPVOID param)
 "<div class='card'><div class='label'>Elapsed</div><div class='val' id='elapsed'>--</div></div>\n"
 "<div class='card'><div class='label'>File size</div><div class='val' id='filesize'>--</div></div>\n"
 "<div class='card'><div class='label'>Disk free</div><div class='val' id='diskfree'>--</div></div>\n"
-"<div class='card'><div class='label'>Signal A (dBFS)</div><div class='val' id='sigA'>--</div>"
+"<div class='card'><div class='label'>Signal 1 (dBFS)</div><div class='val' id='sigA'>--</div>"
 "<div class='bar-wrap'><div class='bar' id='barA' style='width:0%;background:#4af;'></div></div></div>\n"
-"<div class='card' id='cardB' style='display:none'><div class='label'>Signal B (dBFS)</div>"
+"<div class='card' id='cardB' style='display:none'><div class='label'>Signal 2 (dBFS)</div>"
 "<div class='val' id='sigB'>--</div>"
 "<div class='bar-wrap'><div class='bar' id='barB' style='width:0%;background:#4af;'></div></div></div>\n"
 "<div class='card'><div class='label'>Overflows</div><div class='val' id='ovf'>--</div></div>\n"
@@ -5473,8 +6215,8 @@ static DWORD WINAPI http_worker(LPVOID param)
 "      agcEl.textContent=d.agc_on?'ON':'OFF';agcEl.className='val '+(d.agc_on?'warn':'ok');\n"
 "    }\n"
 "    var alerts=[];\n"
-"    if(d.overload_a)alerts.push('OVL-A');\n"
-"    if(d.overload_b)alerts.push('OVL-B');\n"
+"    if(d.overload_a)alerts.push('OVL-1');\n"
+"    if(d.overload_b)alerts.push('OVL-2');\n"
 "    if(d.writer_error)alerts.push('WRITE ERR');\n"
 "    if(d.disk_stop)alerts.push('DISK FULL');\n"
 "    var aEl=document.getElementById('alerts');\n"
@@ -5486,7 +6228,7 @@ static DWORD WINAPI http_worker(LPVOID param)
 "poll();setInterval(poll,";
         const char *html2 = ");\n</script></body></html>\n";
         char interval_str[16];
-        snprintf(interval_str, sizeof(interval_str), "%d", state->cfg.http_interval_ms);
+        snprintf(interval_str, sizeof(interval_str), "%d", g_http_interval_ms_snapshot);
         const char *hdr = "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nConnection: close\r\n\r\n";
         send(sock, hdr, (int)strlen(hdr), 0);
         send(sock, html, (int)strlen(html), 0);
@@ -5505,6 +6247,7 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
     struct sockaddr_in addr;
     WSADATA wsa;
     int port = state->cfg.http_port;
+    g_http_interval_ms_snapshot = state->cfg.http_interval_ms;
 
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
         LOG_WARN("[HTTP] WSAStartup failed (%d)", WSAGetLastError()); return 1;
@@ -5529,7 +6272,8 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
     { u_long nb=1; ioctlsocket(listen_sock, FIONBIO, &nb); }
 
     Sleep(100);  /* brief delay so message doesn't interrupt countdown line */
-    LOG_INFO("[HTTP] Status server listening on port %d", port);
+    if (g_state.cfg.verbose)
+        LOG_INFO("[HTTP] Status server listening on port %d", port);
     g_http_ready = 1;
 
     while (g_http_running) {
@@ -5558,6 +6302,35 @@ static DWORD WINAPI http_status_thread_func(LPVOID param)
     return 0;
 }
 
+/* Delayed HTTP server shutdown - see the call site in recording_worker()'s
+ * cleanup for why this needs to run detached, on its own thread, rather
+ * than as a plain Sleep() in recording_worker() itself: some callers
+ * (gui_stop_session(1), used for a couple of restart transitions) block
+ * synchronously waiting for the worker thread to fully exit, and a Sleep()
+ * in that thread's own shutdown path would have added the same delay to
+ * those - turning what should be a quick restart into one with a multi-
+ * second UI freeze whenever the HTTP dashboard happens to be enabled.
+ * This thread owns joining and closing the accept-loop thread handle too,
+ * since that thread won't actually exit its loop until the delayed
+ * g_http_running=0 below happens.                                        */
+typedef struct {
+    HANDLE http_thread;
+    DWORD  delay_ms;
+} HttpDelayedStop;
+
+static DWORD WINAPI http_delayed_stop_thread_func(LPVOID param)
+{
+    HttpDelayedStop *p = (HttpDelayedStop *)param;
+    Sleep(p->delay_ms);
+    g_http_running = 0;
+    if (p->http_thread) {
+        WaitForSingleObject(p->http_thread, 2000);
+        CloseHandle(p->http_thread);
+    }
+    free(p);
+    return 0;
+}
+
 /* =========================================================================
  * Hourly recording mode helpers
  * ========================================================================= */
@@ -5569,6 +6342,31 @@ static int hhmm_to_min(const char *s)
     if (sscanf(s, "%d:%d", &h, &m) != 2) return -1;
     if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
     return h * 60 + m;
+}
+
+/* Adds duration_sec to a start time given as HH:MM or HH:MM:SS, wrapping
+ * at midnight, and writes the result as HH:MM:SS. Used to derive a
+ * matching stop time for the scheduling display (Section 3.2) - shown
+ * alongside the start time so both ends of a scheduled recording are
+ * visible at a glance rather than just when it begins. Leaves *out empty
+ * if duration_sec is not a genuine fixed duration (<= 0, meaning "runs
+ * until the next entry" or unlimited), since there is no fixed stop time
+ * to show in that case. */
+static void compute_stop_hms(const char *start_hms, int duration_sec,
+                              char *out, size_t out_sz)
+{
+    int h = 0, m = 0, s = 0;
+    out[0] = '\0';
+    if (duration_sec <= 0 || !start_hms || !start_hms[0]) return;
+    if (sscanf(start_hms, "%d:%d:%d", &h, &m, &s) < 2) return;
+    if (h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59) return;
+    {
+        long total = (long)h * 3600 + (long)m * 60 + s + duration_sec;
+        total %= 86400;
+        if (total < 0) total += 86400;
+        snprintf(out, out_sz, "%02ld:%02ld:%02ld",
+                 total / 3600, (total / 60) % 60, total % 60);
+    }
 }
 
 /* Current time as minutes since midnight */
@@ -5599,8 +6397,8 @@ static int now_min(void)
  * Accurate to roughly a minute, which is plenty for an informational
  * display tile - this is not intended for precision astronomical use.
  *
- * Returns 1 with *sunrise_min_utc/*sunset_min_utc set to minutes-since-
- * midnight-UTC for the given calendar date (can be negative or >1440;
+ * Returns 1 with sunrise_min_utc/sunset_min_utc (via the out-params) set
+ * to minutes-since-midnight-UTC for the given calendar date (can be negative or >1440;
  * the caller wraps to the correct clock time), or 0 if the sun doesn't
  * rise/set at all that day at this latitude (polar day or polar night),
  * in which case both outputs are set to -1.
@@ -5642,26 +6440,65 @@ static int calc_sun_times(int year, int month, int day,
  * displayed in local or UTC time matching cfg->use_utc - the same
  * convention the rest of the app's clock/logging already uses. Falls
  * back to "--:--" for polar day/night at extreme latitudes.             */
+/* Adds exactly one calendar day to *st, correctly handling month/year
+ * rollover (including leap years) via FILETIME arithmetic rather than
+ * hand-rolled month-length logic.                                        */
+static void add_one_day(SYSTEMTIME *st)
+{
+    FILETIME ft;
+    ULARGE_INTEGER ull;
+    SystemTimeToFileTime(st, &ft);
+    ull.LowPart  = ft.dwLowDateTime;
+    ull.HighPart = ft.dwHighDateTime;
+    ull.QuadPart += 864000000000ULL;   /* 24 hours, in 100ns units */
+    ft.dwLowDateTime  = ull.LowPart;
+    ft.dwHighDateTime = ull.HighPart;
+    FileTimeToSystemTime(&ft, st);
+}
+
+/* Formats tomorrow's sunrise and today's sunset as "HH:MM" strings for the
+ * SUN tile, in local or UTC time matching cfg->use_utc - the same
+ * convention the rest of the app's clock/logging already uses.
+ *
+ * Sunrise is deliberately calculated for the FOLLOWING morning rather than
+ * today's: by the time anyone glances at this tile, today's own sunrise
+ * has very likely already passed and is just a stale, useless number -
+ * the sunrise actually still ahead of you is tomorrow's. Sunset stays on
+ * today's date, since that one is still genuinely upcoming (or just
+ * passed) for most of the day, matching how it already worked.
+ *
+ * Falls back to "--:--" for polar day/night at extreme latitudes -
+ * sunrise and sunset are checked independently, since it's possible for
+ * one to still exist while the other doesn't right at a polar transition.
+ * ========================================================================= */
 static void get_sun_times_str(const Config *cfg,
                                char *sunrise_str, size_t sunrise_len,
                                char *sunset_str,  size_t sunset_len)
 {
-    SYSTEMTIME st;
-    double sunrise_min, sunset_min;
+    SYSTEMTIME st, st_tomorrow;
+    double sunrise_min, sunset_min, unused_min;
+    int sunrise_ok, sunset_ok;
 
     get_timestamp(&st); /* today's date, in whichever zone cfg->use_utc selects */
+    st_tomorrow = st;
+    add_one_day(&st_tomorrow);
 
-    /* calc_sun_times() works from a UTC calendar date; using "today" in
-     * the display's own zone rather than converting to a true UTC date is
-     * a deliberate simplification - right at a local midnight this could
-     * shift the result by under a minute, which doesn't matter for a
-     * display-only feature and avoids a full calendar-date conversion.   */
-    if (!calc_sun_times(st.wYear, st.wMonth, st.wDay, cfg->latitude, cfg->longitude,
-                         &sunrise_min, &sunset_min)) {
-        snprintf(sunrise_str, sunrise_len, "--:--");
-        snprintf(sunset_str,  sunset_len,  "--:--");
-        return;
-    }
+    /* calc_sun_times() works from a UTC calendar date; using "today"/
+     * "tomorrow" in the display's own zone rather than converting to a
+     * true UTC date is a deliberate simplification - right at a local
+     * midnight this could shift a result by under a minute, which doesn't
+     * matter for a display-only feature and avoids a full calendar-date
+     * conversion.                                                        */
+    sunset_ok  = calc_sun_times(st.wYear, st.wMonth, st.wDay,
+                                cfg->latitude, cfg->longitude,
+                                &unused_min, &sunset_min);
+    sunrise_ok = calc_sun_times(st_tomorrow.wYear, st_tomorrow.wMonth, st_tomorrow.wDay,
+                                cfg->latitude, cfg->longitude,
+                                &sunrise_min, &unused_min);
+
+    if (!sunrise_ok) snprintf(sunrise_str, sunrise_len, "--:--");
+    if (!sunset_ok)  snprintf(sunset_str,  sunset_len,  "--:--");
+    if (!sunrise_ok && !sunset_ok) return;
 
     if (!cfg->use_utc) {
         TIME_ZONE_INFORMATION tzi;
@@ -5673,11 +6510,13 @@ static void get_sun_times_str(const Config *cfg,
         sunset_min  -= bias_min;
     }
 
-    {
+    if (sunrise_ok) {
         int sr = ((int)floor(sunrise_min) % 1440 + 1440) % 1440;
-        int ss = ((int)floor(sunset_min)  % 1440 + 1440) % 1440;
         snprintf(sunrise_str, sunrise_len, "%02d:%02d", sr / 60, sr % 60);
-        snprintf(sunset_str,  sunset_len,  "%02d:%02d", ss / 60, ss % 60);
+    }
+    if (sunset_ok) {
+        int ss = ((int)floor(sunset_min) % 1440 + 1440) % 1440;
+        snprintf(sunset_str, sunset_len, "%02d:%02d", ss / 60, ss % 60);
     }
 }
 
@@ -5757,8 +6596,11 @@ static int hourly_wait_for_next(int half_win_sec)
         int disp_m  = (top_sec % 3600) / 60;
         int disp_s  = top_sec % 60;
 
+        EnterCriticalSection(&g_next_lock);
         snprintf(g_state.next_start, sizeof(g_state.next_start),
                  "%02d:%02d:%02d", disp_h, disp_m, disp_s);
+        g_state.next_stop[0] = '\0';  /* hourly has no fixed stop time to show */
+        LeaveCriticalSection(&g_next_lock);
 
         /* Update the GUI scheduling text directly so it shows while the
          * monitor thread is not running (between hourly recordings).     */
@@ -5784,25 +6626,54 @@ static int hourly_wait_for_next(int half_win_sec)
  * where the next hourly window opens without looping or sleeping, since
  * nothing is actually waiting yet when this runs (no session started).
  * Writes "HH:MM" into out, or "now" if a window is already open.        */
-static void hourly_next_window_text(char *out, size_t out_sz, int window_min)
+static void hourly_next_window_text(char *out, size_t out_sz, int window_min,
+                                     const char *hourly_start_str,
+                                     const char *hourly_stop_str)
 {
     int half_win_sec = (window_min * 60) / 2;
     int cur_sec  = now_sec();
-    int sec_past = cur_sec % 3600;
-    int pre_sec  = 3600 - half_win_sec;
-    int secs_to_next, top_sec, disp_h, disp_m, hour_boundary;
+    int start_min = hhmm_to_min(hourly_start_str);
+    int stop_min  = hhmm_to_min(hourly_stop_str);
 
-    if (sec_past >= pre_sec || sec_past < half_win_sec) {
-        snprintf(out, out_sz, "now");
-        return;
+    /* Same two-tier check the real wait (recording_worker) uses: is "now"
+     * within the configured nightly session, once the pre-record offset
+     * is folded into the session's own start? If not - e.g. it's mid-
+     * afternoon and the session doesn't open until this evening - the
+     * next actual window is the session's own opening time, not merely
+     * the next top-of-hour, which could be many hours before the session
+     * even starts and was never going to record anything (this was the
+     * bug: showing "next 11:00" while a session configured for 18:00-
+     * 06:00 wouldn't open until that evening at all).                   */
+    if (start_min >= 0 && stop_min >= 0) {
+        int start_sec_midnight = start_min * 60 - half_win_sec;
+        if (start_sec_midnight < 0) start_sec_midnight += 86400;
+        int eff_start_min = start_sec_midnight / 60;
+        if (!hourly_in_session(eff_start_min, stop_min)) {
+            int eff_start_sec = start_min * 60 - half_win_sec;
+            if (eff_start_sec < 0) eff_start_sec += 86400;
+            snprintf(out, out_sz, "%02d:%02d",
+                     (eff_start_sec / 3600) % 24, (eff_start_sec % 3600) / 60);
+            return;
+        }
     }
-    secs_to_next = (sec_past < pre_sec) ? (pre_sec - sec_past)
-                                         : (3600 - sec_past + pre_sec);
-    top_sec = (cur_sec + secs_to_next) % 86400;
-    disp_h  = top_sec / 3600;
-    disp_m  = (top_sec % 3600) / 60;
-    hour_boundary = ((disp_h * 60 + disp_m + (half_win_sec / 60)) % (24 * 60));
-    snprintf(out, out_sz, "%02d:%02d", hour_boundary / 60, hour_boundary % 60);
+
+    {
+        int sec_past = cur_sec % 3600;
+        int pre_sec  = 3600 - half_win_sec;
+        int secs_to_next, top_sec, disp_h, disp_m, hour_boundary;
+
+        if (sec_past >= pre_sec || sec_past < half_win_sec) {
+            snprintf(out, out_sz, "now");
+            return;
+        }
+        secs_to_next = (sec_past < pre_sec) ? (pre_sec - sec_past)
+                                             : (3600 - sec_past + pre_sec);
+        top_sec = (cur_sec + secs_to_next) % 86400;
+        disp_h  = top_sec / 3600;
+        disp_m  = (top_sec % 3600) / 60;
+        hour_boundary = ((disp_h * 60 + disp_m + (half_win_sec / 60)) % (24 * 60));
+        snprintf(out, out_sz, "%02d:%02d", hour_boundary / 60, hour_boundary % 60);
+    }
 }
 
 /* Shared Timer status text, shown near the Timer button (Section 3) -
@@ -5817,29 +6688,30 @@ static void gui_format_timer_idle_text(char *out, size_t out_sz)
     Config *cfg = &g_state.cfg;
     if (cfg->hourly_enable) {
         char next[16];
-        hourly_next_window_text(next, sizeof(next), cfg->hourly_window_min);
-        snprintf(out, out_sz, "HOURLY (next): %s", next);
+        hourly_next_window_text(next, sizeof(next), cfg->hourly_window_min,
+                                 cfg->hourly_start, cfg->hourly_stop);
+        snprintf(out, out_sz, "Scheduled (hourly): %d min  next %s",
+                 cfg->hourly_window_min, next);
     } else if (cfg->schedule_only) {
-        if (cfg->schedule_count > 0) {
+        if (cfg->schedule_total_count > 0) {
             const ScheduleEntry *e = &cfg->schedule[0];
-            char start[6];
-            snprintf(start, sizeof(start), "%.5s", e->start_time);
+            char start[9];
+            snprintf(start, sizeof(start), "%.8s", e->start_time);
             if (e->duration_sec > 0) {
-                int start_min = hhmm_to_min(e->start_time);
-                int end_min = start_min >= 0
-                    ? (start_min + e->duration_sec / 60) % (24 * 60) : -1;
-                if (end_min >= 0) {
-                    snprintf(out, out_sz, "SCHEDULED: %s-%02d:%02d  (%d entr%s)",
-                             start, end_min / 60, end_min % 60,
-                             cfg->schedule_count,
-                             cfg->schedule_count == 1 ? "y" : "ies");
+                char stop[16];
+                compute_stop_hms(e->start_time, e->duration_sec, stop, sizeof(stop));
+                if (stop[0]) {
+                    snprintf(out, out_sz, "Scheduled: %s-%s  (%d entr%s)",
+                             start, stop,
+                             cfg->schedule_total_count,
+                             cfg->schedule_total_count == 1 ? "y" : "ies");
                     return;
                 }
             }
-            snprintf(out, out_sz, "SCHEDULED: %s  (%d entr%s)", start,
-                     cfg->schedule_count, cfg->schedule_count == 1 ? "y" : "ies");
+            snprintf(out, out_sz, "Scheduled: starts %s  (%d entr%s)", start,
+                     cfg->schedule_total_count, cfg->schedule_total_count == 1 ? "y" : "ies");
         } else {
-            snprintf(out, out_sz, "SCHEDULED: no entries configured");
+            snprintf(out, out_sz, "Scheduled: no entries configured");
         }
     } else {
         out[0] = '\0';
@@ -5884,6 +6756,16 @@ static DWORD WINAPI recording_worker(LPVOID param)
 
     /* Fresh run: clear the stop flags so repeated Start presses work. */
     g_running      = 1;
+    if (g_http_delayed_stop_handle) {
+        /* A previous session's HTTP server may still be in its shutdown
+         * grace period (up to 6s) - see the handle's own declaration
+         * comment for why this needs to fully finish, not just be
+         * signalled, before this session touches g_http_running or
+         * starts its own accept loop.                                   */
+        WaitForSingleObject(g_http_delayed_stop_handle, 10000);
+        CloseHandle(g_http_delayed_stop_handle);
+        g_http_delayed_stop_handle = NULL;
+    }
     g_http_running = 1;
     g_http_ready   = 0;
 
@@ -5907,8 +6789,15 @@ static DWORD WINAPI recording_worker(LPVOID param)
     /* Load defaults then INI config (no CLI args in the GUI build). */
     config_set_defaults(&g_state.cfg);
     config_load_ini(&g_state.cfg, config_file);
+    /* Stable reference for schedule entries with freq_sync set - see its
+     * own comment on AppState. Deliberately captured once here rather
+     * than kept as a live alias of cfg.frequency_hz/freq_b_hz, since a
+     * running schedule mutates those directly as its entries fire.       */
+    g_state.baseline_frequency_hz = g_state.cfg.frequency_hz;
+    g_state.baseline_freq_b_hz    = g_state.cfg.freq_b_hz;
 
-    LOG_INFO("DuoDX GUI v%s  (c) 2026 Dave Headland", VERSION);
+    if (g_state.cfg.verbose)
+        LOG_INFO("DuoDX GUI v%s  (c) 2026 Dave Headland", VERSION);
     if (g_state.cfg.verbose)
         LOG_INFO("Config file: %s", config_file);
 
@@ -6002,14 +6891,14 @@ static DWORD WINAPI recording_worker(LPVOID param)
             if (g_state.cfg.verbose)
                 LOG_INFO("  Dual channel   : YES");
         if (g_state.cfg.verbose)
-            LOG_INFO("  Tuner A        : %.6f MHz  Gain: %d dB  LNA: %d",
+            LOG_INFO("  Tuner 1        : %.6f MHz  Gain: %d dB  LNA: %d",
                  g_state.cfg.frequency_hz / 1e6,
                  g_state.cfg.gain_reduction,
                  g_state.cfg.lna_state);
         if (g_state.cfg.verbose)
-            LOG_INFO("  Tuner B        : %.6f MHz  Gain: %d dB  LNA: %d  (%s)",
+            LOG_INFO("  Tuner 2        : %.6f MHz  Gain: %d dB  LNA: %d  (%s)",
                  g_state.cfg.freq_b_hz / 1e6, gr_b, lna_b,
-                 indep ? "independent" : "same as A");
+                 indep ? "independent" : "same as Tuner 1");
     } else {
         if (g_state.cfg.verbose)
             LOG_INFO("  Frequency      : %.6f MHz", g_state.cfg.frequency_hz / 1e6);
@@ -6096,6 +6985,24 @@ static DWORD WINAPI recording_worker(LPVOID param)
      * config and run normally from sched_idx=0. This avoids calling
      * apply_schedule_entry before the device is initialised, and ensures
      * the start time is handled by the normal top-level wait path.      */
+    if (g_state.cfg.schedule_only && g_state.cfg.schedule_count == 0) {
+        /* Nothing was actually scheduled - without this, execution just
+         * fell through the promotion block below (a no-op with nothing
+         * to promote) straight into Step 1 and an actual recording,
+         * using whatever the base config's own frequency/etc. happened
+         * to be, regardless of the operator never having asked for that.
+         * The Timer button (IDC_BTN_SCHED_TOGGLE) now refuses to arm
+         * schedule mode with zero entries in the first place, but this
+         * is a second, independent check for anything that reaches here
+         * some other way - schedule_only=1 already sitting in duodx.ini
+         * from an earlier session, for instance, with the entries since
+         * deleted.                                                       */
+        LOG_ERROR("schedule_only=1 but no schedule entries are configured "
+                  "- nothing to record. Add at least one entry on the "
+                  "Schedule tab, or disable Timer.");
+        rc = 1;
+        goto cleanup_no_api;
+    }
     if (g_state.cfg.schedule_only && g_state.cfg.schedule_count > 0) {
         /* Warn if schedule entries are not in chronological order — only
          * useful when schedule_1 hasn't passed (if it has, we skip it
@@ -6113,16 +7020,47 @@ static DWORD WINAPI recording_worker(LPVOID param)
             }
         }
         ScheduleEntry *e = &g_state.cfg.schedule[0];
+        /* Same freq_sync substitution as apply_schedule_entry() - this
+         * whole block predates that feature and, unlike apply_schedule_
+         * entry(), was never updated to know about it. e->frequency_hz/
+         * freq_b_hz are deliberately left at 0 in the ini for a synced
+         * entry (ini_rewrite_schedule() - they'd otherwise sit there as
+         * a stale, unused snapshot), which this code was reading
+         * directly - for a synced Tuner 2, that meant this ALWAYS took
+         * the "Tuner 2 frequency not specified" branch below and
+         * silently dropped dual-channel mode entirely, regardless of
+         * what the checkbox actually said. Confirmed from a real log:
+         * dual_channel showed YES right up until this exact point, then
+         * "Tuner 2 frequency not specified" fired immediately after.    */
+        double eff_frequency_hz = e->freq_sync ? g_state.baseline_frequency_hz : e->frequency_hz;
+        double eff_freq_b_hz    = e->freq_sync ? g_state.baseline_freq_b_hz   : e->freq_b_hz;
         LOG_INFO("schedule_only=1: using schedule_1 as first recording.");
         orig_sched_count = g_state.cfg.schedule_count; /* save total before shift */
         /* Save original top-level values (pre-promotion) for ad-hoc recordings. */
         g_state.adhoc_frequency_hz  = g_state.cfg.frequency_hz;
         g_state.adhoc_freq_b_hz     = g_state.cfg.freq_b_hz;
+        g_state.adhoc_dual_channel  = g_state.cfg.dual_channel;
         g_state.adhoc_duration_sec  = g_state.cfg.duration_sec;
-        if (e->frequency_hz > 0.0)
-            g_state.cfg.frequency_hz = e->frequency_hz;
-        if (e->freq_b_hz > 0.0)
-            g_state.cfg.freq_b_hz = e->freq_b_hz;
+        if (eff_frequency_hz > 0.0)
+            g_state.cfg.frequency_hz = eff_frequency_hz;
+        if (eff_freq_b_hz > 0.0) {
+            g_state.cfg.freq_b_hz = eff_freq_b_hz;
+        } else if (g_state.cfg.dual_channel) {
+            /* Tuner 2 field left blank for this entry - meant as
+             * "record Tuner 1 only", not "leave Tuner 2 wherever the
+             * base config's Receiver tab happens to have it right now".
+             * Leaving dual_channel on here meant this entry's actual
+             * Tuner 2 frequency was whatever stale value the base config
+             * had (0.9 MHz in one report), which - if it happened to
+             * differ from this entry's own Tuner 1 frequency by more
+             * than the Master/Slave threshold - silently turned an
+             * intended single-tuner recording into an unintended
+             * Master/Slave one, complete with a second file nobody
+             * asked for at a frequency nobody chose.                    */
+            g_state.cfg.dual_channel = 0;
+            LOG_INFO("Schedule entry 1: Tuner 2 frequency not specified - "
+                     "recording Tuner 1 only.");
+        }
         if (e->duration_sec > 0)
             g_state.cfg.duration_sec = e->duration_sec;
         /* Save schedule_1 values post-promotion for restoration after ad-hoc. */
@@ -6178,8 +7116,12 @@ static DWORD WINAPI recording_worker(LPVOID param)
         }
 
         if (g_state.cfg.start_time[0]) {
+            EnterCriticalSection(&g_next_lock);
             strncpy(g_state.next_start, g_state.cfg.start_time,
                     sizeof(g_state.next_start)-1);
+            compute_stop_hms(g_state.next_start, g_state.cfg.duration_sec,
+                              g_state.next_stop, sizeof(g_state.next_stop));
+            LeaveCriticalSection(&g_next_lock);
             LOG_INFO("schedule_only: will wait for start time %s",
                      g_state.cfg.start_time);
         }
@@ -6375,45 +7317,48 @@ static DWORD WINAPI recording_worker(LPVOID param)
          * or the plain top-level values (schedule_only=0).                */
         g_state.master_slave_active =
             fabs(g_state.cfg.frequency_hz - g_state.cfg.freq_b_hz) > 100.0;
-
-        if (g_state.master_slave_active && g_state.cfg.schedule_count > 1) {
-            /* Multi-entry schedules can advance to schedule_2, schedule_3,
-             * etc. with their own frequency pairs, which aren't checked
-             * above (only schedule_1's promoted pair is) - re-deciding
-             * Master/Slave on every schedule advance isn't supported yet,
-             * so play it safe here. A single schedule_1 entry is fully
-             * covered by the check above and doesn't hit this.           */
-            LOG_WARN("Master/Slave mode (different Tuner A/B frequencies) "
-                     "is not yet supported together with multi-entry "
-                     "scheduling - falling back to Dual_Tuner mode for "
-                     "this session. Tuner B's frequency may not apply "
-                     "correctly (this is the known issue being tracked). "
-                     "A single scheduled entry, or a plain immediate "
-                     "Record, supports Master/Slave fully.");
-            g_state.master_slave_active = 0;
-        }
+        /* Previously also forced master_slave_active back off here
+         * whenever schedule_count > 1, on the reasoning that a later
+         * entry's own frequency pair isn't re-checked (see the Schedule
+         * tab's own note on this, and Section 8) - but that's a genuinely
+         * separate concern from whether schedule_1 itself, right here,
+         * should use Master/Slave. schedule_1's own pair is fully known
+         * at this exact point regardless of how many entries follow it,
+         * so blocking it too meant a schedule's first (and possibly only
+         * genuinely Master/Slave) entry got silently downgraded to
+         * Dual_Tuner mode - which then failed outright against any
+         * output format other than Linrad/WavViewDX, since Dual_Tuner
+         * mode with genuinely different frequencies isn't actually
+         * phase-coherent despite being flagged as if it were. The later-
+         * entry limitation is already handled on its own terms: an entry
+         * with its Tuner 2 field left blank correctly forces single-
+         * tuner for itself (Section 8), and one that does specify both
+         * frequencies simply continues on whatever mode schedule_1
+         * already established, which is what the Schedule tab's note
+         * describes - neither of those needs schedule_1's own detection
+         * disabled to work correctly.                                    */
 
         if (g_state.master_slave_active) {
             /* Different CFs: Dual_Tuner mode does not reliably apply an
-             * independent RF frequency to Tuner B on this hardware/driver
+             * independent RF frequency to Tuner 2 on this hardware/driver
              * (confirmed by direct IQ analysis, not just the API's return
-             * code). Run this session as Master (Tuner A only) - Tuner B
+             * code). Run this session as Master (Tuner 1 only) - Tuner 2
              * is recorded by a separate Slave process, launched further
              * below once the output filenames are known. From here on
              * this session behaves exactly like an ordinary single-tuner
-             * recording of Tuner A.                                     */
+             * recording of Tuner 1.                                     */
             g_state.device.rspDuoMode = sdrplay_api_RspDuoMode_Master;
             g_state.device.tuner      = sdrplay_api_Tuner_A;
             g_state.device.rspDuoSampleFreq = g_state.cfg.sample_rate_hz;
             g_state.cfg.dual_channel = 0;
-            LOG_INFO("RSPduo Master/Slave mode: Tuner A (Master, this "
-                     "process) %.4f MHz, Tuner B (Slave, separate "
+            LOG_INFO("RSPduo Master/Slave mode: Tuner 1 (Master, this "
+                     "process) %.4f MHz, Tuner 2 (Slave, separate "
                      "process) %.4f MHz.",
                      g_state.cfg.frequency_hz / 1e6,
                      g_state.cfg.freq_b_hz / 1e6);
         } else {
             /* Same CF on both tuners - phase-coherent Dual_Tuner mode,
-             * unaffected by the Tuner B frequency bug since both tuners
+             * unaffected by the Tuner 2 frequency bug since both tuners
              * want the same frequency anyway.                          */
             g_state.device.rspDuoMode      = sdrplay_api_RspDuoMode_Dual_Tuner;
             g_state.device.tuner           = sdrplay_api_Tuner_Both;
@@ -6429,14 +7374,23 @@ static DWORD WINAPI recording_worker(LPVOID param)
         g_state.device.rspDuoMode      = sdrplay_api_RspDuoMode_Single_Tuner;
         if (!strcmp(g_state.cfg.rspduo_single_tuner, "B")) {
             g_state.device.tuner = sdrplay_api_Tuner_B;
-            LOG_INFO("RSPduo single-tuner mode: Tuner B (Tuner 2) selected");
+            LOG_INFO("RSPduo single-tuner mode: Tuner 2 selected");
         } else {
             g_state.device.tuner = sdrplay_api_Tuner_A;
-            LOG_INFO("RSPduo single-tuner mode: Tuner A (Tuner 1) selected");
+            LOG_INFO("RSPduo single-tuner mode: Tuner 1 selected");
         }
         /* rspDuoSampleFreq is only used in dual-tuner master mode;
          * leave it at 0 for single-tuner mode.                    */
     }
+
+    /* Whichever of the three branches above ran, dual_channel/
+     * master_slave_active are now finalised for this session - see
+     * WM_APP_TUNER_CONFIG_CHANGED's own comment for why this can't just
+     * call EnableWindow() directly from here (wrong thread) or rely on
+     * gui_refresh_monitor_bar_visibility() picking it up on its own
+     * (explicitly never runs while g_worker_active, which by this point
+     * in a fresh session already is).                                   */
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_TUNER_CONFIG_CHANGED, 0, 0);
 
     /* Validate antenna value for non-RSPduo devices.
      * 50ohm and Hi-Z are RSPduo Tuner 1 port names - meaningless elsewhere.
@@ -6470,9 +7424,9 @@ static DWORD WINAPI recording_worker(LPVOID param)
         goto cleanup_device;
     }
 
-    /* In single-tuner mode with Tuner B selected, ch_a_params is aliased
-     * onto the real Tuner B channel struct rather than Tuner A's - the
-     * same trick the Master/Slave Slave process already uses for Tuner B
+    /* In single-tuner mode with Tuner 2 selected, ch_a_params is aliased
+     * onto the real Tuner 2 channel struct rather than Tuner 1's - the
+     * same trick the Master/Slave Slave process already uses for Tuner 2
      * (see run_slave_b_session()). rxChannelB itself stays unpopulated/
      * unused in single-tuner mode regardless of which physical tuner is
      * active - the API only allocates it for dual-tuner modes - so every
@@ -6516,7 +7470,7 @@ static DWORD WINAPI recording_worker(LPVOID param)
 
         if (g_state.cfg.dual_channel) {
             int max_lna_b = max_lna;   /* same device, same limit */
-            /* -1 means "inherit from Tuner A" - resolve before validating,
+            /* -1 means "inherit from Tuner 1" - resolve before validating,
              * matching the inheritance logic used when applying gain.    */
             int lna_b = (g_state.cfg.lna_state_b >= 0)
                         ? g_state.cfg.lna_state_b : g_state.cfg.lna_state;
@@ -6649,16 +7603,40 @@ static DWORD WINAPI recording_worker(LPVOID param)
             ring_size = RING_BUFFER_MIN_BYTES;
         }
 
-        if (g_state.cfg.verbose)
-            LOG_INFO("Allocating ring buffer: %zu MB",
-                 ring_size / (1024 * 1024));
-
         if (ring_init(&g_state.ring, ring_size) != 0) {
             LOG_ERROR("Failed to allocate ring buffer (%zu MB)",
                       ring_size / (1024 * 1024));
             rc = 1;
             goto cleanup_device;
         }
+
+        /* ring_init() rounds up to a power of 2 and then silently caps at
+         * RING_BUFFER_MAX_BYTES - g_state.ring.size (the actual allocated
+         * size) can therefore differ from ring_size (what was actually
+         * requested, pre-rounding) in either direction: rounding up alone
+         * can hand back noticeably more buffering than ring_buffer_sec
+         * asked for, while the cap can hand back noticeably less, with
+         * nothing previously distinguishing the two - "20 seconds"
+         * requested was liable to silently become 32 seconds' worth on a
+         * modest sample rate, or as little as 8 seconds' worth on a high
+         * one, with only the MB figure logged either way, not the actual
+         * duration the operator was actually reasoning about. Comparing
+         * against the pre-call ring_size here (not RING_BUFFER_MAX_BYTES
+         * directly) means this only fires when the cap actually changed
+         * something, not on every allocation.                            */
+        if (g_state.ring.size < ring_size) {
+            LOG_WARN("ring_buffer_sec=%d requested %zu MB - capped to the "
+                     "%d MB maximum (%.1f seconds at this sample rate, not %d).",
+                     g_state.cfg.ring_buffer_sec, ring_size / (1024 * 1024),
+                     RING_BUFFER_MAX_BYTES / (1024 * 1024),
+                     (double)g_state.ring.size / (double)bytes_per_sec,
+                     g_state.cfg.ring_buffer_sec);
+        }
+
+        if (g_state.cfg.verbose)
+            LOG_INFO("Allocating ring buffer: %zu MB (%.1f seconds at this sample rate)",
+                     g_state.ring.size / (1024 * 1024),
+                     (double)g_state.ring.size / (double)bytes_per_sec);
     }
 
     /* ------------------------------------------------------------------ */
@@ -6730,10 +7708,10 @@ static DWORD WINAPI recording_worker(LPVOID param)
         g_state.listening = 1;
 
         if (g_state.cfg.dual_channel) {
-            /* Same RSPduo Tuner B frequency quirk as the main recording
+            /* Same RSPduo Tuner 2 frequency quirk as the main recording
              * Init() below - see its own comment there for the full
              * explanation (setting rfFreq.rfHz before Init() isn't
-             * reliably enough for Tuner B). Needed here too now that
+             * reliably enough for Tuner 2). Needed here too now that
              * Listening can open a genuine dual-tuner stream, not just a
              * single one - both tuners are live from this point, so
              * switching which one the monitor listens to (right-click)
@@ -6744,10 +7722,10 @@ static DWORD WINAPI recording_worker(LPVOID param)
                                        sdrplay_api_Update_Tuner_Frf,
                                        sdrplay_api_Update_Ext1_None);
             if (ferr != sdrplay_api_Success)
-                LOG_WARN("Tuner B frequency update failed: %s",
+                LOG_WARN("Tuner 2 frequency update failed: %s",
                          sdrplay_api_GetErrorString(ferr));
-            else
-                LOG_INFO("Tuner B frequency confirmed: %.6f MHz",
+            else if (g_state.cfg.verbose)
+                LOG_INFO("Tuner 2 frequency confirmed: %.6f MHz",
                          g_state.cfg.freq_b_hz / 1e6);
             Sleep(400);
             g_state.ch_a_params->tunerParams.rfFreq.rfHz = g_state.cfg.frequency_hz;
@@ -6755,25 +7733,25 @@ static DWORD WINAPI recording_worker(LPVOID param)
                                        sdrplay_api_Update_Tuner_Frf,
                                        sdrplay_api_Update_Ext1_None);
             if (ferr != sdrplay_api_Success)
-                LOG_WARN("Tuner A frequency update failed: %s",
+                LOG_WARN("Tuner 1 frequency update failed: %s",
                          sdrplay_api_GetErrorString(ferr));
-            else
-                LOG_INFO("Tuner A frequency confirmed: %.6f MHz",
+            else if (g_state.cfg.verbose)
+                LOG_INFO("Tuner 1 frequency confirmed: %.6f MHz",
                          g_state.cfg.frequency_hz / 1e6);
         }
         if (g_state.master_slave_active) {
             /* Same reasoning as the dual_channel branch above - Listening
-             * previously never started the Tuner B slave at all, since
+             * previously never started the Tuner 2 slave at all, since
              * that only ever happened from the main recording setup
              * further below. Reuses the same, already-working launch
              * function and its pipe-reader thread - listen_only=1 means
              * no file is created (see run_slave_b_session), matching how
-             * this process's own Tuner A stream never writes anything
+             * this process's own Tuner 1 stream never writes anything
              * during Listening either.                                   */
             if (!launch_slave_b_process(&g_state, NULL, 0, 1)) {
-                LOG_WARN("Master/Slave: failed to start the Tuner B slave "
-                         "process - Tuner B will not be monitorable this "
-                         "session (Tuner A is unaffected).");
+                LOG_WARN("Master/Slave: failed to start the Tuner 2 slave "
+                         "process - Tuner 2 will not be monitorable this "
+                         "session (Tuner 1 is unaffected).");
                 g_state.master_slave_active = 0;
             }
         }
@@ -6892,10 +7870,13 @@ hourly_next:
                 int diff = eff_start_sec - cur;
                 if (diff < 0) diff += 86400;
                 if (diff == 0) break;
+                EnterCriticalSection(&g_next_lock);
                 snprintf(g_state.next_start, sizeof(g_state.next_start),
                          "%02d:%02d:%02d",
                          eff_start_sec / 3600, (eff_start_sec % 3600) / 60,
                          eff_start_sec % 60);
+                g_state.next_stop[0] = '\0';
+                LeaveCriticalSection(&g_next_lock);
                 Sleep(1000);
             }
             if (!g_running || g_cancel_listening) { rc = 0; goto cleanup_device; }
@@ -6930,7 +7911,10 @@ hourly_downgraded:
              * open, nothing scheduled, wait for the user" correctly.      */
             g_downgrade_to_listening = 0;
             g_toggle_btn_recording = 0;
+            EnterCriticalSection(&g_next_lock);
             g_state.next_start[0] = '\0';
+            g_state.next_stop[0]  = '\0';
+            LeaveCriticalSection(&g_next_lock);
             if (g_hwnd) PostMessageA(g_hwnd, WM_APP_DOWNGRADED_TO_LISTENING, 0, 0);
             LOG_OK("Timer disabled - wait cancelled, still listening.");
         }
@@ -6945,6 +7929,16 @@ repeat_schedule:
             LOG_INFO("Schedule entry %d of %d",
                      sched_idx + 1, orig_sched_count);
             apply_schedule_entry(&g_state, e);
+            /* Refreshes the antenna quick-select button's text (Section
+             * 13.1) among other things - apply_schedule_entry() above
+             * may have just staged a different cfg.antenna for this
+             * entry (applied for real at the next device Init, per that
+             * function's own comment), but nothing was otherwise telling
+             * the button to catch up, so it kept showing whichever
+             * antenna the previous entry - or the ad-hoc default - had
+             * left it on, even once a later entry's antenna had
+             * genuinely taken effect on the hardware.                   */
+            if (g_hwnd) PostMessageA(g_hwnd, WM_APP_TUNER_CONFIG_CHANGED, 0, 0);
             /* Wait for this entry's start time if specified */
             if (e->start_time[0]) {
                 if (!wait_until_time(e->start_time, 1)) {
@@ -6959,6 +7953,7 @@ repeat_schedule:
                     g_state.cfg.frequency_hz = g_state.adhoc_frequency_hz;
                 if (g_state.adhoc_freq_b_hz > 0.0)
                     g_state.cfg.freq_b_hz = g_state.adhoc_freq_b_hz;
+                g_state.cfg.dual_channel = g_state.adhoc_dual_channel;
                 if (g_state.adhoc_duration_sec > 0)
                     g_state.cfg.duration_sec = g_state.adhoc_duration_sec;
                 g_state.adhoc_recording = 1;
@@ -7056,7 +8051,10 @@ repeat_schedule:
                          * exactly what this now is.                       */
                         g_downgrade_to_listening = 0;
                         g_toggle_btn_recording = 0;
+                        EnterCriticalSection(&g_next_lock);
                         g_state.next_start[0] = '\0';
+                        g_state.next_stop[0]  = '\0';
+                        LeaveCriticalSection(&g_next_lock);
                         if (g_hwnd) PostMessageA(g_hwnd, WM_APP_DOWNGRADED_TO_LISTENING, 0, 0);
                         LOG_OK("Timer disabled - wait cancelled, still listening.");
                         g_in_generic_listen_wait = 1;
@@ -7137,6 +8135,7 @@ repeat_schedule:
                     g_state.cfg.frequency_hz = g_state.adhoc_frequency_hz;
                 if (g_state.adhoc_freq_b_hz > 0.0)
                     g_state.cfg.freq_b_hz = g_state.adhoc_freq_b_hz;
+                g_state.cfg.dual_channel = g_state.adhoc_dual_channel;
                 if (g_state.adhoc_duration_sec > 0)
                     g_state.cfg.duration_sec = g_state.adhoc_duration_sec;
                 g_state.adhoc_recording = 1;
@@ -7157,6 +8156,32 @@ repeat_schedule:
     /* ------------------------------------------------------------------ */
     /* Step 6: Generate output filename if not explicitly set, then open   */
     /* ------------------------------------------------------------------ */
+
+    /* If output_file actually names an existing directory - typing (or
+     * pasting) a folder path into what's meant to be a filename field is
+     * an easy mistake, and previously failed with a bare, confusing
+     * CreateFile error (Windows refuses to open a directory as a
+     * writable file) - treat it the way it was clearly intended: as a
+     * recording location for this session, with a filename auto-
+     * generated inside it exactly as if output_file had been left blank.
+     * Checked before the schedule_only default-detection below so this
+     * also covers a schedule entry's own output_file field, not just the
+     * top-level one.                                                    */
+    {
+        DWORD attrs = GetFileAttributesA(g_state.cfg.output_file);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            LOG_INFO("Output file '%s' is actually a folder - using it as "
+                     "the recording location for this session instead, "
+                     "with an auto-generated filename inside it.",
+                     g_state.cfg.output_file);
+            strncpy(g_state.cfg.recording_path, g_state.cfg.output_file,
+                    sizeof(g_state.cfg.recording_path) - 1);
+            g_state.cfg.recording_path[sizeof(g_state.cfg.recording_path) - 1] = '\0';
+            strncpy(g_state.cfg.output_file, DEFAULT_OUTPUT_FILE,
+                    sizeof(g_state.cfg.output_file) - 1);
+            g_state.cfg.output_file[sizeof(g_state.cfg.output_file) - 1] = '\0';
+        }
+    }
 
     /* Resolve the output file path.
      *
@@ -7236,7 +8261,7 @@ repeat_schedule:
             /* A listen-only slave from a preceding Listening session is
              * already running - stop it cleanly before starting the real
              * recording one below, otherwise both would try to use the
-             * same physical Tuner B at once. Brief gap in Tuner B's
+             * same physical Tuner 2 at once. Brief gap in Tuner 2's
              * stream during this handoff is expected and harmless -
              * nothing was being written to a file yet anyway.
              * stop_slave_b_process() unconditionally clears
@@ -7247,18 +8272,21 @@ repeat_schedule:
              * downstream that checks this flag (the meter, the audio
              * feed, the right-click tuner switch) silently starts
              * behaving as if Master/Slave mode had ended - which is
-             * exactly the bug this fixes: Tuner B's process was still
+             * exactly the bug this fixes: Tuner 2's process was still
              * genuinely running and streaming correctly the whole time,
              * only the flag was wrong.                                   */
-            LOG_INFO("Master/Slave: stopping the listen-only Tuner B "
+            LOG_INFO("Master/Slave: stopping the listen-only Tuner 2 "
                      "process so recording can start on a fresh one.");
             stop_slave_b_process(&g_state);
+            verify_slave_b_recording(&g_state);  /* no-op here (listen-only,
+                no output_file_b yet) but resets the mapping cleanly for the
+                fresh slave about to be launched below. */
             g_state.master_slave_active = 1;
         }
         if (!launch_slave_b_process(&g_state, g_state.output_file_b,
                                      g_state.cfg.duration_sec, 0)) {
-            LOG_ERROR("Master/Slave: failed to start the Tuner B slave "
-                      "process - Tuner B will not be recorded this session.");
+            LOG_ERROR("Master/Slave: failed to start the Tuner 2 slave "
+                      "process - Tuner 2 will not be recorded this session.");
             g_state.master_slave_active = 0;
         }
     }
@@ -7268,29 +8296,31 @@ repeat_schedule:
             g_state.cfg.output_format == FORMAT_WAVVIEWDX  ? "WavViewDX-raw" :
             g_state.cfg.output_format == FORMAT_SDRUNO     ? "SDRuno WAV (216-byte header)" :
             g_state.cfg.output_format == FORMAT_WINRAD     ? "Winrad WAV (216-byte header)" :
+            g_state.cfg.output_format == FORMAT_PERSEUS    ? "Perseus WAV (86-byte header)" :
+            g_state.cfg.output_format == FORMAT_JAGUAR     ? "Jaguar WAV (86-byte header)" :
             g_state.cfg.output_format == FORMAT_SDRCONNECT ? "SDR Connect WAV (80-byte header)" :
                                                               "Linrad (41-byte header)";
         LOG_INFO("Output format : %s", fmt_name);
         if (g_state.cfg.dual_channel && !g_state.master_slave_active &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
                  g_state.cfg.output_format == FORMAT_WINRAD ||
+                 g_state.cfg.output_format == FORMAT_PERSEUS ||
+                 g_state.cfg.output_format == FORMAT_JAGUAR ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT)) {
-            LOG_ERROR("Output format '%s' does not support interleaved "
-                      "dual-channel mode (same CF on both tuners).", fmt_name);
-            LOG_ERROR("Set dual_channel=0 and specify which tuner to record:");
-            LOG_ERROR("  Tuner 1 (A): dual_channel=0  antenna=Hi-Z  (or 50ohm)");
-            LOG_ERROR("  Tuner 2 (B): dual_channel=0  (connect antenna to Tuner 2 port)");
-            LOG_ERROR("(Different CFs on the two tuners record fine as two "
-                      "separate files in any format - only same-CF "
-                      "interleaved dual needs Linrad.)");
+            LOG_ERROR("Output format '%s' doesn't support same-CF "
+                      "interleaved dual (COHERENT) - use Linrad or "
+                      "WavViewDX, different frequencies, or a single "
+                      "tuner. See Settings > Recording.", fmt_name);
             rc = 1;
             goto cleanup_ring;
         }
         if (g_state.master_slave_active &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
                  g_state.cfg.output_format == FORMAT_WINRAD ||
+                 g_state.cfg.output_format == FORMAT_PERSEUS ||
+                 g_state.cfg.output_format == FORMAT_JAGUAR ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT)) {
-            LOG_INFO("Different CFs on Tuner A/B: recording as two separate "
+            LOG_INFO("Different CFs on Tuner 1/2: recording as two separate "
                      "%s files (one per tuner), not an interleaved dual file.",
                      fmt_name);
         }
@@ -7390,11 +8420,13 @@ repeat_schedule:
         goto cleanup_ring;
     }
 
-    /* Split mode (SDRuno always; Winrad/SDR Connect when so configured):
-     * make sure the part counter starts clean (it's also reset alongside
-     * samples_written between recordings, but a first-ever recording in
-     * this process needs it set here too).                               */
+    /* Split mode (SDRuno/Perseus/Jaguar always; Winrad/SDR Connect when so
+     * configured): make sure the part counter starts clean (it's also
+     * reset alongside samples_written between recordings, but a
+     * first-ever recording in this process needs it set here too).       */
     if (g_state.cfg.output_format == FORMAT_SDRUNO ||
+            g_state.cfg.output_format == FORMAT_PERSEUS ||
+            g_state.cfg.output_format == FORMAT_JAGUAR ||
             ((g_state.cfg.output_format == FORMAT_WINRAD ||
               g_state.cfg.output_format == FORMAT_SDRCONNECT) &&
              g_state.cfg.large_file_mode == LARGE_FILE_SPLIT)) {
@@ -7417,6 +8449,18 @@ repeat_schedule:
             /* SDRuno never gets RF64 - it can't play those back (see the
              * OutputFormat enum comment) - so this is unconditional.     */
             if (!write_sdruno_header(g_state.out_file, &g_state.cfg)) {
+                rc = 1; goto cleanup_file;
+            }
+            FlushFileBuffers(g_state.out_file);
+        } else if (g_state.cfg.output_format == FORMAT_PERSEUS) {
+            /* Perseus never gets RF64 either - same reasoning as SDRuno. */
+            if (!write_perseus_header(g_state.out_file, &g_state.cfg)) {
+                rc = 1; goto cleanup_file;
+            }
+            FlushFileBuffers(g_state.out_file);
+        } else if (g_state.cfg.output_format == FORMAT_JAGUAR) {
+            /* Jaguar never gets RF64 either - same reasoning as Perseus. */
+            if (!write_jaguar_header(g_state.out_file, &g_state.cfg)) {
                 rc = 1; goto cleanup_file;
             }
             FlushFileBuffers(g_state.out_file);
@@ -7465,9 +8509,9 @@ repeat_schedule:
         }
         FlushFileBuffers(g_state.out_file_b);
 
-        LOG_INFO("Output file A : %s (1 channel, 16-bit, %.4f MHz)",
+        LOG_INFO("Output file 1 : %s (1 channel, 16-bit, %.4f MHz)",
                  g_state.cfg.output_file, g_state.cfg.frequency_hz / 1e6);
-        LOG_INFO("Output file B : %s (1 channel, 16-bit, %.4f MHz)",
+        LOG_INFO("Output file 2 : %s (1 channel, 16-bit, %.4f MHz)",
                  g_state.output_file_b, g_state.cfg.freq_b_hz / 1e6);
     } else {
         LOG_INFO("Output file   : %s (%d channel(s), 16-bit)",
@@ -7567,6 +8611,17 @@ repeat_schedule:
          * whichever mode g_state.cfg.dual_channel currently says.        */
         ring_reset(&g_state.ring);
         g_state.listening = 0;
+        /* Monitor being on is meant for checking in while waiting or
+         * listening, not for it to keep running unattended through an
+         * actual recording - turned off here so it starts each recording
+         * silent by default; still available to switch back on by hand
+         * mid-recording if actually wanted for a moment. The repaint
+         * itself happens on the UI thread via gui_set_recording_ui()
+         * below (WM_APP_RECORDING_STARTED) - this thread can't touch
+         * g_hBtnMonitor directly, same reasoning as everywhere else in
+         * this codebase that posts rather than calls UI functions
+         * straight from the worker thread.                              */
+        g_monitor.enabled = 0;
         LOG_OK("Recording started (receiver was already running).");
         if (g_hwnd) PostMessageA(g_hwnd, WM_APP_RECORDING_STARTED, 0, 0);
     } else {
@@ -7593,17 +8648,20 @@ repeat_schedule:
     g_state.stream_running = 1;
     g_recording = 1;  /* legacy flag; harmless in GUI build */
     QueryPerformanceCounter(&g_state.start_time);
+    EnterCriticalSection(&g_next_lock);
     g_state.next_start[0] = '\0';  /* clear waiting indicator now recording */
+    g_state.next_stop[0]  = '\0';
+    LeaveCriticalSection(&g_next_lock);
 
     /* RSPduo dual-tuner mode: force-apply both tuners' RF frequency via an
      * explicit post-Init Update. Setting rfFreq.rfHz in the channel struct
-     * before sdrplay_api_Init() is not reliably enough for Tuner B.
+     * before sdrplay_api_Init() is not reliably enough for Tuner 2.
      * Independent per-tuner frequency updates in RSPduo dual-tuner mode are
      * a known troublesome area of this API (reports of the same symptom -
      * an Update() that reports success but the RF frequency of the
      * non-master tuner doesn't actually move - exist for other RSPduo
-     * client libraries too). Tuner B is updated first, with a short settle
-     * delay before Tuner A, in case the driver needs the non-master tuner
+     * client libraries too). Tuner 2 is updated first, with a short settle
+     * delay before Tuner 1, in case the driver needs the non-master tuner
      * addressed before the master "re-confirms" its own frequency.        */
     if (g_state.cfg.dual_channel) {
         sdrplay_api_ErrT ferr;
@@ -7613,10 +8671,10 @@ repeat_schedule:
                                    sdrplay_api_Update_Tuner_Frf,
                                    sdrplay_api_Update_Ext1_None);
         if (ferr != sdrplay_api_Success)
-            LOG_WARN("Tuner B frequency update failed: %s",
+            LOG_WARN("Tuner 2 frequency update failed: %s",
                      sdrplay_api_GetErrorString(ferr));
-        else
-            LOG_INFO("Tuner B frequency confirmed: %.6f MHz",
+        else if (g_state.cfg.verbose)
+            LOG_INFO("Tuner 2 frequency confirmed: %.6f MHz",
                      g_state.cfg.freq_b_hz / 1e6);
 
         Sleep(400);
@@ -7626,27 +8684,27 @@ repeat_schedule:
                                    sdrplay_api_Update_Tuner_Frf,
                                    sdrplay_api_Update_Ext1_None);
         if (ferr != sdrplay_api_Success)
-            LOG_WARN("Tuner A frequency update failed: %s",
+            LOG_WARN("Tuner 1 frequency update failed: %s",
                      sdrplay_api_GetErrorString(ferr));
-        else
-            LOG_INFO("Tuner A frequency confirmed: %.6f MHz",
+        else if (g_state.cfg.verbose)
+            LOG_INFO("Tuner 1 frequency confirmed: %.6f MHz",
                      g_state.cfg.frequency_hz / 1e6);
 
         Sleep(400);
 
-        /* Re-assert Tuner B's frequency once more - if Tuner A's own
+        /* Re-assert Tuner 2's frequency once more - if Tuner 1's own
          * update (as the RSPduo master tuner) causes some internal
-         * re-sync that disturbs Tuner B's setting, this gives B the
+         * re-sync that disturbs Tuner 2's setting, this gives B the
          * last word. */
         g_state.ch_b_params->tunerParams.rfFreq.rfHz = g_state.cfg.freq_b_hz;
         ferr = sdrplay_api_Update(g_state.device.dev, sdrplay_api_Tuner_B,
                                    sdrplay_api_Update_Tuner_Frf,
                                    sdrplay_api_Update_Ext1_None);
         if (ferr != sdrplay_api_Success)
-            LOG_WARN("Tuner B frequency re-assert failed: %s",
+            LOG_WARN("Tuner 2 frequency re-assert failed: %s",
                      sdrplay_api_GetErrorString(ferr));
-        else
-            LOG_INFO("Tuner B frequency re-confirmed: %.6f MHz",
+        else if (g_state.cfg.verbose)
+            LOG_INFO("Tuner 2 frequency re-confirmed: %.6f MHz",
                      g_state.cfg.freq_b_hz / 1e6);
 
         Sleep(400);
@@ -7763,17 +8821,25 @@ repeat_schedule:
                                  sched_idx >= g_state.cfg.schedule_count) ? 1 : 0;
 
     /* Next scheduled start time for dashboard (empty if last recording) */
+    EnterCriticalSection(&g_next_lock);
     memset(g_state.next_start, 0, sizeof(g_state.next_start));
+    memset(g_state.next_stop, 0, sizeof(g_state.next_stop));
     if (sched_idx == 0 && g_state.cfg.start_time[0]) {
         /* Top-level or ad-hoc path: next start is the top-level start_time. */
         strncpy(g_state.next_start, g_state.cfg.start_time,
                 sizeof(g_state.next_start) - 1);
+        compute_stop_hms(g_state.next_start, g_state.cfg.duration_sec,
+                          g_state.next_stop, sizeof(g_state.next_stop));
     } else if (sched_idx < g_state.cfg.schedule_count &&
             g_state.cfg.schedule[sched_idx].start_time[0]) {
         strncpy(g_state.next_start,
                 g_state.cfg.schedule[sched_idx].start_time,
                 sizeof(g_state.next_start) - 1);
+        compute_stop_hms(g_state.next_start,
+                          g_state.cfg.schedule[sched_idx].duration_sec,
+                          g_state.next_stop, sizeof(g_state.next_stop));
     }
+    LeaveCriticalSection(&g_next_lock);
     /* Note: start_time is zeroed AFTER the stats block below so the
      * duration calculation remains correct. frozen_json is built here
      * before ring_free / ReleaseDevice / sdrplay_api_Close so all
@@ -7859,14 +8925,79 @@ repeat_schedule:
     CloseHandle(g_state.writer_thread);
     CloseHandle(g_state.writer_ready_event);
 
-    /* Print final statistics */
+    /* Whether this was a Master/Slave or same-process dual-file session,
+     * captured now before anything below can clear master_slave_active
+     * (stop_slave_b_process() always does) or output_file_b - used both
+     * for the output-file summary format below and to decide whether
+     * Tuner 1's own verification gets an explicit "Verifying Tuner 1
+     * file" label (only meaningful when there's a Tuner 2 file to
+     * distinguish it from).                                             */
+    int was_dual_files = g_state.dual_separate_files ||
+                          g_state.master_slave_active ||
+                          g_state.output_file_b[0] != '\0';
+
+    /* Elapsed time computed and frozen for the HTTP monitor right away,
+     * same as before - only the LOG_INFO calls that use it move further
+     * down now, not this.                                                */
+    double elapsed;
     {
         LARGE_INTEGER end_time;
-        double elapsed;
         QueryPerformanceCounter(&end_time);
         elapsed = (double)(end_time.QuadPart - g_state.start_time.QuadPart)
                   / (double)g_state.perf_freq.QuadPart;
+    }
+    g_state.start_time.QuadPart = 0;
 
+    /* Close and verify the completed recording file now, so it is
+     * immediately accessible to other applications (e.g. WavViewDX, HxD)
+     * without needing to stop DuoDX. The file handle was previously left
+     * open until the end of the entire session.                           */
+    if (g_state.out_file != INVALID_HANDLE_VALUE) {
+        /* segment_samples_written, not samples_written: if split mode
+         * rolled over to a new part file, samples_written is the
+         * cumulative session total but this file only holds the current
+         * segment - segment_samples_written tracks that correctly and is
+         * identical to samples_written whenever no rollover happened.    */
+        if (g_state.segment_samples_written > 0 &&
+                (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                 g_state.cfg.output_format == FORMAT_WINRAD ||
+                 g_state.cfg.output_format == FORMAT_PERSEUS ||
+                 g_state.cfg.output_format == FORMAT_JAGUAR ||
+                 g_state.cfg.output_format == FORMAT_SDRCONNECT))
+            finalize_output_header(g_state.out_file, &g_state.cfg,
+                            g_state.segment_samples_written);
+        CloseHandle(g_state.out_file);
+        g_state.out_file = INVALID_HANDLE_VALUE;
+        if (g_state.segment_samples_written > 0) {
+            if (was_dual_files)
+                LOG_INFO("Verifying Tuner 1 file: %s", g_state.cfg.output_file);
+            verify_recording(&g_state.cfg, g_state.segment_samples_written);
+        }
+    }
+    if (g_state.master_slave_active) {
+        stop_slave_b_process(&g_state);
+        /* stop_slave_b_process() unconditionally clears master_slave_
+         * active - correct for a session that's truly ending, wrong here
+         * if a multi-entry schedule is about to advance to another entry:
+         * the recording that just finished is over, but the Master/Slave
+         * session itself isn't. Restoring it is what lets Step 6/7's
+         * "if (master_slave_active) { ...relaunch the slave process... }"
+         * block, further below once the next entry's wait completes,
+         * actually run again - without this restore (here and at the two
+         * further stop_slave_b_process() calls below, part of this same
+         * teardown sequence), Tuner 2 correctly recorded for a schedule's
+         * first entry and then silently stopped being recorded at all for
+         * every entry after it. Harmless if the session is actually
+         * ending instead - nothing downstream reads this again before the
+         * full session-end teardown resets it along with everything else.*/
+        g_state.master_slave_active = 1;
+    }
+    close_and_verify_file_b(&g_state);
+    verify_slave_b_recording(&g_state);
+
+    /* Print final statistics - after both files' verification results
+     * above, not in between them (see was_dual_files further up).        */
+    {
         LOG_INFO("Recording complete:");
         if (g_state.cfg.verbose)
             LOG_INFO("  Duration       : %.2f seconds", elapsed);
@@ -7889,9 +9020,9 @@ repeat_schedule:
             LOG_WARN("  Overflows      : %ld", g_state.overflows);
         if (g_state.cfg.recording_path[0])
         LOG_INFO("  Recording path : %s", g_state.cfg.recording_path);
-    if (g_state.dual_separate_files) {
-        LOG_INFO("  Output file A  : %s", g_state.cfg.output_file);
-        LOG_INFO("  Output file B  : %s", g_state.output_file_b);
+    if (was_dual_files) {
+        LOG_INFO("  Output file 1  : %s", g_state.cfg.output_file);
+        LOG_INFO("  Output file 2  : %s", g_state.output_file_b);
     } else {
         LOG_INFO("  Output file    : %s", g_state.cfg.output_file);
     }
@@ -7916,34 +9047,6 @@ repeat_schedule:
             LOG_ERROR("Recording may be incomplete due to write errors.");
     }
 
-    /* Freeze elapsed on HTTP monitor now that stats have been printed */
-    g_state.start_time.QuadPart = 0;
-
-    /* Close and verify the completed recording file now, so it is
-     * immediately accessible to other applications (e.g. WavViewDX, HxD)
-     * without needing to stop DuoDX. The file handle was previously left
-     * open until the end of the entire session.                           */
-    if (g_state.out_file != INVALID_HANDLE_VALUE) {
-        /* segment_samples_written, not samples_written: if split mode
-         * rolled over to a new part file, samples_written is the
-         * cumulative session total but this file only holds the current
-         * segment - segment_samples_written tracks that correctly and is
-         * identical to samples_written whenever no rollover happened.    */
-        if (g_state.segment_samples_written > 0 &&
-                (g_state.cfg.output_format == FORMAT_SDRUNO ||
-                 g_state.cfg.output_format == FORMAT_WINRAD ||
-                 g_state.cfg.output_format == FORMAT_SDRCONNECT))
-            finalize_output_header(g_state.out_file, &g_state.cfg,
-                            g_state.segment_samples_written);
-        CloseHandle(g_state.out_file);
-        g_state.out_file = INVALID_HANDLE_VALUE;
-        if (g_state.segment_samples_written > 0)
-            verify_recording(&g_state.cfg, g_state.segment_samples_written);
-    }
-    close_and_verify_file_b(&g_state);
-    if (g_state.master_slave_active)
-        stop_slave_b_process(&g_state);
-
     /* ── Between-recording reset ─────────────────────────────────────────
      * If there are more schedule entries and no errors, stop the stream,
      * reset counters, reopen the output file, and restart the stream.   */
@@ -7959,13 +9062,17 @@ repeat_schedule:
             if (g_state.sched1_duration_sec > 0)
                 g_state.cfg.duration_sec = g_state.sched1_duration_sec;
         }
+        EnterCriticalSection(&g_next_lock);
         strncpy(g_state.next_start, g_state.cfg.start_time,
                 sizeof(g_state.next_start) - 1);
+        compute_stop_hms(g_state.next_start, g_state.cfg.duration_sec,
+                          g_state.next_stop, sizeof(g_state.next_stop));
+        LeaveCriticalSection(&g_next_lock);
         snprintf(g_ui.sched, sizeof(g_ui.sched),
-                 "Schedule: %d entr%s  starts %s",
-                 g_state.cfg.schedule_count,
-                 g_state.cfg.schedule_count == 1 ? "y" : "ies",
-                 g_state.cfg.start_time);
+                 "Scheduled: starts %s  (%d entr%s)",
+                 g_state.cfg.start_time,
+                 g_state.cfg.schedule_total_count,
+                 g_state.cfg.schedule_total_count == 1 ? "y" : "ies");
     } else {
         sched_idx++;
     }
@@ -7975,11 +9082,30 @@ repeat_schedule:
             LOG_INFO("Preparing for schedule entry %d of %d ...",
                  sched_idx + 1, orig_sched_count);
 
+        /* master_slave_active is reset precisely where a specific entry's
+         * blank Tuner 2 field actually forces single-tuner for that
+         * entry - see apply_schedule_entry() and the overnight-reload
+         * block. Deliberately not done here as a blanket rule keyed off
+         * dual_channel alone: dual_channel is 0 for the entire rest of
+         * a session once Master/Slave mode is established (Section 7.3),
+         * which is completely normal and expected for as long as
+         * Master/Slave keeps legitimately continuing into further
+         * entries - a blanket check here couldn't tell that case apart
+         * from one where a specific entry's own blank Tuner 2 field
+         * means it genuinely shouldn't, and ended up silently ending
+         * every multi-entry Master/Slave schedule after its first
+         * recording regardless of what later entries actually wanted.  */
+
         /* Stop current stream */
         g_recording = 0;
         g_state.stream_running = 0;
-        if (g_state.master_slave_active)
+        if (g_state.master_slave_active) {
             stop_slave_b_process(&g_state);
+            verify_slave_b_recording(&g_state);
+            g_state.master_slave_active = 1;   /* see the restore comment
+                at the first stop_slave_b_process() call in this same
+                between-recording teardown sequence, just above.         */
+        }
         {
             sdrplay_api_ErrT uerr;
             int uninit_attempts = 0;
@@ -8019,6 +9145,8 @@ repeat_schedule:
             if (g_state.segment_samples_written > 0 &&
                     (g_state.cfg.output_format == FORMAT_SDRUNO ||
                      g_state.cfg.output_format == FORMAT_WINRAD ||
+                     g_state.cfg.output_format == FORMAT_PERSEUS ||
+                     g_state.cfg.output_format == FORMAT_JAGUAR ||
                      g_state.cfg.output_format == FORMAT_SDRCONNECT))
                 finalize_output_header(g_state.out_file, &g_state.cfg,
                                 g_state.segment_samples_written);
@@ -8028,8 +9156,13 @@ repeat_schedule:
                 verify_recording(&g_state.cfg, g_state.segment_samples_written);
         }
         close_and_verify_file_b(&g_state);
-        if (g_state.master_slave_active)
+        if (g_state.master_slave_active) {
             stop_slave_b_process(&g_state);
+            verify_slave_b_recording(&g_state);
+            g_state.master_slave_active = 1;   /* see the restore comment
+                at the first stop_slave_b_process() call in this same
+                between-recording teardown sequence, above.              */
+        }
 
         /* Reset per-recording counters */
         g_state.samples_received    = 0;
@@ -8130,16 +9263,67 @@ repeat_schedule:
         config_set_defaults(&g_state.cfg);
         config_load_ini(&g_state.cfg, config_file);
 
+        /* validate_config() is what actually computes expected_output_
+         * rate_hz and the other IF/BW/decimation-derived fields from the
+         * loaded sample_rate_hz/if_khz/bw_khz - config_set_defaults()'s
+         * memset() leaves them at 0, and nothing else here was setting
+         * them either. Skipping this meant every session that made it
+         * through a full day-to-day repeat cycle carried a genuinely
+         * zeroed expected_output_rate_hz into its next recording -
+         * wrong "SR=0 sps" in the file header, a nonsensical "0 seconds
+         * of disk space available" warning, and - since that value feeds
+         * ring buffer sizing and duration/space math downstream - a
+         * route to the actual crash this was chasing. Same call the
+         * normal cold start already makes right after its own config
+         * load; failure here is treated the same way too.               */
+        if (!validate_config(&g_state.cfg)) {
+            LOG_ERROR("Schedule repeat: config validation failed after "
+                      "reload - stopping rather than continuing with an "
+                      "invalid configuration.");
+            rc = 1;
+            goto cleanup_writer;
+        }
+
         /* Re-apply schedule_only promotion */
         if (!g_state.cfg.schedule_only)
             g_state.cfg.schedule_count = 0;
 
         if (g_state.cfg.schedule_only && g_state.cfg.schedule_count > 0) {
             ScheduleEntry *e = &g_state.cfg.schedule[0];
-            if (e->frequency_hz > 0.0)
-                g_state.cfg.frequency_hz = e->frequency_hz;
-            if (e->freq_b_hz > 0.0)
-                g_state.cfg.freq_b_hz = e->freq_b_hz;
+            /* Same freq_sync substitution as the other two schedule_1
+             * promotion sites (the initial cold-start one, and
+             * apply_schedule_entry() for later entries) - this repeat
+             * path read e->frequency_hz/freq_b_hz directly too, so a
+             * synced entry's deliberately-blank stored values hit the
+             * same "not specified" fallback here on every overnight
+             * repeat, not just the very first run.                       */
+            double eff_frequency_hz = e->freq_sync ? g_state.baseline_frequency_hz : e->frequency_hz;
+            double eff_freq_b_hz    = e->freq_sync ? g_state.baseline_freq_b_hz   : e->freq_b_hz;
+            if (eff_frequency_hz > 0.0)
+                g_state.cfg.frequency_hz = eff_frequency_hz;
+            if (eff_freq_b_hz > 0.0) {
+                g_state.cfg.freq_b_hz = eff_freq_b_hz;
+            } else if (g_state.cfg.dual_channel) {
+                /* Same fix as the two other schedule_1 promotion sites
+                 * (the initial cold-start one, and apply_schedule_entry()
+                 * for later entries) - config_load_ini() just reloaded
+                 * dual_channel fresh from the base ini (true, in at least
+                 * one report), and this reload path never had the same
+                 * "blank Tuner 2 means single-tuner for this entry"
+                 * correction the other two got. Left uncorrected here,
+                 * cfg.dual_channel disagreed with the single-tuner stream
+                 * actually running (the callback selection itself is
+                 * untouched, since g_state.listening skips Step 8's
+                 * re-Init entirely) - exactly the kind of flag mismatch
+                 * that's caused crashes elsewhere in this area, and
+                 * matches the "Dual channel: 1" a real crash report
+                 * showed for a session that was actually single-channel
+                 * throughout.                                            */
+                g_state.cfg.dual_channel = 0;
+                g_state.master_slave_active = 0;
+                LOG_INFO("Schedule repeat: Tuner 2 frequency not specified "
+                         "- recording Tuner 1 only.");
+            }
             if (e->duration_sec > 0)
                 g_state.cfg.duration_sec = e->duration_sec;
             if (e->output_file[0])
@@ -8153,13 +9337,21 @@ repeat_schedule:
                              e->start_time);
                 strncpy(g_state.cfg.start_time, e->start_time,
                         sizeof(g_state.cfg.start_time)-1);
+                EnterCriticalSection(&g_next_lock);
                 strncpy(g_state.next_start, e->start_time,
                         sizeof(g_state.next_start)-1);
+                compute_stop_hms(g_state.next_start, e->duration_sec,
+                                  g_state.next_stop, sizeof(g_state.next_stop));
+                LeaveCriticalSection(&g_next_lock);
             }
             int ri;
             for (ri = 0; ri < g_state.cfg.schedule_count - 1; ri++)
                 g_state.cfg.schedule[ri] = g_state.cfg.schedule[ri+1];
             g_state.cfg.schedule_count--;
+            /* Same antenna-button refresh as the non-repeat schedule
+             * transition above - this re-promotion can also stage a
+             * different cfg.antenna for the cycle's first entry.        */
+            if (g_hwnd) PostMessageA(g_hwnd, WM_APP_TUNER_CONFIG_CHANGED, 0, 0);
         }
 
         /* Reset all per-session counters */
@@ -8183,6 +9375,46 @@ repeat_schedule:
         g_state.start_time.QuadPart = 0;
         /* next_start already set above - keep it so dashboard shows NEXT AT */
         ring_reset(&g_state.ring);
+
+        /* g_state.cfg.frequency_hz/freq_b_hz were just re-promoted to
+         * schedule_1's values above, but that only touched the config -
+         * sched_idx==0 means the do-loop's own apply_schedule_entry()
+         * call is skipped for this next iteration (it only runs for
+         * sched_idx > 0), and g_state.listening=1 below means Step 8
+         * won't call sdrplay_api_Init() again either - normally one of
+         * those two is what actually pushes a new frequency to the
+         * hardware. Without this, the device stayed tuned whichever
+         * entry was recording when the cycle finished (yesterday's last
+         * one) for the entire overnight wait and into today's
+         * recording, both silently wrong. Mirrors exactly what
+         * apply_schedule_entry() itself does for its own stream_running
+         * case - a live Update(), not a fresh Init().                   */
+        if (g_state.stream_running) {
+            sdrplay_api_ErrT ferr;
+            g_state.ch_a_params->tunerParams.rfFreq.rfHz = g_state.cfg.frequency_hz;
+            ferr = sdrplay_api_Update(g_state.device.dev, g_state.device.tuner,
+                                       sdrplay_api_Update_Tuner_Frf,
+                                       sdrplay_api_Update_Ext1_None);
+            if (ferr == sdrplay_api_Success)
+                LOG_INFO("Schedule repeat: Tuner 1 frequency set to %.6f MHz",
+                         g_state.cfg.frequency_hz / 1e6);
+            else
+                LOG_WARN("Schedule repeat: Tuner 1 frequency update failed: %s",
+                          sdrplay_api_GetErrorString(ferr));
+            if (g_state.cfg.dual_channel && g_state.ch_b_params) {
+                g_state.ch_b_params->tunerParams.rfFreq.rfHz = g_state.cfg.freq_b_hz;
+                ferr = sdrplay_api_Update(g_state.device.dev, sdrplay_api_Tuner_B,
+                                           sdrplay_api_Update_Tuner_Frf,
+                                           sdrplay_api_Update_Ext1_None);
+                if (ferr == sdrplay_api_Success)
+                    LOG_INFO("Schedule repeat: Tuner 2 frequency set to %.6f MHz",
+                             g_state.cfg.freq_b_hz / 1e6);
+                else
+                    LOG_WARN("Schedule repeat: Tuner 2 frequency update "
+                             "failed: %s", sdrplay_api_GetErrorString(ferr));
+            }
+        }
+
         /* Device stays open continuously through this loop-back too - see
          * the identical comment on the hourly repeat path above for why
          * this needs restoring before Step 8 is reached again.            */
@@ -8220,6 +9452,8 @@ cleanup_file:
         if (g_state.segment_samples_written > 0 &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
                  g_state.cfg.output_format == FORMAT_WINRAD ||
+                 g_state.cfg.output_format == FORMAT_PERSEUS ||
+                 g_state.cfg.output_format == FORMAT_JAGUAR ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT))
             finalize_output_header(g_state.out_file, &g_state.cfg,
                             g_state.segment_samples_written);
@@ -8229,8 +9463,10 @@ cleanup_file:
             verify_recording(&g_state.cfg, g_state.segment_samples_written);
     }
     close_and_verify_file_b(&g_state);
-    if (g_state.master_slave_active)
+    if (g_state.master_slave_active) {
         stop_slave_b_process(&g_state);
+        verify_slave_b_recording(&g_state);
+    }
 
 cleanup_ring:
     /* Stop monitor thread if still running (skipped cleanup_writer path) */
@@ -8267,14 +9503,15 @@ cleanup_ring:
         }
         g_state.listening  = 0;
         g_record_now       = 0;
-        g_cancel_listening  = 0;
+        /* g_cancel_listening is now reset in WM_APP_DONE (UI thread),
+         * after the config reload there - see that comment for why.     */
         g_downgrade_to_listening = 0;
         g_in_generic_listen_wait = 0;
     }
     ring_free(&g_state.ring);
 
 cleanup_device:
-    /* Stop the Tuner B slave process if this was a Master/Slave session -
+    /* Stop the Tuner 2 slave process if this was a Master/Slave session -
      * cleanup_device is reached directly (skipping cleanup_file, the only
      * other place this is called) by every plain listening-cancel path,
      * including the ordinary "Monitor with no schedule, then Stop"
@@ -8286,8 +9523,10 @@ cleanup_device:
      * the cleanup_file call, so if that one already ran (the recording
      * path falls through this label too) master_slave_active is already
      * 0 and this is a safe no-op, not a double-stop.                    */
-    if (g_state.master_slave_active)
+    if (g_state.master_slave_active) {
         stop_slave_b_process(&g_state);
+        verify_slave_b_recording(&g_state);
+    }
 
     /* Stop monitor if still running (may have skipped cleanup_writer/ring) */
     if (g_gui_mon_thread) {
@@ -8325,7 +9564,8 @@ cleanup_device:
                                    * at the next start - see the reset in
                                    * gui_start_listening() for why this
                                    * flag needs to be reliably clean.      */
-        g_cancel_listening  = 0;
+        /* g_cancel_listening is now reset in WM_APP_DONE (UI thread),
+         * after the config reload there - see that comment for why.     */
         g_downgrade_to_listening = 0;
         g_in_generic_listen_wait = 0;
     }
@@ -8378,8 +9618,52 @@ cleanup_no_api:
 
     /* Stop HTTP server. */
     g_running = 0;
-    g_http_running = 0;
-    if (http_thread) {
+    if (g_state.cfg.http_port > 0 && http_thread) {
+        /* Give the dashboard's own poll interval at least one more cycle
+         * to actually see the "finished" snapshot just built above,
+         * before the server stops accepting connections and that
+         * snapshot becomes unreachable. Without this, a poll interval
+         * slower than the gap between the recording ending and the
+         * server shutting down (which was previously the very next
+         * line - no gap at all) could miss the finished state entirely
+         * and be stuck showing whatever the last live poll happened to
+         * catch, with no way to ever see FINISHED afterward. Capped at
+         * 6 seconds regardless of how long the configured interval is
+         * (up to 30s). Runs detached (see http_delayed_stop_thread_func's
+         * own comment) so this delay doesn't block whichever thread
+         * might be synchronously waiting on this worker thread's own
+         * exit.                                                         */
+        HttpDelayedStop *hp = malloc(sizeof(HttpDelayedStop));
+        if (hp) {
+            hp->http_thread = http_thread;
+            hp->delay_ms = (g_state.cfg.http_interval_ms * 2 < 6000)
+                           ? (DWORD)(g_state.cfg.http_interval_ms * 2) : 6000;
+            HANDLE dt = CreateThread(NULL, 0, http_delayed_stop_thread_func, hp, 0, NULL);
+            if (dt) {
+                /* Kept open (not closed here) - a subsequent session's own
+                 * cold start waits on this handle before touching
+                 * g_http_running or starting its own accept loop, and
+                 * closes it once that wait completes. See
+                 * g_http_delayed_stop_handle's declaration for why this
+                 * needs to be a real wait rather than fire-and-forget.   */
+                g_http_delayed_stop_handle = dt;
+            } else {
+                /* Couldn't even start the delayed-stop thread - fall back
+                 * to stopping immediately rather than leaking hp/never
+                 * stopping the server at all.                           */
+                free(hp);
+                g_http_running = 0;
+                WaitForSingleObject(http_thread, 2000);
+                CloseHandle(http_thread);
+            }
+        } else {
+            g_http_running = 0;
+            WaitForSingleObject(http_thread, 2000);
+            CloseHandle(http_thread);
+        }
+        http_thread = NULL;
+    } else if (http_thread) {
+        g_http_running = 0;
         WaitForSingleObject(http_thread, 2000);
         CloseHandle(http_thread);
         http_thread = NULL;
@@ -8415,19 +9699,48 @@ cleanup_no_api:
  * off. Doesn't affect the "Stop" label once actually recording.         */
 static const char *gui_record_btn_idle_label(void)
 {
-    return (g_state.cfg.schedule_only || g_state.cfg.hourly_enable)
-           ? "Start" : "Record";
+    return "Record";
 }
 
 static void gui_set_recording_ui(int recording)
 {
+    int timer_armed = g_state.cfg.schedule_only || g_state.cfg.hourly_enable;
     g_toggle_btn_recording = recording;
-    SetWindowTextA(g_hBtnToggle, recording ? "Stop" : gui_record_btn_idle_label());
-    EnableWindow(g_hBtnToggle, TRUE);
+    /* Only reads "Stop" for a genuine ad-hoc recording (Timer not armed)
+     * - a Timer-driven recording starting also calls this with
+     * recording=1, but the button is inert throughout that regardless
+     * (see the EnableWindow() below), so it should keep reading "Record"
+     * the whole time rather than switching to "Stop" for something this
+     * button had no part in starting and can't be used to stop either.  */
+    SetWindowTextA(g_hBtnToggle,
+                   (recording && !timer_armed) ? "Stop" : gui_record_btn_idle_label());
+    /* Record/Stop stays disabled throughout a Timer-driven session
+     * (Section 3.1/3.2) - only re-enabled once Timer itself is turned
+     * off. Without this check, this function running mid-session (the
+     * transition into an actually-recording state, most commonly) kept
+     * unconditionally re-enabling it regardless of Timer's own state,
+     * silently undoing the whole point of disabling it in the first
+     * place.                                                            */
+    EnableWindow(g_hBtnToggle, !timer_armed);
     EnableWindow(g_hBtnAgc,     recording);
     if (g_hBtnSettings) EnableWindow(g_hBtnSettings, !recording);
-    if (g_hBtnSchedToggle) EnableWindow(g_hBtnSchedToggle, TRUE);
+    /* Timer and Record/Stop are kept mutually exclusive while a
+     * recording is actually running, not just while one or the other is
+     * armed: an ad-hoc recording (started via Record, Timer not armed)
+     * now disables Timer for as long as it's in progress, so it can't be
+     * turned on mid-recording and end up fighting over which one
+     * actually owns stopping the session - Stop is the only way out of
+     * an ad-hoc recording, same as Record was the only way into it.
+     * Timer itself stays enabled the whole time a Timer-driven recording
+     * is running, since turning it off is exactly how that kind of
+     * recording gets stopped.                                           */
+    if (g_hBtnSchedToggle) EnableWindow(g_hBtnSchedToggle, !recording || timer_armed);
     InvalidateRect(g_hBtnToggle, NULL, FALSE);
+    /* Picks up g_monitor.enabled possibly having just been forced off by
+     * the worker thread (a scheduled/timer recording actually starting -
+     * see the comment at that assignment) - safe/cheap to always repaint
+     * here regardless of why this was called.                           */
+    if (g_hBtnMonitor) InvalidateRect(g_hBtnMonitor, NULL, FALSE);
 }
 
 /* While listening (device running, no file open yet), the toggle button
@@ -8440,11 +9753,37 @@ static void gui_set_listening_ui(void)
 {
     g_toggle_btn_recording = 0;
     SetWindowTextA(g_hBtnToggle, gui_record_btn_idle_label());
-    EnableWindow(g_hBtnToggle, TRUE);
+    /* Same reasoning as gui_set_recording_ui() above. */
+    EnableWindow(g_hBtnToggle,
+                 !(g_state.cfg.schedule_only || g_state.cfg.hourly_enable));
     EnableWindow(g_hBtnAgc,     TRUE);
     if (g_hBtnSettings) EnableWindow(g_hBtnSettings, TRUE);
     if (g_hBtnSchedToggle) EnableWindow(g_hBtnSchedToggle, TRUE);
     InvalidateRect(g_hBtnToggle, NULL, FALSE);
+}
+
+/* Waits for a previous gui_monitor_thread_func instance to actually exit
+ * (its own loop only checks g_worker_active, so this only makes sense to
+ * call once that's already 0 - true at every call site below, all of
+ * which run after the previous session has genuinely stopped) before a
+ * new one is created, and closes its handle.
+ *
+ * Without this, gui_stop_session()'s wait_for_exit only ever waited for
+ * g_worker_thread (the recording/listening worker) - never for this
+ * separate thread - so a fast stop-then-restart (Timer off then straight
+ * back on while listening is the shortest path to it) could create a
+ * fresh gui_monitor_thread_func while the previous one hadn't quite
+ * finished its last iteration yet. Both then ran concurrently, each
+ * reading and resetting the shared peak level on its own cycle and
+ * stealing the other's freshly-accumulated reading before it was ever
+ * read for real - which is what was surfacing as the level meter
+ * flickering between a real reading and silence on every single update. */
+static void gui_retire_monitor_thread(void)
+{
+    if (!g_gui_mon_thread) return;
+    WaitForSingleObject(g_gui_mon_thread, 6000);
+    CloseHandle(g_gui_mon_thread);
+    g_gui_mon_thread = NULL;
 }
 
 static void gui_start_session(void)
@@ -8490,6 +9829,14 @@ static void gui_start_session(void)
     g_last_infobar_text[0] = '\0';
     g_last_infostrip_text[0] = '\0';
 
+    /* Called with g_worker_active still whatever the previous session left
+     * it at (0, by this point - see the early-return guard above) so a
+     * previous gui_monitor_thread_func, if one is somehow still winding
+     * down, sees that and actually exits rather than mistaking the new
+     * session for its own continuation - see gui_retire_monitor_thread()'s
+     * own comment for why this matters and what it fixes.               */
+    gui_retire_monitor_thread();
+
     g_worker_active = 1;
     g_device_busy   = 1;
     gui_set_recording_ui(1);
@@ -8515,9 +9862,17 @@ static void gui_stop_session(int wait_for_exit)
 
     /* Signal the engine to stop. */
     g_running      = 0;
-    g_http_running = 0;
     g_state.stop_requested = 1;
     g_state.stream_running = 0;
+    g_cancel_listening = 1;   /* Also covers the Tuner 1/2 button-greying
+        guard (monitor_tuner_greyed()/monitor_tuner_config_enabled()) for
+        this stop path, not just gui_cancel_listening()'s - see the reset
+        of this flag in WM_APP_DONE for the full explanation. Every
+        existing check of g_cancel_listening in the worker thread's wait
+        loops is already paired with a g_running check, which this
+        function already clears, so setting it here doesn't change when
+        any of those loops exit - it only adds the signal those two
+        button-state functions need for this stop path too.             */
 
     if (wait_for_exit && g_worker_thread) {
         WaitForSingleObject(g_worker_thread, 35000);
@@ -8580,38 +9935,36 @@ static void gui_start_listening(void)
      * so the display started from an old leftover value and only slowly
      * corrected using new, otherwise-accurate measurements, rather than
      * starting genuinely fresh.                                          */
-    g_monitor.carrier_prev_valid          = 0;
-    g_monitor.carrier_lpf_state.re        = 0.0f;
-    g_monitor.carrier_lpf_state.im        = 0.0f;
-    g_monitor.carrier_dbm_baseline_valid  = 0;
-    g_monitor.carrier_phase_accum         = 0.0;
-    g_monitor.carrier_weight_accum        = 0.0;
-    g_monitor.carrier_accum_samples       = 0;
-    g_monitor.carrier_offset_valid_pub    = 0;
-    g_monitor.carrier_window_count        = 0;
-    g_monitor.carrier_last_raw_valid      = 0;
-    g_monitor.carrier_consec_agree        = 0;
-    g_monitor.carrier_locked_pub          = 0;
-    g_monitor.carrier_last_published_valid = 0;
-    g_monitor.carrier_settled_count        = 0;
-    g_monitor.carrier_settled_pub          = 0;
-    g_monitor.carrier_agc_guard_remaining = CARRIER_AGC_GUARD_SAMPLES;
-    g_monitor.carrier_window_target       = CARRIER_WINDOW_SAMPLES_MIN;
-    g_monitor.carrier_agc_gain_at_start   = 0.0f;
+    g_monitor.carrier_fft_fill             = 0;
+    g_monitor.carrier_blocks_accum         = 0;
+    g_monitor.carrier_offset_valid_pub[0]     = 0;
+    g_monitor.carrier_offset_valid_pub[1]     = 0;
+    g_monitor.carrier_window_count         = 0;
+    g_monitor.carrier_consec_valid         = 0;
+    g_monitor.carrier_consec_rejected      = 0;
+    g_monitor.carrier_locked_pub[0]           = 0;
+    g_monitor.carrier_locked_pub[1]           = 0;
+    g_monitor.carrier_last_published_valid[0] = 0;
+    g_monitor.carrier_last_published_valid[1] = 0;
+    g_monitor.carrier_settled_count[0]        = 0;
+    g_monitor.carrier_settled_count[1]        = 0;
+    g_monitor.carrier_settled_pub[0]          = 0;
+    g_monitor.carrier_settled_pub[1]          = 0;
+    g_monitor.carrier_agc_guard_remaining  = CARRIER_AGC_GUARD_SAMPLES;
 
     if (g_ab_auto_pending && g_state.cfg.dual_channel &&
             fabs(g_state.cfg.frequency_hz - g_state.cfg.freq_b_hz) < 1.0) {
-        /* Tuner A/B are set to the same frequency and this is the first
+        /* Tuner 1/2 are set to the same frequency and this is the first
          * Monitor press since app start (or since the last Settings Save) -
          * turn A=B on automatically so the two stay in sync from the
          * start, without overriding a later deliberate manual toggle. */
         g_monitor.freq_locked = 1;
         /* Actually sync the two dial frequencies here too, not just the
-         * lock flag - otherwise Tuner B's dial frequency sits at its
+         * lock flag - otherwise Tuner 2's dial frequency sits at its
          * startup default (0.0, uninitialized) until the user happens to
          * switch to it for the first time, at which point it snaps to
-         * Tuner B's own coverage centre rather than matching wherever
-         * Tuner A actually is - exactly the "A doesn't equal B when
+         * Tuner 2's own coverage centre rather than matching wherever
+         * Tuner 1 actually is - exactly the "A doesn't equal B when
          * switching" symptom this auto-lock was supposed to prevent.    */
         EnterCriticalSection(&g_monitor.settings_lock);
         g_monitor.freq_hz   = g_state.cfg.frequency_hz;
@@ -8628,6 +9981,7 @@ static void gui_start_listening(void)
     g_last_sched_text[0] = '\0';
     g_last_infobar_text[0] = '\0';
     g_last_infostrip_text[0] = '\0';
+    gui_retire_monitor_thread();
     g_worker_active = 1;
     g_device_busy   = 1;
     gui_set_listening_ui();
@@ -8862,21 +10216,22 @@ static void draw_counter(HDC dc, int x, int y, int w, int h,
     draw_text(dc, x + 10, y + 24, value, valcol, g_hFontBig);
 }
 
-/* Two-row variant for the SUN tile - "SUNRISE  HH:MM" on the top line,
- * "SUNSET  HH:MM" on the line below, rather than draw_counter's usual
- * single label + single value layout. SUNRISE and SUNSET share the same
- * (dim, small) label font so the two rows read consistently; the times
- * use the slightly larger/brighter value font, matching how every other
- * tile emphasises its value over its label.                              */
+/* Two-row variant for the SUN tile - "SUNSET  HH:MM" on the top line,
+ * "SUNRISE  HH:MM" on the line below (sunset shown first since it's
+ * generally the more DX-relevant of the two), rather than draw_counter's
+ * usual single label + single value layout. SUNRISE and SUNSET share the
+ * same (dim, small) label font so the two rows read consistently; the
+ * times use the slightly larger/brighter value font, matching how every
+ * other tile emphasises its value over its label.                        */
 static void draw_suntile(HDC dc, int x, int y, int w, int h,
                           const char *sunrise, const char *sunset)
 {
     RECT r = { x, y, x + w, y + h };
     draw_panel(dc, r);
-    draw_text(dc, x + 10, y + 8,  "SUNRISE", COL_TEXT_DIM, g_hFontUI);
-    draw_text(dc, x + 76, y + 6,  sunrise,   COL_SUNRISE, g_hFontVal);
-    draw_text(dc, x + 10, y + 32, "SUNSET",  COL_TEXT_DIM, g_hFontUI);
-    draw_text(dc, x + 76, y + 30, sunset,    COL_SUNSET, g_hFontVal);
+    draw_text(dc, x + 10, y + 8,  "SUNSET",  COL_TEXT_DIM, g_hFontUI);
+    draw_text(dc, x + 76, y + 6,  sunset,    COL_SUNSET, g_hFontVal);
+    draw_text(dc, x + 10, y + 32, "SUNRISE", COL_TEXT_DIM, g_hFontUI);
+    draw_text(dc, x + 76, y + 30, sunrise,   COL_SUNRISE, g_hFontVal);
 }
 
 /* =========================================================================
@@ -9204,50 +10559,39 @@ static void monitor_update_params(void)
         g_monitor.deemph_state  = 0.0f;
         g_monitor.agc_gain       = 3.0f;
         g_monitor.agc_envelope   = 0.0f;
-        g_monitor.carrier_prev_valid       = 0;
-        g_monitor.carrier_lpf_state.re     = 0.0f;
-        g_monitor.carrier_lpf_state.im     = 0.0f;
-        g_monitor.carrier_dbm_baseline_valid = 0;
-        g_monitor.carrier_phase_accum      = 0.0;
-        g_monitor.carrier_weight_accum     = 0.0;
-        g_monitor.carrier_accum_samples    = 0;
-        g_monitor.carrier_last_raw_valid   = 0;
-        g_monitor.carrier_consec_agree     = 0;
-        if (tuner_changed && !g_monitor.freq_locked) {
-            /* Genuinely a different tuner/frequency - no continuity makes
-             * sense, clear the display too, same as before. Skipped when
-             * A=B is locked: both tuners share the same frequency then,
-             * so switching which one is active/displayed doesn't change
-             * what's actually being measured any more than a bandwidth
-             * change does - same reasoning as the mode/bandwidth case
-             * below applies here too.                                    */
-            g_monitor.carrier_offset_valid_pub = 0;
-            g_monitor.carrier_window_count     = 0;
-            g_monitor.carrier_locked_pub       = 0;
-            g_monitor.carrier_last_published_valid = 0;
-        }
-        /* else: a pure mode/bandwidth change on the same tuner (or a
-         * tuner switch while A=B is locked) - the accumulator internals
-         * above still need a clean restart (the DSP chain, and this
-         * filter's own state, just got rebuilt), but the carrier
-         * frequency itself hasn't moved, so there's no reason to blank
-         * the display and force a full re-lock from scratch. Leaving
-         * offset_valid_pub/window_count/locked_pub alone keeps showing
-         * the last known reading uninterrupted while a fresh
-         * accumulation quietly re-verifies it in the background -
-         * window_count staying wherever it already was (typically at the
-         * smoothing floor by then) means the next few genuine
-         * measurements blend in gradually rather than snapping to
-         * whatever the very first new window happens to read.           */
-        /* Settle status ("(lock)") resets either way - a fresh
-         * accumulation is starting regardless of which branch above ran,
-         * so it's honest to say "still confirming" until it actually has,
-         * rather than keep showing "(lock)" from before the change.     */
-        g_monitor.carrier_settled_count = 0;
-        g_monitor.carrier_settled_pub   = 0;
+        g_monitor.carrier_fft_fill          = 0;
+        g_monitor.carrier_blocks_accum      = 0;
+        g_monitor.carrier_consec_valid      = 0;
+        /* Neither a mode/bandwidth change nor a tuner A/B switch clears
+         * the display here any more - the accumulator internals above
+         * still need a clean restart (the DSP chain, and this filter's
+         * own state, just got rebuilt), but in both cases there's a
+         * real chance the reading is still valid: the carrier frequency
+         * hasn't moved just because the filter did, and switching tuners
+         * doesn't mean the signal is gone - it may be the same station
+         * on a second antenna, just at a different level. carrier_offset_
+         * hz_pub and the rest of the published state (struct comment,
+         * above) are per tuner specifically so this works correctly for
+         * a genuine A/B switch too: leaving them alone here means each
+         * tuner shows its own last published reading immediately on
+         * switching to it, not the other tuner's value re-labelled with
+         * the new dial frequency, while a fresh accumulation quietly
+         * re-verifies that reading in the background - window_count
+         * staying wherever it already was (typically at the smoothing
+         * floor by then) means the next few genuine measurements blend
+         * in gradually rather than snapping to whatever the very first
+         * new window happens to read. If the re-verification instead
+         * comes back consistently empty - most likely a directional
+         * antenna change on a tuner switch nulling the station out -
+         * carrier_consec_rejected below reaches CARRIER_LOSS_MIN_AGREE
+         * and invalidates that tuner's reading at that point, same as it
+         * would during any other sustained loss of signal.
+         *
+         * A genuine retune to a different dial frequency is a separate
+         * code path (the freqdigits scroll handler) and still clears
+         * immediately there, since that really is "somewhere else" with
+         * nothing to preserve continuity with.                          */
         g_monitor.carrier_agc_guard_remaining = CARRIER_AGC_GUARD_SAMPLES;
-        g_monitor.carrier_window_target = CARRIER_WINDOW_SAMPLES_MIN;
-        g_monitor.carrier_agc_gain_at_start = 0.0f;
         /* Mute just long enough to cover whichever filters actually got
          * reset above, rather than always assuming the worst case. A
          * bandwidth-only change only reset the ~127-tap selectivity
@@ -9584,200 +10928,152 @@ static DWORD WINAPI monitor_thread_func(LPVOID param)
                 }
 
                 /* Carrier frequency offset - see the field comments in
-                 * AppMonitor for the method. AM only: SSB/CW have no
-                 * steady carrier to track, and FM's "carrier" is the
-                 * deliberately-varying thing being demodulated.          */
+                 * AppMonitor for the method (FFT peak search across the
+                 * whole channel - see CARRIER_FFT_SIZE for why this
+                 * replaced an earlier narrowband approach). AM only:
+                 * SSB/CW have no steady carrier to track, and FM's
+                 * "carrier" is the deliberately-varying thing being
+                 * demodulated.                                          */
                 {
                 MonMode mode = (MonMode)g_monitor.mode;
                 if (mode == MON_MODE_AM6 || mode == MON_MODE_AM4 ||
                         mode == MON_MODE_AM24) {
-                    /* Narrowband tracking filter - runs unconditionally,
-                     * even during the AGC guard, so its own (much
-                     * shorter, ~40ms) settling transient is long over by
-                     * the time anything downstream starts trusting data.
-                     * See CARRIER_LPF_CUTOFF_HZ and the field comment on
-                     * carrier_lpf_state for why this exists.             */
-                    {
-                        float lpf_alpha = (float)(2.0 * MON_PI * CARRIER_LPF_CUTOFF_HZ /
-                                                   g_monitor.work_rate_hz);
-                        g_monitor.carrier_lpf_state.re +=
-                            lpf_alpha * (sel.re - g_monitor.carrier_lpf_state.re);
-                        g_monitor.carrier_lpf_state.im +=
-                            lpf_alpha * (sel.im - g_monitor.carrier_lpf_state.im);
-                    }
                     if (g_monitor.carrier_agc_guard_remaining > 0) {
                         g_monitor.carrier_agc_guard_remaining--;
-                    } else if (g_monitor.carrier_prev_valid) {
-                        if (g_monitor.carrier_accum_samples == 0) {
-                            g_monitor.carrier_window_target = carrier_window_samples_for_signal();
-                            g_monitor.carrier_agc_gain_at_start = g_monitor.agc_gain;
-                        }
-                        float pr = g_monitor.carrier_lpf_state.re * g_monitor.carrier_prev_sample.re +
-                                   g_monitor.carrier_lpf_state.im * g_monitor.carrier_prev_sample.im;
-                        float pi = g_monitor.carrier_lpf_state.im * g_monitor.carrier_prev_sample.re -
-                                   g_monitor.carrier_lpf_state.re * g_monitor.carrier_prev_sample.im;
-                        float weight = sqrtf(pr * pr + pi * pi);
-                        float dphase = atan2f(pi, pr);
-                        g_monitor.carrier_phase_accum  += (double)dphase * (double)weight;
-                        g_monitor.carrier_weight_accum += (double)weight;
-                        g_monitor.carrier_accum_samples++;
+                    } else {
+                        g_monitor.carrier_fft_buf[g_monitor.carrier_fft_fill] = sel;
+                        g_monitor.carrier_fft_fill++;
 
-                        if (g_monitor.carrier_accum_samples >= g_monitor.carrier_window_target) {
-                            if (g_monitor.carrier_weight_accum > 0.0) {
-                                double mean_dphase = g_monitor.carrier_phase_accum /
-                                                      g_monitor.carrier_weight_accum;
-                                double off_hz = mean_dphase * g_monitor.work_rate_hz /
-                                                (2.0 * MON_PI);
+                        if (g_monitor.carrier_fft_fill >= CARRIER_FFT_SIZE) {
+                            int i;
+                            /* Hann window while promoting to double
+                             * precision for the FFT - keeps the block
+                             * edges from smearing energy across many
+                             * bins, which would both weaken the true
+                             * peak and raise the apparent noise floor
+                             * right around it.                          */
+                            for (i = 0; i < CARRIER_FFT_SIZE; i++) {
+                                double w = 0.5 - 0.5 * cos(2.0 * MON_PI * i /
+                                                            (CARRIER_FFT_SIZE - 1));
+                                g_monitor.carrier_fft_work[i].re =
+                                    g_monitor.carrier_fft_buf[i].re * w;
+                                g_monitor.carrier_fft_work[i].im =
+                                    g_monitor.carrier_fft_buf[i].im * w;
+                            }
+                            carrier_fft(g_monitor.carrier_fft_work, CARRIER_FFT_SIZE, 0);
 
-                                float agc_rel_change =
-                                    (g_monitor.carrier_agc_gain_at_start > 0.0f)
-                                    ? fabsf(g_monitor.agc_gain - g_monitor.carrier_agc_gain_at_start)
-                                      / g_monitor.carrier_agc_gain_at_start
-                                    : 1.0f;
-                                int agc_stable = agc_rel_change <= (float)CARRIER_AGC_STABILITY_FRAC;
+                            if (g_monitor.carrier_blocks_accum == 0)
+                                g_monitor.carrier_blocks_target = carrier_blocks_for_signal();
 
-                                /* Fade check - see the field/constant
-                                 * comments. Independent of agc_stable:
-                                 * a sustained fade can produce windows
-                                 * that agree closely with each other
-                                 * while both are wrong, which the
-                                 * agreement check alone can't catch.    */
-                                int not_fading = !g_monitor.carrier_dbm_baseline_valid ||
-                                    (g_monitor.smeter_dbm_pub >=
-                                     g_monitor.carrier_dbm_baseline - (float)CARRIER_FADE_DROP_DB);
-                                int accepted = agc_stable && not_fading;
+                            for (i = 0; i < CARRIER_FFT_SIZE; i++) {
+                                double re = g_monitor.carrier_fft_work[i].re;
+                                double im = g_monitor.carrier_fft_work[i].im;
+                                double p  = re * re + im * im;
+                                if (g_monitor.carrier_blocks_accum == 0)
+                                    g_monitor.carrier_avg_pwr[i] = p;
+                                else
+                                    g_monitor.carrier_avg_pwr[i] += p;
+                            }
+                            g_monitor.carrier_blocks_accum++;
+                            g_monitor.carrier_fft_fill = 0;
 
-                                if (accepted) {
-                                    /* Lock check - see the field/constant
-                                     * comments. Runs off the raw per-window
-                                     * value, not the smoothed one, since the
-                                     * whole point is to catch disagreement
-                                     * before smoothing has a chance to hide it. */
-                                    if (g_monitor.carrier_last_raw_valid &&
-                                            fabs(off_hz - g_monitor.carrier_last_raw_hz) <=
-                                                CARRIER_LOCK_TOLERANCE_HZ) {
-                                        g_monitor.carrier_consec_agree++;
-                                    } else {
-                                        g_monitor.carrier_consec_agree = 0;
-                                    }
-                                    g_monitor.carrier_locked_pub =
-                                        (g_monitor.carrier_consec_agree >= CARRIER_LOCK_MIN_AGREE);
-                                    g_monitor.carrier_last_raw_hz   = off_hz;
-                                    g_monitor.carrier_last_raw_valid = 1;
+                            if (g_monitor.carrier_blocks_accum >= g_monitor.carrier_blocks_target) {
+                                double peak_to_floor_db;
+                                double off_hz = carrier_find_peak(
+                                    g_monitor.carrier_avg_pwr, CARRIER_FFT_SIZE,
+                                    g_monitor.work_rate_hz, CARRIER_SEARCH_HZ,
+                                    &peak_to_floor_db);
+                                int accepted = (peak_to_floor_db >= CARRIER_VALIDITY_DB);
 
-                                    /* Baseline dbm - slow EMA, updated only
-                                     * from windows that already passed
-                                     * every other check, so a fade can't
-                                     * drag its own detection threshold
-                                     * down with it.                      */
-                                    if (!g_monitor.carrier_dbm_baseline_valid) {
-                                        g_monitor.carrier_dbm_baseline = g_monitor.smeter_dbm_pub;
-                                        g_monitor.carrier_dbm_baseline_valid = 1;
-                                    } else {
-                                        g_monitor.carrier_dbm_baseline +=
-                                            0.1f * (g_monitor.smeter_dbm_pub - g_monitor.carrier_dbm_baseline);
-                                    }
-                                }
+                                g_monitor.carrier_consec_valid =
+                                    accepted ? g_monitor.carrier_consec_valid + 1 : 0;
+                                g_monitor.carrier_locked_pub[g_monitor.tuner_sel] =
+                                    (g_monitor.carrier_consec_valid >= CARRIER_LOCK_MIN_AGREE);
 
                                 if (!accepted) {
-                                    /* Discard entirely - a window ridden
-                                     * through active AGC hunting, or a
-                                     * genuine fade, doesn't get to touch
-                                     * the lock state (already skipped
-                                     * above) or the smoothed estimate
-                                     * either. Confirmed with real data:
-                                     * both a fluctuating-AGC signal and a
-                                     * genuine ~20 dB fade can otherwise
-                                     * drag the smoothed estimate onto a
-                                     * wrong value for a long time.       */
-                                } else if (!g_monitor.carrier_offset_valid_pub) {
-                                    g_monitor.carrier_offset_hz_pub = (float)off_hz;
-                                    g_monitor.carrier_offset_valid_pub = 1;
-                                    g_monitor.carrier_window_count = 1;
+                                    /* No carrier found in this window - count
+                                     * consecutive misses so a reading that's
+                                     * already showing (persisted through a
+                                     * mode/bandwidth change or a tuner A/B
+                                     * switch, see above) gets invalidated
+                                     * once it's clear the signal genuinely
+                                     * isn't there any more, rather than left
+                                     * showing a stale value forever. A
+                                     * single missed window (a brief fade)
+                                     * does not blank it - only a sustained
+                                     * run of them does.                    */
+                                    g_monitor.carrier_consec_rejected++;
+                                    if (g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] &&
+                                            g_monitor.carrier_consec_rejected >=
+                                                CARRIER_LOSS_MIN_AGREE) {
+                                        g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel]     = 0;
+                                        g_monitor.carrier_window_count         = 0;
+                                        g_monitor.carrier_last_published_valid[g_monitor.tuner_sel] = 0;
+                                        g_monitor.carrier_settled_count[g_monitor.tuner_sel]        = 0;
+                                        g_monitor.carrier_settled_pub[g_monitor.tuner_sel]          = 0;
+                                        g_monitor.carrier_consec_rejected      = 0;
+                                    }
                                 } else {
-                                    /* Fast-then-settling EMA: alpha starts
-                                     * at 1 (first window, handled above),
-                                     * halves the gap on the 2nd, a third
-                                     * on the 3rd, and so on - a running
-                                     * average - continuing to shrink well
-                                     * past the initial few windows, down
-                                     * to a 0.1 floor. Windows contaminated
-                                     * by active AGC hunting or a fade are
-                                     * already filtered out above, so what
-                                     * reaches here should be genuinely
-                                     * trustworthy measurement noise around
-                                     * a value that - for a real broadcast
-                                     * carrier - is essentially constant,
-                                     * worth continuing to average down
-                                     * rather than stopping at an arbitrary
-                                     * point. Not as low as the very first
-                                     * attempt at this (0.02): that assumed
-                                     * every accepted window was equally
-                                     * trustworthy, which turned out not to
-                                     * be true until these filters existed -
-                                     * keeping a bit more responsiveness
-                                     * here is a reasonable safety margin
-                                     * against whatever still slips through
-                                     * undetected.                        */
-                                    float alpha = 1.0f / (float)(g_monitor.carrier_window_count + 1);
-                                    if (alpha < 0.1f) alpha = 0.1f;
-                                    g_monitor.carrier_offset_hz_pub +=
-                                        alpha * ((float)off_hz - g_monitor.carrier_offset_hz_pub);
-                                    g_monitor.carrier_window_count++;
+                                    g_monitor.carrier_consec_rejected = 0;
                                 }
 
-                                /* Settle indicator ("(lock)") - see the
-                                 * field/constant comments. Checks how
-                                 * much the PUBLISHED value itself just
-                                 * moved, not the raw measurement -
-                                 * carrier_locked_pub already covers "is
-                                 * this trustworthy enough to show",  this
-                                 * covers "has it actually stopped
-                                 * changing yet". Gated on accepted: a
-                                 * discarded window leaves offset_hz_pub
-                                 * completely untouched, which would
-                                 * otherwise look like "zero change" and
-                                 * count toward settling for entirely the
-                                 * wrong reason - nothing was actually
-                                 * confirmed that window.                  */
                                 if (accepted) {
-                                    if (g_monitor.carrier_last_published_valid &&
-                                            fabsf(g_monitor.carrier_offset_hz_pub -
-                                                  g_monitor.carrier_last_published_hz) <=
-                                                (float)CARRIER_SETTLE_TOLERANCE_HZ) {
-                                        g_monitor.carrier_settled_count++;
+                                    /* Fast-then-settling EMA: alpha starts at 1
+                                     * (first accepted measurement), halves the
+                                     * gap on the 2nd, a third on the 3rd, and
+                                     * so on down to a 0.1 floor - a real
+                                     * broadcast carrier is essentially
+                                     * constant, so continuing to average down
+                                     * well past the first few measurements is
+                                     * worth it for display stability.        */
+                                    if (!g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel]) {
+                                        g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel] = (float)off_hz;
+                                        g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] = 1;
+                                        g_monitor.carrier_window_count = 1;
                                     } else {
-                                        g_monitor.carrier_settled_count = 0;
+                                        float alpha = 1.0f /
+                                            (float)(g_monitor.carrier_window_count + 1);
+                                        if (alpha < 0.1f) alpha = 0.1f;
+                                        g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel] +=
+                                            alpha * ((float)off_hz - g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel]);
+                                        g_monitor.carrier_window_count++;
                                     }
-                                    g_monitor.carrier_settled_pub =
-                                        (g_monitor.carrier_settled_count >= CARRIER_SETTLE_MIN_COUNT);
-                                    g_monitor.carrier_last_published_hz   = g_monitor.carrier_offset_hz_pub;
-                                    g_monitor.carrier_last_published_valid = 1;
+
+                                    /* Settle indicator ("(lock)") - tracks
+                                     * the PUBLISHED value's own recent
+                                     * stability, separate from
+                                     * carrier_locked_pub (which only means
+                                     * "trustworthy enough to show at all"). */
+                                    if (g_monitor.carrier_last_published_valid[g_monitor.tuner_sel] &&
+                                            fabsf(g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel] -
+                                                  g_monitor.carrier_last_published_hz[g_monitor.tuner_sel]) <=
+                                                (float)CARRIER_SETTLE_TOLERANCE_HZ) {
+                                        g_monitor.carrier_settled_count[g_monitor.tuner_sel]++;
+                                    } else {
+                                        g_monitor.carrier_settled_count[g_monitor.tuner_sel] = 0;
+                                    }
+                                    g_monitor.carrier_settled_pub[g_monitor.tuner_sel] =
+                                        (g_monitor.carrier_settled_count[g_monitor.tuner_sel] >= CARRIER_SETTLE_MIN_COUNT);
+                                    g_monitor.carrier_last_published_hz[g_monitor.tuner_sel]   = g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel];
+                                    g_monitor.carrier_last_published_valid[g_monitor.tuner_sel] = 1;
                                 }
+
+                                g_monitor.carrier_blocks_accum = 0;
                             }
-                            g_monitor.carrier_phase_accum  = 0.0;
-                            g_monitor.carrier_weight_accum = 0.0;
-                            g_monitor.carrier_accum_samples = 0;
                         }
                     }
-                    g_monitor.carrier_prev_sample = g_monitor.carrier_lpf_state;
-                    g_monitor.carrier_prev_valid  = 1;
                 } else {
-                    g_monitor.carrier_prev_valid       = 0;
-                    g_monitor.carrier_lpf_state.re     = 0.0f;
-                    g_monitor.carrier_lpf_state.im     = 0.0f;
-                    g_monitor.carrier_dbm_baseline_valid = 0;
-                    g_monitor.carrier_offset_valid_pub = 0;
-                    g_monitor.carrier_window_count     = 0;
-                    g_monitor.carrier_last_raw_valid   = 0;
-                    g_monitor.carrier_consec_agree     = 0;
-                    g_monitor.carrier_locked_pub       = 0;
-                    g_monitor.carrier_last_published_valid = 0;
-                    g_monitor.carrier_settled_count        = 0;
-                    g_monitor.carrier_settled_pub          = 0;
-                    g_monitor.carrier_agc_guard_remaining = CARRIER_AGC_GUARD_SAMPLES;
-                    g_monitor.carrier_window_target = CARRIER_WINDOW_SAMPLES_MIN;
-                    g_monitor.carrier_agc_gain_at_start = 0.0f;
+                    g_monitor.carrier_fft_fill             = 0;
+                    g_monitor.carrier_blocks_accum         = 0;
+                    g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel]     = 0;
+                    g_monitor.carrier_window_count         = 0;
+                    g_monitor.carrier_consec_valid         = 0;
+                    g_monitor.carrier_consec_rejected      = 0;
+                    g_monitor.carrier_locked_pub[g_monitor.tuner_sel]           = 0;
+                    g_monitor.carrier_last_published_valid[g_monitor.tuner_sel] = 0;
+                    g_monitor.carrier_settled_count[g_monitor.tuner_sel]        = 0;
+                    g_monitor.carrier_settled_pub[g_monitor.tuner_sel]          = 0;
+                    g_monitor.carrier_agc_guard_remaining  = CARRIER_AGC_GUARD_SAMPLES;
                 }
                 }
 
@@ -9889,7 +11185,7 @@ static void monitor_global_init(void)
     InitializeCriticalSection(&g_monitor.settings_lock);
 
     g_monitor.freq_hz   = DEFAULT_FREQUENCY_HZ;
-    g_monitor.freq_hz_b = 0.0;   /* unset - auto-centres on first use of Tuner B */
+    g_monitor.freq_hz_b = 0.0;   /* unset - auto-centres on first use of Tuner 2 */
     g_monitor.bw_khz    = MON_MODE_INFO[MON_MODE_AM6].bw_khz_default;
     g_monitor.notch_khz = 0.0;
     g_monitor.mode      = MON_MODE_AM6;
@@ -9927,40 +11223,45 @@ static void monitor_shutdown(void)
  * ========================================================================= */
 static void monitor_create_controls(HWND parent, HINSTANCE hInst)
 {
-    int i;
     char buf[32];
 
     g_hBtnMonitor = mk_button(parent, IDC_BTN_MONITOR,
                                (!g_state.cfg.dual_channel &&
                                 !strcmp(g_state.cfg.rspduo_single_tuner, "B"))
-                               ? "Tuner B" : "Tuner A");
-    g_hBtnFreqLock = mk_button(parent, IDC_BTN_FREQ_LOCK, "A=B");
+                               ? "Tuner 2" : "Tuner 1");
+    g_hBtnTunerA = mk_button(parent, IDC_BTN_TUNER_A, "1");
+    g_hBtnTunerB = mk_button(parent, IDC_BTN_TUNER_B, "2");
+    g_hBtnFreqLock = mk_button(parent, IDC_BTN_FREQ_LOCK, "LOCK");
     EnableWindow(g_hBtnFreqLock, FALSE);   /* Monitor is off at creation
         * time - monitor_sync_button_label() enables it once a session
         * actually meets the criteria (Monitor on, matching CFs).         */
+
+    /* Antenna quick-select (Section 13.1) - a single button to the left
+     * of Tuner 1/Monitor, bottom-aligned with it and with a small
+     * "ANTENNA" label above; left-click brings up a menu (see antenna_
+     * show_menu()). Hidden entirely on devices with nothing to pick
+     * between - see antenna_slot_info() and monitor_layout.             */
+    g_hBtnAnt = mk_button(parent, IDC_BTN_ANT, "Ant");
+    g_hAntLbl = CreateWindowExA(0, "STATIC", "ANTENNA",
+                    WS_CHILD | WS_VISIBLE | SS_CENTER,
+                    0, 0, 10, 10, parent, NULL, hInst, NULL);
+    if (g_hFontTiny) SendMessageA(g_hAntLbl, WM_SETFONT, (WPARAM)g_hFontTiny, TRUE);
 
     g_hFreqDigits = freqdigits_create(parent, hInst);
     g_hMonHzLbl = CreateWindowExA(0, "STATIC", "Hz", WS_CHILD | WS_VISIBLE | SS_LEFT,
                     0, 0, 10, 10, parent, NULL, hInst, NULL);
 
-    g_hMonModeLbl = CreateWindowExA(0, "STATIC", "Mode", WS_CHILD | WS_VISIBLE | SS_LEFT,
+    /* "MODE:" plus a plain static readout of the current mode name,
+     * rather than an interactive dropdown - left-clicking the bandwidth
+     * digits (Section 10) now brings up the same mode+bandwidth choices
+     * in one menu, so a separate always-open combo box here was
+     * redundant as well as visually heavier than it needed to be.       */
+    g_hMonModeLbl = CreateWindowExA(0, "STATIC", "MODE:", WS_CHILD | WS_VISIBLE | SS_LEFT,
                     0, 0, 10, 10, parent, NULL, hInst, NULL);
-    g_hMonMode = CreateWindowExA(0, "COMBOBOX", "",
-                    WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
-                    0, 0, 10, 10, parent, (HMENU)(INT_PTR)IDC_COMBO_MON_MODE,
-                    hInst, NULL);
-    for (i = 0; i < MON_MODE_COUNT; i++)
-        SendMessageA(g_hMonMode, CB_ADDSTRING, 0, (LPARAM)MON_MODE_INFO[MON_MODE_DISPLAY_ORDER[i]].name);
-    SendMessageA(g_hMonMode, CB_SETCURSEL, (WPARAM)0, 0); /* display index 0 = MON_MODE_AM6 */
-    {
-        HMODULE hUx = LoadLibraryA("uxtheme.dll");
-        if (hUx) {
-            typedef HRESULT (WINAPI *PFN_SWT)(HWND, LPCWSTR, LPCWSTR);
-            PFN_SWT pSwt = (PFN_SWT)GetProcAddress(hUx, "SetWindowTheme");
-            if (pSwt) pSwt(g_hMonMode, L"DarkMode_Explorer", NULL);
-            FreeLibrary(hUx);
-        }
-    }
+    g_hMonMode = CreateWindowExA(0, "STATIC",
+                    "AM",
+                    WS_CHILD | WS_VISIBLE | SS_LEFT,
+                    0, 0, 10, 10, parent, NULL, hInst, NULL);
 
     g_hBwDigits = bwdigits_create(parent, hInst);
     g_hMonKhzLbl = CreateWindowExA(0, "STATIC", "kHz", WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -10048,11 +11349,23 @@ static void monitor_layout(HWND hwnd, int right_edge, int bar_y, int bar_h)
 {
     int x = 14;
     int w_btn = 86, w_lock = 44, w_freq = 160, w_hz = 20;
-    int w_mode_lbl = 38, w_mode = 105;
+    int w_mode_lbl = 44, w_mode = 42;
     int w_bw_digits = 70, w_khz = 28;
     int w_notch_lbl = 58, w_notch_digits = 86, w_notch_khz = 28;
     int w_vol_lbl = 26, w_vol_val = 50;
     int w_hpf_lbl = 76, w_hpf_val = 54;
+    /* Tuner 1/Tuner 2 are wide enough to show their full label text -
+     * they're the primary start/stop + tuner-select controls now, not a
+     * small accessory next to a separate Monitor button, so they get a
+     * comfortable width rather than being squeezed into single letters. */
+    int w_tuner_btn = 78, tuner_gap = 4;
+    int use_tuner_buttons = !monitor_use_single_button();
+    /* Total width of whichever control(s) occupy this slot - Monitor
+     * alone in legacy mode, or Tuner 1 + gap + Tuner 2 in the new
+     * (default) mode, which replaces Monitor's slot rather than sitting
+     * alongside it - there's no separate Monitor button visible at all
+     * in the new mode.                                                    */
+    int w_start_slot = use_tuner_buttons ? (w_tuner_btn * 2 + tuner_gap) : w_btn;
     /* Tight gaps sit between a control and something that reads as part
      * of the same unit with it - a digit display and its own unit label
      * (e.g. "kHz"), but also Monitor/A=B, Mode/Bandwidth, and the Notch
@@ -10067,10 +11380,33 @@ static void monitor_layout(HWND hwnd, int right_edge, int bar_y, int bar_h)
     int row2_y = bar_y + row1_h + BOTTOM_MON_ROW_GAP;
     int slider_x, slider_w, slider_right, slider_h;
     int fixed_w, n_group_gaps = 3, gap_group;
+    /* Antenna quick-select (Section 13.1) - a single button, same height
+     * as row 1, to the left of Tuner 1/Monitor; left-click brings up a
+     * menu (antenna_show_menu()) rather than needing its own dedicated
+     * space per option. Reserved only when antenna_slot_info() says the
+     * connected device actually has more than one antenna to pick
+     * between - zero width otherwise, so a device with nothing to
+     * select (RSP1/RSP1A/RSP1B, or an RSPduo dual/Master-Slave session)
+     * doesn't leave a dead gap where this would otherwise sit.          */
+    int n_ant = antenna_slot_info(NULL, NULL);
+    int w_ant = 56;   /* column width - the label above uses this in full */
+    int w_ant_btn = w_ant - 10;   /* button itself is a bit narrower than
+                                      the label, centred within the column */
+    /* Noticeably shorter than the other row-1 buttons - a small
+     * secondary control sitting next to Tuner 1/Monitor rather than
+     * matching its full height, which read as competing with it for
+     * attention rather than as the occasional-use accessory it is.     */
+    int h_ant = row1_h - 15;
+    int ant_total = n_ant > 0 ? (w_ant + gap_tight) : 0;
 
     (void)hwnd; (void)bar_h;
 
-    fixed_w = w_btn + gap_tight + w_lock
+    if (n_ant <= 0) {
+        ShowWindow(g_hBtnAnt, SW_HIDE);
+        ShowWindow(g_hAntLbl, SW_HIDE);
+    }
+
+    fixed_w = ant_total + w_start_slot + gap_tight + w_lock
             + w_freq + gap_tight + w_hz
             + w_mode_lbl + gap_tight + w_mode + gap_tight + w_bw_digits + gap_tight + w_khz
             + w_notch_lbl + gap_tight + w_notch_digits + gap_tight + w_notch_khz;
@@ -10085,24 +11421,81 @@ static void monitor_layout(HWND hwnd, int right_edge, int bar_y, int bar_h)
         if (leftover > 0) x += leftover / 2;
     }
 
+    /* Antenna quick-select (Section 13.1) - placed here, after the
+     * centring shift above rather than before it, specifically so the
+     * gap to Tuner 1/Monitor right after it stays the fixed gap_tight
+     * regardless of how much leftover space that shift ends up
+     * distributing - placing it earlier meant the shift only ever
+     * widened the gap between these two specific controls (everything
+     * placed after the shift moved together, so their gaps stayed
+     * consistent; this one didn't, since it was already positioned
+     * before the shift ran).                                           */
+    if (n_ant > 0) {
+        const char *ant_labels[3], *ant_values[3];
+        const char *sel = NULL;
+        int i;
+        antenna_slot_info(ant_labels, ant_values);
+        for (i = 0; i < n_ant; i++) {
+            if (!strcmp(g_state.cfg.antenna, ant_values[i])) {
+                sel = ant_labels[i];
+                break;
+            }
+        }
+        SetWindowTextA(g_hBtnAnt, sel ? sel : ant_labels[0]);
+        /* Bottom-aligned with Tuner 1/Monitor, with the "ANTENNA" label
+         * filling the space left above it rather than the button being
+         * vertically centred - matches Tuner 1/Monitor's own baseline so
+         * the two read as sitting on the same line, with the label
+         * acting as a header for the pair rather than a floating aside. */
+        MoveWindow(g_hBtnAnt, x + (w_ant - w_ant_btn) / 2, bar_y + row1_h - h_ant,
+                   w_ant_btn, h_ant, TRUE);
+        MoveWindow(g_hAntLbl, x, bar_y, w_ant, row1_h - h_ant, TRUE);
+        ShowWindow(g_hBtnAnt, SW_SHOW);
+        ShowWindow(g_hAntLbl, SW_SHOW);
+    }
+    x += ant_total;
+
     /* Row 1 */
-    MoveWindow(g_hBtnMonitor, x, bar_y, w_btn, row1_h, TRUE);
-    x += w_btn + gap_tight;
+    if (use_tuner_buttons) {
+        MoveWindow(g_hBtnTunerA, x, bar_y, w_tuner_btn, row1_h, TRUE);
+        x += w_tuner_btn + tuner_gap;
+        MoveWindow(g_hBtnTunerB, x, bar_y, w_tuner_btn, row1_h, TRUE);
+        x += w_tuner_btn;
+        ShowWindow(g_hBtnMonitor, SW_HIDE);
+        ShowWindow(g_hBtnTunerA, SW_SHOW);
+        ShowWindow(g_hBtnTunerB, SW_SHOW);
+        /* Genuinely disables whichever tuner isn't actually usable per
+         * current Settings - see monitor_tuner_config_enabled().        */
+        EnableWindow(g_hBtnTunerA, monitor_tuner_config_enabled(0));
+        EnableWindow(g_hBtnTunerB, monitor_tuner_config_enabled(1));
+    } else {
+        MoveWindow(g_hBtnMonitor, x, bar_y, w_btn, row1_h, TRUE);
+        x += w_btn;
+        ShowWindow(g_hBtnMonitor, SW_SHOW);
+        ShowWindow(g_hBtnTunerA, SW_HIDE);
+        ShowWindow(g_hBtnTunerB, SW_HIDE);
+    }
+    x += gap_tight;
 
     MoveWindow(g_hBtnFreqLock, x, bar_y, w_lock, row1_h, TRUE);
-    x += w_lock + gap_group;
+    /* A=B only means anything once there are two individually-selectable
+     * tuners to lock together - on a single-tuner device (the Tuner 1/
+     * Tuner 2 buttons aren't showing either, in that case) it has
+     * nothing to do, so it's hidden along with them rather than sitting
+     * there as a button with no purpose. Its width is skipped too when
+     * hidden, so the frequency digits shift left to fill the space
+     * rather than leaving a gap where the button used to be.            */
+    ShowWindow(g_hBtnFreqLock, use_tuner_buttons ? SW_SHOW : SW_HIDE);
+    if (use_tuner_buttons) x += w_lock + gap_group;
 
     MoveWindow(g_hFreqDigits, x, bar_y + 2, w_freq, row1_h - 4, TRUE);
     x += w_freq + gap_tight;
     MoveWindow(g_hMonHzLbl, x, bar_y + (row1_h - 16) / 2, w_hz, 16, TRUE);
     x += w_hz + gap_group;
 
-    /* A combo box's height parameter covers the closed box PLUS the open
-     * drop-down list - giving it only row1_h leaves no room to drop down,
-     * so nothing appears to happen when another mode is picked. */
     MoveWindow(g_hMonModeLbl, x, bar_y + (row1_h - 16) / 2, w_mode_lbl, 16, TRUE);
     x += w_mode_lbl + gap_tight;
-    MoveWindow(g_hMonMode, x, bar_y + 2, w_mode, row1_h - 4 + 160, TRUE);
+    MoveWindow(g_hMonMode, x, bar_y + (row1_h - 16) / 2, w_mode, 16, TRUE);
     x += w_mode + gap_tight;
 
     MoveWindow(g_hBwDigits, x, bar_y + 2, w_bw_digits, row1_h - 4, TRUE);
@@ -10121,7 +11514,7 @@ static void monitor_layout(HWND hwnd, int right_edge, int bar_y, int bar_h)
      * pattern as row 1. Low Cut's slider gets a fixed width now rather
      * than stretching to the right edge, since the S-meter needs to sit
      * after it and fill the remaining space itself instead.              */
-    x = 14;
+    x = 14 + ant_total;
     MoveWindow(g_hMonVolLbl, x, row2_y + (row2_h - 16) / 2, w_vol_lbl, 16, TRUE);
     x += w_vol_lbl + gap_tight;
 
@@ -10299,6 +11692,480 @@ static double *monitor_active_freq_ptr(void)
     return p;
 }
 
+/* Which set of step presets applies to a given frequency (Section 10,
+ * "Tuning Step"). 0 = VLF/LF/MF/HF (below 30 MHz): 5/9/10 kHz, the
+ * broadcast/utility allocation grids in that range. 1 = FM broadcast
+ * (88-108 MHz specifically, not all of VHF): 25/50/100 kHz, the FM
+ * channel spacings in use worldwide. 2 = other VHF/UHF: 5/6.25/10/12.5/
+ * 25 kHz, the land-mobile/aero/marine channel spacings most commonly
+ * found there. Also used to index g_freqStepCustomHz, so a Custom value
+ * picked once for one group doesn't leak into a different one.          */
+static int freqstep_band_group(double freq_hz)
+{
+    if (freq_hz < 30000000.0) return 0;
+    if (freq_hz >= 88000000.0 && freq_hz <= 108000000.0) return 1;
+    return 2;
+}
+
+/* Rounds freq_hz to the nearest multiple of step_hz, measured from 0 Hz -
+ * matches every broadcast/utility channel grid actually in use (MW, FM,
+ * NAmerica MW, aero, land-mobile) without needing a per-grid offset, since
+ * each of those grids' own channels already land on exact multiples of
+ * their own spacing counted from 0 Hz. step_hz <= 0 returns freq_hz
+ * unchanged.                                                             */
+static double freqstep_snap(double freq_hz, double step_hz)
+{
+    double n;
+    if (step_hz <= 0.0) return freq_hz;
+    n = floor(freq_hz / step_hz + 0.5);
+    return n * step_hz;
+}
+
+/* Whether the currently active step (g_freqStepHz) is a Custom one, and
+ * the anchor frequency it's measured from - set when Custom is picked
+ * from the step menu, to whatever the operator was tuned to at that
+ * moment (see freqdigits_show_step_menu()). Presets keep snapping from
+ * 0 Hz via freqstep_snap() above, since that's genuinely where the real
+ * broadcast/channel grids they represent line up. Custom steps are
+ * commonly irregular grids that aren't 0-anchored at all - HF utility/
+ * numbers stations, for instance, are often worked in 3 kHz steps but
+ * from an odd starting point (8867, 8870, 8873 kHz - none of those are
+ * exact multiples of 3 kHz counted from 0), so Custom instead measures
+ * from wherever the operator actually was when they set it up.          */
+static int    g_freqStepIsCustom  = 0;
+static double g_freqStepAnchorHz  = 0.0;
+
+/* Single place all three step-consumers (menu selection, mouse wheel,
+ * Page Up/Down) snap through, so Custom's different-anchor behaviour
+ * only has to be implemented once rather than three times.              */
+static double freqstep_snap_active(double freq_hz)
+{
+    if (g_freqStepHz <= 0.0) return freq_hz;
+    if (g_freqStepIsCustom) {
+        double n = floor((freq_hz - g_freqStepAnchorHz) / g_freqStepHz + 0.5);
+        return g_freqStepAnchorHz + n * g_freqStepHz;
+    }
+    return freqstep_snap(freq_hz, g_freqStepHz);
+}
+
+/* Applies a (possibly snapped) frequency to whichever tuner is active,
+ * clamped to coverage and mirrored to the locked tuner exactly the same
+ * way the mouse wheel handler does - shared so the step-menu selection,
+ * the wheel, and Page Up/Down all go through one place rather than three
+ * slightly-different copies of the same clamp/lock/carrier-clear logic. */
+static void freqstep_apply(double new_freq_hz)
+{
+    double *pfreq, center;
+    int locked, other_sel = -1;
+    EnterCriticalSection(&g_monitor.settings_lock);
+    pfreq = monitor_active_freq_ptr();
+    center = monitor_center_for_tuner((int)g_monitor.tuner_sel);
+    *pfreq = monitor_clamp_to_coverage(new_freq_hz, center);
+    locked = g_monitor.freq_locked;
+    if (locked) {
+        other_sel = g_monitor.tuner_sel == 0 ? 1 : 0;
+        double other_center = monitor_center_for_tuner(other_sel);
+        double clamped = monitor_clamp_to_coverage(*pfreq, other_center);
+        if (other_sel == 1)
+            g_monitor.freq_hz_b = clamped;
+        else
+            g_monitor.freq_hz = clamped;
+    }
+    g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] = 0;
+    g_monitor.carrier_locked_pub[g_monitor.tuner_sel]       = 0;
+    g_monitor.carrier_consec_valid     = 0;
+    g_monitor.carrier_consec_rejected  = 0;
+    g_monitor.carrier_last_published_valid[g_monitor.tuner_sel] = 0;
+    g_monitor.carrier_settled_count[g_monitor.tuner_sel]        = 0;
+    g_monitor.carrier_settled_pub[g_monitor.tuner_sel]          = 0;
+    /* A=B locked - the other tuner's frequency was just mirrored above,
+     * so its own published reading is exactly as stale as this tuner's
+     * and needs clearing too, not just the one actually being scrolled. */
+    if (locked && other_sel >= 0) {
+        g_monitor.carrier_offset_valid_pub[other_sel] = 0;
+        g_monitor.carrier_locked_pub[other_sel]       = 0;
+        g_monitor.carrier_last_published_valid[other_sel] = 0;
+        g_monitor.carrier_settled_count[other_sel]        = 0;
+        g_monitor.carrier_settled_pub[other_sel]          = 0;
+    }
+    LeaveCriticalSection(&g_monitor.settings_lock);
+
+    if (g_hFreqDigits) InvalidateRect(g_hFreqDigits, NULL, FALSE);
+}
+
+/* IDs for the tuning-step popup menu built in freqdigits_show_step_menu(). */
+#define IDM_FREQSTEP_DEFAULT   4001
+#define IDM_FREQSTEP_CUSTOM    4002
+#define IDM_FREQSTEP_PRESET0   4010   /* +0..+7 for up to 8 presets per group */
+#define IDM_SMETER_AUTOCAL     4020
+#define IDM_SMETER_SETCAL      4021
+
+/* Small modal prompt for a custom step size in kHz - just a label, one
+ * edit field, OK and Cancel, the same weight as similarly small one-field
+ * prompts elsewhere in the app rather than a full dialog. Returns the
+ * entered value in Hz, or 0.0 if cancelled/left blank/invalid.           */
+/* State for the custom-step prompt below - one dialog at a time, same as
+ * the rest of the app's small popups, so plain statics are fine.         */
+static double g_freqStepPromptResult;
+static HWND   g_freqStepPromptEdit;
+
+static LRESULT CALLBACK freqstep_prompt_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == IDOK) {
+            char editbuf[32];
+            GetWindowTextA(g_freqStepPromptEdit, editbuf, sizeof(editbuf));
+            double khz = atof(editbuf);
+            if (khz > 0.0) g_freqStepPromptResult = khz * 1000.0;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static double freqstep_prompt_custom(HWND parent, double current_hz)
+{
+    /* Reuses the Settings window's own small-prompt machinery is more
+     * than this needs - a plain MessageBox-style modal with one edit
+     * control, built and torn down on the spot, keeps this self-
+     * contained rather than pulling in the Settings dialog's much
+     * larger tab/control infrastructure for a single number. Needs its
+     * own real window procedure (below) rather than DefWindowProcA,
+     * though - a button's BN_CLICKED is delivered as WM_COMMAND sent
+     * straight to the parent's window procedure as part of handling the
+     * click, not posted through the message queue, so a message loop
+     * alone watching GetMessage() output - as an earlier version of this
+     * did - never actually sees it and OK/Cancel do nothing.            */
+    WNDCLASSA wc;
+    static int class_registered = 0;
+    if (!class_registered) {
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = freqstep_prompt_wndproc;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = "DuoDXFreqStepPrompt";
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+        RegisterClassA(&wc);
+        class_registered = 1;
+    }
+
+    g_freqStepPromptResult = 0.0;
+
+    RECT pr;
+    GetWindowRect(parent, &pr);
+    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "DuoDXFreqStepPrompt",
+        "Custom Tuning Step", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        pr.left + (pr.right - pr.left) / 2 - 130, pr.top + (pr.bottom - pr.top) / 3, 260, 130,
+        parent, NULL, GetModuleHandleA(NULL), NULL);
+    if (!hDlg) return 0.0;
+
+    HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HWND hLbl = CreateWindowExA(0, "STATIC", "Step size (kHz):",
+        WS_CHILD | WS_VISIBLE, 16, 16, 200, 20, hDlg, NULL, GetModuleHandleA(NULL), NULL);
+    SendMessageA(hLbl, WM_SETFONT, (WPARAM)hf, TRUE);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.4g", current_hz / 1000.0);
+    g_freqStepPromptEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", current_hz > 0.0 ? buf : "",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 16, 40, 100, 24,
+        hDlg, NULL, GetModuleHandleA(NULL), NULL);
+    SendMessageA(g_freqStepPromptEdit, WM_SETFONT, (WPARAM)hf, TRUE);
+    HWND hOk = CreateWindowExA(0, "BUTTON", "OK",
+        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 40, 76, 80, 26,
+        hDlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleA(NULL), NULL);
+    SendMessageA(hOk, WM_SETFONT, (WPARAM)hf, TRUE);
+    HWND hCancel = CreateWindowExA(0, "BUTTON", "Cancel",
+        WS_CHILD | WS_VISIBLE, 140, 76, 80, 26,
+        hDlg, (HMENU)(INT_PTR)IDCANCEL, GetModuleHandleA(NULL), NULL);
+    SendMessageA(hCancel, WM_SETFONT, (WPARAM)hf, TRUE);
+
+    SetFocus(g_freqStepPromptEdit);
+    SendMessageA(g_freqStepPromptEdit, EM_SETSEL, 0, -1);
+    ShowWindow(hDlg, SW_SHOW);
+
+    /* Small self-contained modal loop - IsDialogMessageA handles Enter
+     * (clicks the default button, OK) and Escape (Cancel, via the
+     * WS_SYSMENU/WM_CLOSE route IsDialogMessageA maps it to) for free
+     * once the window procedure above actually responds to WM_COMMAND;
+     * the loop itself just needs to keep pumping until the window is
+     * gone, however that happened (OK, Cancel, Escape, or the X button -
+     * all now go through DestroyWindow the same way).                   */
+    while (IsWindow(hDlg)) {
+        MSG msg;
+        if (!GetMessageA(&msg, NULL, 0, 0)) break;
+        if (!IsDialogMessageA(hDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+    return g_freqStepPromptResult;
+}
+
+/* Same self-contained modal-prompt pattern as freqstep_prompt_custom()
+ * just above, for one different number - see that function's own
+ * comment for why this doesn't reuse the Settings dialog's machinery.
+ * A separate "confirmed" flag (rather than freqstep's >0.0 check) is
+ * needed here since a calibration value of exactly 0 - or a genuinely
+ * negative one - is a normal, valid entry, not a sentinel for
+ * "cancelled".                                                          */
+static double g_carrierCalibPromptResult;
+static int    g_carrierCalibPromptConfirmed;
+static HWND   g_carrierCalibPromptEdit;
+
+static LRESULT CALLBACK carrier_calib_prompt_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id == IDOK) {
+            char editbuf[32];
+            GetWindowTextA(g_carrierCalibPromptEdit, editbuf, sizeof(editbuf));
+            g_carrierCalibPromptResult = atof(editbuf);
+            g_carrierCalibPromptConfirmed = 1;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+/* Returns 1 and fills *result_hz if the user confirmed (OK, or Enter),
+ * 0 if they cancelled (Cancel, Escape, or the X button) - *result_hz is
+ * left untouched in that case.                                          */
+static int carrier_calib_prompt(HWND parent, double current_hz, double *result_hz)
+{
+    static int class_registered = 0;
+    if (!class_registered) {
+        WNDCLASSA wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = carrier_calib_prompt_wndproc;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = "DuoDXCarrierCalibPrompt";
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+        RegisterClassA(&wc);
+        class_registered = 1;
+    }
+
+    g_carrierCalibPromptResult = 0.0;
+    g_carrierCalibPromptConfirmed = 0;
+
+    RECT pr;
+    GetWindowRect(parent, &pr);
+    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "DuoDXCarrierCalibPrompt",
+        "Carrier Offset Calibration", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        pr.left + (pr.right - pr.left) / 2 - 130, pr.top + (pr.bottom - pr.top) / 3, 260, 130,
+        parent, NULL, GetModuleHandleA(NULL), NULL);
+    if (!hDlg) return 0;
+
+    HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HWND hLbl = CreateWindowExA(0, "STATIC", "Calibration (Hz, +/-):",
+        WS_CHILD | WS_VISIBLE, 16, 16, 220, 20, hDlg, NULL, GetModuleHandleA(NULL), NULL);
+    SendMessageA(hLbl, WM_SETFONT, (WPARAM)hf, TRUE);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.5f", current_hz);
+    g_carrierCalibPromptEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", buf,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 16, 40, 120, 24,
+        hDlg, NULL, GetModuleHandleA(NULL), NULL);
+    SendMessageA(g_carrierCalibPromptEdit, WM_SETFONT, (WPARAM)hf, TRUE);
+    HWND hOk = CreateWindowExA(0, "BUTTON", "OK",
+        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 40, 76, 80, 26,
+        hDlg, (HMENU)(INT_PTR)IDOK, GetModuleHandleA(NULL), NULL);
+    SendMessageA(hOk, WM_SETFONT, (WPARAM)hf, TRUE);
+    HWND hCancel = CreateWindowExA(0, "BUTTON", "Cancel",
+        WS_CHILD | WS_VISIBLE, 140, 76, 80, 26,
+        hDlg, (HMENU)(INT_PTR)IDCANCEL, GetModuleHandleA(NULL), NULL);
+    SendMessageA(hCancel, WM_SETFONT, (WPARAM)hf, TRUE);
+
+    SetFocus(g_carrierCalibPromptEdit);
+    SendMessageA(g_carrierCalibPromptEdit, EM_SETSEL, 0, -1);
+    ShowWindow(hDlg, SW_SHOW);
+
+    while (IsWindow(hDlg)) {
+        MSG msg;
+        if (!GetMessageA(&msg, NULL, 0, 0)) break;
+        if (!IsDialogMessageA(hDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+    if (g_carrierCalibPromptConfirmed) *result_hz = g_carrierCalibPromptResult;
+    return g_carrierCalibPromptConfirmed;
+}
+
+/* Applies a new carrier_offset_calib_hz live (no Settings dialog, no
+ * restart needed - it's a pure display-side correction, never touching
+ * the recorded IQ data or anything requiring the SDRplay API, so there's
+ * no reason it should have needed the whole dialog in the first place)
+ * and patches duodx.ini immediately, same pattern as monitor_hpf_enable's
+ * own main-window control (IDC_BTN_HPF_ENABLE).                          */
+static void carrier_calib_apply(double new_hz)
+{
+    IniPatchEntry e[1];
+    g_state.cfg.carrier_offset_calib_hz = new_hz;
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+    e[0].key = "carrier_offset_calib_hz";
+    snprintf(e[0].value, sizeof(e[0].value), "%.5f", new_hz);
+    ini_patch_values("duodx.ini", e, 1);
+}
+
+/* Shared by both the S-meter's right-click and a left-click directly on
+ * the OFFSET readout itself (see WM_LBUTTONDOWN in WndProc) - one small
+ * menu, one place its two commands are handled, regardless of which
+ * control the click came through.                                       */
+static void show_carrier_calib_menu(HWND owner, int screen_x, int screen_y)
+{
+    HMENU hMenu = CreatePopupMenu();
+    int cmd;
+    AppendMenuA(hMenu, MF_STRING, IDM_SMETER_AUTOCAL, "Auto Calibrate Carrier Offset");
+    AppendMenuA(hMenu, MF_STRING, IDM_SMETER_SETCAL,  "Set Carrier Calibration...");
+    cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                          screen_x, screen_y, 0, owner, NULL);
+    DestroyMenu(hMenu);
+
+    if (cmd == IDM_SMETER_AUTOCAL) {
+        /* Same gating and calculation as the Settings dialog's Auto
+         * Calibrate button (IDC_BTN_AUTO_CAL) - see its own comment -
+         * just applied live here instead of only filling in a textbox
+         * that then needed a subsequent Save to take effect.             */
+        if (g_monitor.enabled && g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] &&
+                g_monitor.carrier_settled_pub[g_monitor.tuner_sel]) {
+            double new_calib = -(double)g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel];
+            carrier_calib_apply(new_calib);
+        } else {
+            MessageBoxA(owner,
+                "No valid, settled OFFSET reading right now - tune "
+                "to a steady reference signal, make sure Monitor is "
+                "on and the OFFSET display is actually showing, "
+                "then try again.",
+                "Auto Calibrate", MB_OK | MB_ICONINFORMATION);
+        }
+    } else if (cmd == IDM_SMETER_SETCAL) {
+        double entered;
+        if (carrier_calib_prompt(owner, g_state.cfg.carrier_offset_calib_hz, &entered))
+            carrier_calib_apply(entered);
+    }
+}
+
+
+/* Builds and shows the tuning-step popup menu (Section 10), band-
+ * appropriate presets first, Custom last, at the given screen point.     */
+static void freqdigits_show_step_menu(HWND hwnd, int screen_x, int screen_y)
+{
+    static const double presets_hf[]  = { 5000.0, 9000.0, 10000.0 };
+    static const double presets_fm[]  = { 25000.0, 50000.0, 100000.0 };
+    static const double presets_vhf[] = { 5000.0, 6250.0, 10000.0, 12500.0, 25000.0 };
+    const double *presets;
+    int n_presets, i, group;
+    double cur_freq, sel;
+    HMENU hMenu;
+
+    EnterCriticalSection(&g_monitor.settings_lock);
+    cur_freq = *monitor_active_freq_ptr();
+    LeaveCriticalSection(&g_monitor.settings_lock);
+
+    group = freqstep_band_group(cur_freq);
+    switch (group) {
+        case 0:  presets = presets_hf;  n_presets = 3; break;
+        case 1:  presets = presets_fm;  n_presets = 3; break;
+        default: presets = presets_vhf; n_presets = 5; break;
+    }
+
+    hMenu = CreatePopupMenu();
+    AppendMenuA(hMenu, MF_STRING | (g_freqStepHz == 0.0 ? MF_CHECKED : 0),
+                IDM_FREQSTEP_DEFAULT, "Default (per-digit)");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    for (i = 0; i < n_presets; i++) {
+        char label[32];
+        if (presets[i] < 1000.0)
+            snprintf(label, sizeof(label), "%.0f Hz", presets[i]);
+        else if (fmod(presets[i], 1000.0) == 0.0)
+            snprintf(label, sizeof(label), "%.0f kHz", presets[i] / 1000.0);
+        else
+            snprintf(label, sizeof(label), "%.2f kHz", presets[i] / 1000.0);
+        AppendMenuA(hMenu, MF_STRING | (g_freqStepHz == presets[i] ? MF_CHECKED : 0),
+                    IDM_FREQSTEP_PRESET0 + i, label);
+    }
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    {
+        char custom_label[48];
+        double remembered = g_freqStepCustomHz[group];
+        int is_active = (remembered > 0.0 && g_freqStepHz == remembered);
+        if (remembered > 0.0)
+            snprintf(custom_label, sizeof(custom_label), "Custom (%.4g kHz)...", remembered / 1000.0);
+        else
+            snprintf(custom_label, sizeof(custom_label), "Custom...");
+        AppendMenuA(hMenu, MF_STRING | (is_active ? MF_CHECKED : 0),
+                    IDM_FREQSTEP_CUSTOM, custom_label);
+    }
+
+    sel = 0.0;
+    {
+        int cmd;
+        SetForegroundWindow(hwnd);
+        cmd = TrackPopupMenu(hMenu,
+                    TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                    screen_x, screen_y, 0, hwnd, NULL);
+        PostMessageA(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(hMenu);
+
+        if (cmd == 0) {
+            return;   /* dismissed with no selection */
+        } else if (cmd == IDM_FREQSTEP_DEFAULT) {
+            g_freqStepHz = 0.0;
+            g_freqStepIsCustom = 0;
+        } else if (cmd == IDM_FREQSTEP_CUSTOM) {
+            double entered = freqstep_prompt_custom(GetParent(hwnd), g_freqStepCustomHz[group]);
+            if (entered > 0.0) {
+                g_freqStepCustomHz[group] = entered;
+                g_freqStepHz = entered;
+                g_freqStepIsCustom = 1;
+                sel = entered;
+            } else {
+                return;   /* cancelled - leave the active step untouched */
+            }
+        } else if (cmd >= IDM_FREQSTEP_PRESET0 && cmd < IDM_FREQSTEP_PRESET0 + n_presets) {
+            sel = presets[cmd - IDM_FREQSTEP_PRESET0];
+            g_freqStepHz = sel;
+            g_freqStepIsCustom = 0;
+        } else {
+            return;
+        }
+    }
+
+    /* Snap to the nearest step-aligned frequency immediately on picking a
+     * non-Default step, per the design: selecting 9 kHz while tuned to
+     * 1434 kHz jumps straight to 1431 kHz rather than waiting for the
+     * next wheel/Page Up-Down press to land on-grid by chance. For
+     * Custom, the anchor is set to this same freshly-read frequency
+     * first, so the snap below is a no-op (the operator's own tuned
+     * frequency is by definition already "on-grid" for a Custom step
+     * anchored to it) and every step from here measures from it.         */
+    if (g_freqStepHz > 0.0) {
+        EnterCriticalSection(&g_monitor.settings_lock);
+        cur_freq = *monitor_active_freq_ptr();
+        LeaveCriticalSection(&g_monitor.settings_lock);
+        if (g_freqStepIsCustom) g_freqStepAnchorHz = cur_freq;
+        freqstep_apply(freqstep_snap_active(cur_freq));
+    }
+
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);  /* step indicator label */
+}
+
 static LRESULT CALLBACK freqdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -10370,13 +12237,25 @@ static LRESULT CALLBACK freqdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         }
         SelectObject(dc, of);
 
-        pen = CreatePen(PS_SOLID, 1, COL_PANEL_EDGE);
-        op = SelectObject(dc, pen);
-        ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(dc, ob);
-        SelectObject(dc, op);
-        DeleteObject(pen);
+        {
+            /* Same 1px border as always: cyan for an active preset step,
+             * purple for an active Custom step (Section 10) - grey
+             * otherwise. Colour alone is enough of a cue without changing
+             * thickness (a thicker pen actually needs the rectangle inset
+             * on its right/bottom edges to render evenly, since
+             * Rectangle()'s path sits exactly on the control's own
+             * boundary there and clips half the extra width away - not a
+             * concern at the original 1px weight, which this stays at). */
+            pen = CreatePen(PS_SOLID, 1,
+                             g_freqStepHz <= 0.0 ? COL_PANEL_EDGE :
+                             g_freqStepIsCustom  ? COL_ACCENT_CUSTOM : COL_ACCENT);
+            op = SelectObject(dc, pen);
+            ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        }
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -10404,11 +12283,38 @@ static LRESULT CALLBACK freqdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARA
         }
         return 0;
 
+    case WM_LBUTTONDOWN: {
+        /* Left-click anywhere on the frequency digits brings up the
+         * tuning-step menu (Section 10) - there's no other use for a
+         * plain click here (tuning itself is wheel-driven), so the whole
+         * control is a click target rather than needing a fixed spot.    */
+        POINT pt;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        ClientToScreen(hwnd, &pt);
+        freqdigits_show_step_menu(hwnd, pt.x, pt.y);
+        return 0;
+    }
+
     case WM_MOUSEWHEEL: {
         int notches = (int)(short)HIWORD(wp) / WHEEL_DELTA;
         POINT pt;
         int digit, p;
-        double place, center, *pfreq;
+        double place, freq_now;
+
+        if (g_freqStepHz > 0.0) {
+            /* A tuning step is active - the whole frequency moves by that
+             * amount regardless of which digit the cursor is over, per
+             * the design (Section 10). Snap first in case the frequency
+             * drifted off-grid some other way (e.g. typed in directly),
+             * so the very first wheel step always lands back on-grid
+             * rather than compounding an off-grid starting point.        */
+            EnterCriticalSection(&g_monitor.settings_lock);
+            freq_now = *monitor_active_freq_ptr();
+            LeaveCriticalSection(&g_monitor.settings_lock);
+            freqstep_apply(freqstep_snap_active(freq_now) + g_freqStepHz * notches);
+            return 0;
+        }
 
         pt.x = (short)LOWORD(lp);
         pt.y = (short)HIWORD(lp);
@@ -10426,12 +12332,16 @@ static LRESULT CALLBACK freqdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARA
          * noise or out-of-band content the ADC happened to capture
          * down to baseband and demodulates it - which sounds exactly
          * like a genuine signal even though there's nothing there.
-         * Tuner-aware: Tuner A and B remember separate frequencies.   */
+         * Tuner-aware: Tuner 1 and B remember separate frequencies.   */
+        {
+        double *pfreq, center;
+        int locked, other_sel = -1;
         EnterCriticalSection(&g_monitor.settings_lock);
         pfreq = monitor_active_freq_ptr();
         center = monitor_center_for_tuner((int)g_monitor.tuner_sel);
         *pfreq = monitor_clamp_to_coverage(*pfreq + place * notches, center);
-        if (g_monitor.freq_locked) {
+        locked = g_monitor.freq_locked;
+        if (locked) {
             /* Clamp to the OTHER tuner's own coverage, not just copy the
              * raw value - with two receiver CFs far apart (e.g. genuine
              * Master/Slave, CF1=1MHz, CF2=5MHz), the active tuner's
@@ -10440,32 +12350,42 @@ static LRESULT CALLBACK freqdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARA
              * a real, valid frequency for that tuner - the closest thing
              * to "the same" it can actually receive - rather than
              * silently tuning it somewhere it has no signal at all.      */
-            int other_sel = g_monitor.tuner_sel == 0 ? 1 : 0;
+            other_sel = g_monitor.tuner_sel == 0 ? 1 : 0;
             double other_center = monitor_center_for_tuner(other_sel);
             double clamped = monitor_clamp_to_coverage(*pfreq, other_center);
             if (other_sel == 1)
                 g_monitor.freq_hz_b = clamped;
             else
                 g_monitor.freq_hz = clamped;
+            /* The other tuner's frequency was just mirrored above too,
+             * so its own published carrier reading is exactly as stale
+             * as the tuner actually being scrolled - clear both.        */
+            g_monitor.carrier_offset_valid_pub[other_sel] = 0;
+            g_monitor.carrier_locked_pub[other_sel]       = 0;
+            g_monitor.carrier_last_published_valid[other_sel] = 0;
+            g_monitor.carrier_settled_count[other_sel]        = 0;
+            g_monitor.carrier_settled_pub[other_sel]          = 0;
         }
         LeaveCriticalSection(&g_monitor.settings_lock);
+        }
 
         /* Retuned - the carrier readout (if showing) was measuring the
          * OLD frequency, so it needs to clear immediately rather than
          * keep showing what looks like a live reading of wherever the
          * dial has now moved to. Only the published display state is
          * touched here (safe from the GUI thread, these are exactly the
-         * volatile flags meant for that); the phase accumulator and
-         * narrowband filter are DSP-thread-owned and are left alone -
-         * they'll naturally converge on the new frequency's data within
-         * the next window or two without needing a hard reset here.    */
-        g_monitor.carrier_offset_valid_pub = 0;
-        g_monitor.carrier_locked_pub       = 0;
-        g_monitor.carrier_last_raw_valid   = 0;
-        g_monitor.carrier_consec_agree     = 0;
-        g_monitor.carrier_last_published_valid = 0;
-        g_monitor.carrier_settled_count        = 0;
-        g_monitor.carrier_settled_pub          = 0;
+         * volatile flags meant for that); the FFT accumulation in
+         * progress is DSP-thread-owned and is left alone - it'll
+         * naturally start a fresh block/average on the new frequency's
+         * data within the next window or two without needing a hard
+         * reset here.                                                    */
+        g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] = 0;
+        g_monitor.carrier_locked_pub[g_monitor.tuner_sel]       = 0;
+        g_monitor.carrier_consec_valid     = 0;
+        g_monitor.carrier_consec_rejected  = 0;
+        g_monitor.carrier_last_published_valid[g_monitor.tuner_sel] = 0;
+        g_monitor.carrier_settled_count[g_monitor.tuner_sel]        = 0;
+        g_monitor.carrier_settled_pub[g_monitor.tuner_sel]          = 0;
 
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
@@ -10554,6 +12474,36 @@ static int bwdigits_hit_test(HWND hwnd, int client_x)
         x += cell_w[i];
     }
     return BW_STR_LEN - 1;
+}
+
+/* IDs for the mode+bandwidth popup menu below. */
+#define IDM_MODE_PRESET0   4020   /* +0..+7, one per MON_MODE_COUNT entry */
+
+/* Builds and shows the mode+bandwidth popup menu (Section 10, "Mode and
+ * Bandwidth") - the same MON_MODE_INFO presets the old dropdown offered,
+ * in the same MON_MODE_DISPLAY_ORDER, with the currently active one
+ * checked.                                                               */
+static void bwdigits_show_mode_menu(HWND hwnd, int screen_x, int screen_y)
+{
+    HMENU hMenu = CreatePopupMenu();
+    int i, cmd;
+    MonMode cur_mode = (MonMode)g_monitor.mode;
+
+    for (i = 0; i < MON_MODE_COUNT; i++) {
+        MonMode mode = MON_MODE_DISPLAY_ORDER[i];
+        AppendMenuA(hMenu, MF_STRING | (mode == cur_mode ? MF_CHECKED : 0),
+                    IDM_MODE_PRESET0 + i, MON_MODE_INFO[mode].name);
+    }
+
+    SetForegroundWindow(hwnd);
+    cmd = TrackPopupMenu(hMenu,
+                TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                screen_x, screen_y, 0, hwnd, NULL);
+    PostMessageA(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(hMenu);
+
+    if (cmd >= IDM_MODE_PRESET0 && cmd < IDM_MODE_PRESET0 + MON_MODE_COUNT)
+        monitor_apply_mode(MON_MODE_DISPLAY_ORDER[cmd - IDM_MODE_PRESET0]);
 }
 
 static LRESULT CALLBACK bwdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -10647,6 +12597,19 @@ static LRESULT CALLBACK bwdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
+
+    case WM_LBUTTONDOWN: {
+        /* Left-click anywhere on the bandwidth digits brings up the
+         * mode+bandwidth menu (Section 10, "Mode and Bandwidth") - the
+         * same set of presets the old Mode dropdown offered, just chosen
+         * from here now that the dropdown itself is gone.               */
+        POINT pt;
+        pt.x = (short)LOWORD(lp);
+        pt.y = (short)HIWORD(lp);
+        ClientToScreen(hwnd, &pt);
+        bwdigits_show_mode_menu(hwnd, pt.x, pt.y);
+        return 0;
+    }
 
     case WM_MOUSEWHEEL: {
         int notches = (int)(short)HIWORD(wp) / WHEEL_DELTA;
@@ -10995,20 +12958,134 @@ static float smeter_s9_dbm_for_current_tuner(void)
                                                  : SMETER_S9_HF_DBM;
 }
 
-/* Picks how long the carrier tracker should integrate before it will call
- * a window "done" - see CARRIER_WINDOW_SAMPLES_MAX for the reasoning.
- * Tiered in S-unit-ish steps (6 dB each) below S9, doubling the window
- * roughly every couple of S-units weaker, capped at 12s so even very
- * weak DX doesn't wait forever for a reading that may never fully settle. */
-static int carrier_window_samples_for_signal(void)
+/* Picks how many FFT blocks the carrier tracker should average together
+ * before it will call an accumulation "done" - tiered in S-unit-ish steps
+ * (6 dB each) below S9, doubling roughly every couple of S-units weaker,
+ * capped at 12s so even very weak DX doesn't wait forever for a reading
+ * that may never fully settle. Same signal-strength tiers and timing as
+ * the earlier time-domain version, just expressed as a count of
+ * CARRIER_FFT_SIZE blocks (128ms each at MON_WORK_RATE_NARROW) instead of
+ * raw accumulated samples.                                                */
+static int carrier_blocks_for_signal(void)
 {
     float s9_dbm = smeter_s9_dbm_for_current_tuner();
     float below_s9 = s9_dbm - g_monitor.smeter_dbm_pub;  /* + = weaker than S9 */
-    if (below_s9 <= 0.0f)  return  32000;   /* >= S9          : 1s  */
-    if (below_s9 <= 12.0f) return  64000;   /* S7 - S9        : 2s  */
-    if (below_s9 <= 24.0f) return 128000;   /* S5 - S7        : 4s  */
-    if (below_s9 <= 36.0f) return 256000;   /* S3 - S5        : 8s  */
-    return CARRIER_WINDOW_SAMPLES_MAX;      /* weaker than S3 : 12s */
+    if (below_s9 <= 0.0f)  return  8;    /* >= S9          : ~1s  */
+    if (below_s9 <= 12.0f) return 16;    /* S7 - S9        : ~2s  */
+    if (below_s9 <= 24.0f) return 32;    /* S5 - S7        : ~4s  */
+    if (below_s9 <= 36.0f) return 63;    /* S3 - S5        : ~8s  */
+    return 94;                           /* weaker than S3 : ~12s */
+}
+
+/* Radix-2 iterative FFT (Cooley-Tukey, decimation-in-time), in place.
+ * n must be a power of 2 (CARRIER_FFT_SIZE, 4096). Forward transform when
+ * invert=0, matching the standard e^{-j*2*pi*k*n/N} convention: a tone at
+ * +f Hz lands in a low-index ("positive") bin, one at -f Hz wraps to the
+ * top half of the array. Validated during design against synthetic tones
+ * across the full search range, under realistic AM modulation, and at
+ * marginal SNR - see the design notes on the carrier_* fields above.     */
+static void carrier_fft(DCplx *a, int n, int invert)
+{
+    int i, j, k, len;
+    for (i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { DCplx t = a[i]; a[i] = a[j]; a[j] = t; }
+    }
+    for (len = 2; len <= n; len <<= 1) {
+        double ang = 2.0 * MON_PI / len * (invert ? 1 : -1);
+        DCplx wlen = { cos(ang), sin(ang) };
+        for (i = 0; i < n; i += len) {
+            DCplx w = { 1.0, 0.0 };
+            for (k = 0; k < len / 2; k++) {
+                DCplx u = a[i + k];
+                DCplx v = { a[i+k+len/2].re * w.re - a[i+k+len/2].im * w.im,
+                            a[i+k+len/2].re * w.im + a[i+k+len/2].im * w.re };
+                a[i+k]         = (DCplx){ u.re + v.re, u.im + v.im };
+                a[i+k+len/2]   = (DCplx){ u.re - v.re, u.im - v.im };
+                { DCplx nw = { w.re*wlen.re - w.im*wlen.im, w.re*wlen.im + w.im*wlen.re }; w = nw; }
+            }
+        }
+    }
+    if (invert) {
+        for (i = 0; i < n; i++) { a[i].re /= n; a[i].im /= n; }
+    }
+}
+
+/* Converts a bin index (0..N-1, standard unshifted FFT order) to a signed
+ * frequency in Hz, treating bins past N/2 as negative frequencies.       */
+static double carrier_bin_to_hz(double bin, int n, double fs)
+{
+    if (bin > n / 2.0) bin -= n;
+    return bin * fs / n;
+}
+
+/* Finds the strongest peak in the (already block-averaged) power
+ * spectrum within +/- CARRIER_SEARCH_HZ of DC, refines its position with
+ * parabolic interpolation on the log-power spectrum, and reports the
+ * peak-to-noise-floor ratio (the validity signal) alongside it. Bin 0
+ * (DC) is included in the search like any other bin - an earlier version
+ * excluded it outright, reasoning that real SDR hardware can carry a
+ * residual DC/LO-leakage term there, but that turned out to be a
+ * self-inflicted bug: whenever the true carrier genuinely sat near zero,
+ * the interpolation still read bin 0's (correctly enormous) power as a
+ * neighbour while being forced to report the peak at bin 1 instead,
+ * producing a ~half-bin bias every time (confirmed in testing: a true
+ * 0Hz offset measured ~3.9Hz off at a 4096-point/32kHz block). The
+ * CARRIER_VALIDITY_DB peak-to-floor gate below is the real safeguard
+ * against a spurious DC spike being mistaken for a genuine carrier -
+ * confirmed separately against synthetic pure-noise input, which never
+ * exceeded roughly 5dB peak-to-floor across many independent trials,
+ * comfortably under the 18dB bar - so a second, cruder positional
+ * exclusion on top of that wasn't actually needed, and excluding bin 0 is
+ * no more justified than excluding any other single bin would be.       */
+static double carrier_find_peak(const double *pwr, int n, double fs, double search_hz,
+                                 double *out_peak_to_floor_db)
+{
+    int search_bins = (int)(search_hz / fs * n);
+    if (search_bins < 1) search_bins = 1;
+    if (search_bins > n / 2 - 2) search_bins = n / 2 - 2;
+
+    int peak_bin = 0;
+    double peak_val = pwr[0];
+    for (int i = 0; i <= search_bins; i++)
+        if (pwr[i] > peak_val) { peak_val = pwr[i]; peak_bin = i; }
+    for (int i = n - search_bins; i < n; i++)
+        if (pwr[i] > peak_val) { peak_val = pwr[i]; peak_bin = i; }
+
+    /* Noise floor: median of the searched bins, excluding a small guard
+     * band (+/-2 bins) around the peak itself. */
+    double *cand = (double *)alloca(sizeof(double) * (size_t)(2 * search_bins + 2));
+    int cand_count = 0;
+    for (int i = 0; i <= search_bins; i++) {
+        int d = i - peak_bin; if (d < 0) d = -d;
+        if (d > 2) cand[cand_count++] = pwr[i];
+    }
+    for (int i = n - search_bins; i < n; i++) {
+        int d = i - peak_bin; if (d < 0) d = -d;
+        if (d > 2) cand[cand_count++] = pwr[i];
+    }
+    for (int i = 1; i < cand_count; i++) {
+        double key = cand[i]; int j = i - 1;
+        while (j >= 0 && cand[j] > key) { cand[j+1] = cand[j]; j--; }
+        cand[j+1] = key;
+    }
+    double floor_val = cand_count > 0 ? cand[cand_count/2] : 1e-30;
+    if (out_peak_to_floor_db)
+        *out_peak_to_floor_db = 10.0 * log10((peak_val + 1e-30) / (floor_val + 1e-30));
+
+    int left  = (peak_bin - 1 + n) % n;
+    int right = (peak_bin + 1) % n;
+    double lm1 = log(pwr[left]  + 1e-30);
+    double l0  = log(pwr[peak_bin] + 1e-30);
+    double lp1 = log(pwr[right] + 1e-30);
+    double denom = lm1 - 2.0 * l0 + lp1;
+    double delta = (denom != 0.0) ? 0.5 * (lm1 - lp1) / denom : 0.0;
+    if (delta > 0.5) delta = 0.5;
+    if (delta < -0.5) delta = -0.5;
+
+    return carrier_bin_to_hz(peak_bin + delta, n, fs);
 }
 
 /* Maps a dBm reading to a 0..1 bar-fill fraction via two straight-line
@@ -11048,6 +13125,29 @@ static LRESULT CALLBACK smeter_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 {
     if (msg == WM_ERASEBKGND)
         return 1;   /* WM_PAINT fills the whole client area - avoids flicker */
+
+    /* Right-click for carrier offset calibration - the S-meter is a
+     * reasonable home for this: it's monitor-audio-only, never touches
+     * the recorded IQ data or the SDRplay API, but previously lived
+     * exclusively in the Settings dialog, which is fully disabled the
+     * whole time an actual recording is running (same reasoning that
+     * already moved Low Cut/Vol/Notch out to the main window - see
+     * IDC_BTN_HPF_ENABLE's own comment). Reusing this control rather
+     * than adding a new one avoids touching monitor_layout()'s already
+     * tightly-packed row calculations.                                   */
+    if (msg == WM_CONTEXTMENU) {
+        POINT pt;
+        pt.x = (int)(short)LOWORD(lp);
+        pt.y = (int)(short)HIWORD(lp);
+        if (pt.x == -1 && pt.y == -1) {
+            RECT rc;
+            GetWindowRect(hwnd, &rc);
+            pt.x = rc.left + 8;
+            pt.y = rc.top + 8;
+        }
+        show_carrier_calib_menu(GetParent(hwnd), pt.x, pt.y);
+        return 0;
+    }
 
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
@@ -11158,16 +13258,30 @@ static HWND smeter_create(HWND parent, HINSTANCE hInst)
 }
 
 
-static void monitor_apply_mode_from_combo(void)
+/* Short text for the MODE: readout specifically (Section 10) - the full
+ * MON_MODE_INFO name (e.g. "AM 6kHz") stays exactly as-is for the preset
+ * menu, but repeating the bandwidth in the readout too was redundant with
+ * the bandwidth digits sitting right next to it, and made the readout box
+ * wider than it needed to be. Every mode other than the three AM variants
+ * already has a short, bandwidth-free name of its own (LSB, USB, CW,
+ * FM-N, FM-W), so only AM needs its own case here.                       */
+static const char *monitor_mode_short_name(MonMode mode)
 {
-    LRESULT sel;
-    MonMode mode;
-    if (!g_hMonMode || !g_hBwDigits) return;
+    switch (mode) {
+        case MON_MODE_AM6:
+        case MON_MODE_AM4:
+        case MON_MODE_AM24: return "AM";
+        default: return MON_MODE_INFO[mode].name;
+    }
+}
 
-    sel = SendMessageA(g_hMonMode, CB_GETCURSEL, 0, 0);
-    if (sel == CB_ERR || sel < 0 || sel >= MON_MODE_COUNT) return;
-    mode = MON_MODE_DISPLAY_ORDER[sel];
+static void monitor_apply_mode(MonMode mode)
+{
+    if (!g_hMonMode || !g_hBwDigits) return;
+    if (mode < 0 || mode >= MON_MODE_COUNT) return;
+
     g_monitor.mode = (LONG)mode;
+    SetWindowTextA(g_hMonMode, monitor_mode_short_name(mode));
 
     /* Auto-fill the bandwidth digits with this mode's default, as before. */
     EnterCriticalSection(&g_monitor.settings_lock);
@@ -11233,7 +13347,7 @@ static void monitor_apply_hpf_hz_from_slider(void)
 
 /* Right-click on the Monitor button (RSPduo dual/Master-Slave only)
  * switches which tuner is being listened to. Previously this opened a
- * small popup menu with "Monitor Tuner A"/"Monitor Tuner B" items,
+ * small popup menu with "Monitor Tuner 1"/"Monitor Tuner 2" items,
  * requiring a second click to pick one - since there are only ever two
  * tuners, a menu never had anything to offer beyond "the other one",
  * so right-click now toggles directly instead.                        */
@@ -11271,8 +13385,11 @@ static void monitor_toggle_tuner_sel(void)
         LeaveCriticalSection(&g_monitor.settings_lock);
     }
 
-    SetWindowTextA(g_hBtnMonitor, g_monitor.tuner_sel ? "Tuner B" : "Tuner A");
+    if (monitor_use_single_button())
+        SetWindowTextA(g_hBtnMonitor, g_monitor.tuner_sel ? "Tuner 2" : "Tuner 1");
     InvalidateRect(g_hBtnMonitor, NULL, TRUE);
+    if (g_hBtnTunerA) InvalidateRect(g_hBtnTunerA, NULL, TRUE);
+    if (g_hBtnTunerB) InvalidateRect(g_hBtnTunerB, NULL, TRUE);
     if (g_hFreqDigits) InvalidateRect(g_hFreqDigits, NULL, TRUE);
 }
 
@@ -11308,6 +13425,10 @@ static void monitor_switch_single_tuner_live(void)
 {
     int was_b = !strcmp(g_state.cfg.rspduo_single_tuner, "B");
     const char *new_tuner = was_b ? "A" : "B";
+    const char *new_tuner_display = was_b ? "1" : "2";   /* new_tuner
+        itself must stay "A"/"B" - it's written straight into the
+        rspduo_single_tuner ini value below, which needs to keep matching
+        the format existing duodx.ini files already use.                 */
     IniPatchEntry e[1];
 
     if (g_worker_active && !g_state.listening) {
@@ -11328,9 +13449,12 @@ static void monitor_switch_single_tuner_live(void)
          * tuner_sel/coherent are all unchanged), so update the label
          * directly here instead.                                        */
         if (g_hBtnMonitor) {
-            SetWindowTextA(g_hBtnMonitor, was_b ? "Tuner A" : "Tuner B");
+            if (monitor_use_single_button())
+                SetWindowTextA(g_hBtnMonitor, was_b ? "Tuner 1" : "Tuner 2");
             InvalidateRect(g_hBtnMonitor, NULL, TRUE);
         }
+        if (g_hBtnTunerA) InvalidateRect(g_hBtnTunerA, NULL, TRUE);
+        if (g_hBtnTunerB) InvalidateRect(g_hBtnTunerB, NULL, TRUE);
         return;
     }
 
@@ -11341,7 +13465,7 @@ static void monitor_switch_single_tuner_live(void)
      * the restart below brings back the right one.                      */
     g_tuner_switch_was_record = g_toggle_btn_recording;
     LOG_INFO("Switching to Tuner %s - restarting the receiver on the new "
-             "tuner...", new_tuner);
+             "tuner...", new_tuner_display);
     gui_stop_session(0);
     {
         HANDLE th = CreateThread(NULL, 0, tuner_switch_wait_thread, NULL, 0, NULL);
@@ -11349,9 +13473,326 @@ static void monitor_switch_single_tuner_live(void)
     }
 }
 
+/* Whether Tuner 2 is the currently active/displayed tuner, under
+ * whichever of the two switching mechanisms actually applies right now -
+ * dual_channel/Master-Slave (both tuners genuinely streaming at once, so
+ * g_monitor.tuner_sel just picks which one is being shown/heard) or plain
+ * single-tuner RSPduo mode (only one tuner is ever active, tracked
+ * separately in cfg.rspduo_single_tuner since switching there needs a
+ * restart). Matches the exact same distinction monitor_sync_button_
+ * label() already makes for the legacy button's own label text.         */
+static int monitor_tuner_b_active(void)
+{
+    int has_tuner_b = g_state.cfg.dual_channel || g_state.master_slave_active
+                       || g_cancel_listening;
+    if (has_tuner_b)
+        return g_monitor.tuner_sel == 1;
+    return !strcmp(g_state.cfg.rspduo_single_tuner, "B");
+}
+
+/* Whether there's anything to switch to at all - matches the exact
+ * gating already used by the legacy button's right-click handler.       */
+static int monitor_tuner_switch_available(void)
+{
+    return (g_state.cfg.dual_channel || g_state.master_slave_active) ||
+           (g_last_known_hwVer == SDRPLAY_RSPduo_ID);
+}
+
+/* Whether the classic single button should be showing right now, instead
+ * of the two individual Tuner 1/Tuner 2 buttons. True whenever the
+ * connected hardware isn't genuinely dual-tuner-capable - an RSPdx,
+ * RSP1A, RSP2 or RSP1 only ever has one tuner, so there's no real choice
+ * to offer and the single button always applies there. RSPduo always
+ * gets the two-button (red/blue) style - this is no longer a Settings
+ * choice.                                                                */
+static int monitor_use_single_button(void)
+{
+    return g_last_known_hwVer != SDRPLAY_RSPduo_ID;
+}
+
+/* For the two-button RSPduo mode only: whether this specific button (A
+ * if is_b is 0, B if 1) should be shown "greyed" rather than its own
+ * blue/red identity colour. Only applies in plain single-tuner RSPduo
+ * mode (dual_channel and Master/Slave both off) - genuinely dual mode
+ * always shows both in full colour, since both are equally live there.
+ * In single-tuner mode only one tuner is actually running at a time, so
+ * the one that ISN'T cfg.rspduo_single_tuner right now is shown muted -
+ * still clickable (it switches live, restarting onto that tuner, same
+ * as ever), just visually distinguished as "not what's running now".    */
+static int monitor_tuner_greyed(int is_b)
+{
+    if (g_state.cfg.dual_channel || g_state.master_slave_active) return 0;
+    if (g_cancel_listening) return 0;   /* Covers the whole gap from a Stop/
+        Monitor-off click through to WM_APP_DONE finishing its config
+        reload, not just the active teardown itself - see the reset of
+        this flag in WM_APP_DONE for why it's held that long. This is the
+        function that actually decides the visible "greyed" colour, so
+        missing this guard here (while adding it only to monitor_tuner_
+        config_enabled(), which just controls Windows' own separate
+        clickability state) meant the button still visibly greyed out
+        during that window even though it remained genuinely clickable
+        throughout.                                                      */
+    if (g_last_known_hwVer != SDRPLAY_RSPduo_ID) return 0;
+    {
+        int configured_is_b = !strcmp(g_state.cfg.rspduo_single_tuner, "B");
+        return configured_is_b != (is_b != 0);
+    }
+}
+
+/* Whether the Tuner 1/Tuner 2 button for this specific tuner should be
+ * genuinely clickable at all, as opposed to just shown "greyed" (muted
+ * colour, but still switchable live - monitor_tuner_greyed() above) for
+ * being the not-currently-active one. In plain single-tuner RSPduo mode,
+ * only the tuner actually checked on the Receiver tab (Section 14.1) was
+ * ever set up with real gain/LNA/antenna/notch settings for this session
+ * - the other one was explicitly left unchecked there, not just "parked"
+ * - so live-switching to it was never really supported and produced
+ * exactly the inconsistent behaviour (briefly restarting the wrong
+ * tuner, an LED not matching what's actually running, or genuinely
+ * switching to a tuner nothing here was configured for) this disables.
+ * Dual and Master/Slave sessions have both tuners genuinely running, so
+ * both stay fully clickable there, same as always.                      */
+static int monitor_tuner_config_enabled(int is_b)
+{
+    if (g_state.cfg.dual_channel || g_state.master_slave_active) return 1;
+    if (g_cancel_listening) return 1;   /* Mid-teardown (Stop/Monitor-off
+        just clicked, worker thread still unwinding) - dual_channel and
+        master_slave_active can already read false here even though the
+        session that's stopping was genuinely dual/Master-Slave right up
+        until this moment, since they get cleared as part of that same
+        teardown before it's actually finished. Falling through to the
+        single-tuner check below in that brief window incorrectly
+        disabled whichever tuner wasn't rspduo_single_tuner's stale
+        value - a value a dual/Master-Slave session never had reason to
+        set in the first place - rather than reflecting a session that
+        was, until a moment ago, genuinely running both tuners.          */
+    if (g_last_known_hwVer != SDRPLAY_RSPduo_ID) return 1;  /* not confirmed
+                                                                RSPduo yet -
+                                                                don't restrict
+                                                                on a guess */
+    {
+        int configured_is_b = !strcmp(g_state.cfg.rspduo_single_tuner, "B");
+        return configured_is_b == (is_b != 0);
+    }
+}
+
+/* How many antenna quick-select buttons apply right now (0-3), and what
+ * each one's button label and cfg.antenna value are - see the buttons'
+ * own layout comment (monitor_layout_controls) for why this is capped at
+ * 3. Deliberately keyed off g_last_known_hwVer, the same idle-safe
+ * device-type cache monitor_use_single_button()/monitor_tuner_config_
+ * enabled() already use, rather than g_state.device.hwVer (only valid
+ * once a session is actually running) - these buttons need to lay out
+ * correctly before Start/Listen has ever been pressed, same as the
+ * Tuner 1/2 buttons do.
+ *
+ * RSPdx/RSPdx R2 (A/B/C, three real antenna ports) and RSP2 (A/B) only -
+ * RSPduo was dropped after switching between dual and single-tuner mode
+ * there made this button appear and disappear, shifting the whole row's
+ * layout around it each time - jarring enough that keeping it wasn't
+ * worth it, especially since RSPduo already has the Tuner 1/2 buttons
+ * doing a related job (showing which tuner is actually active). RSP1/
+ * RSP1A/RSP1B only ever have one fixed input either way.                 */
+static int antenna_slot_info(const char *labels[3], const char *values[3])
+{
+    const char *l[3] = {0}, *v[3] = {0};
+    int n = 0;
+
+    if (g_last_known_hwVer == SDRPLAY_RSPdx_ID ||
+            g_last_known_hwVer == SDRPLAY_RSPdxR2_ID) {
+        l[0] = "A"; v[0] = "A";
+        l[1] = "B"; v[1] = "B";
+        l[2] = "C"; v[2] = "C";
+        n = 3;
+    } else if (g_last_known_hwVer == SDRPLAY_RSP2_ID) {
+        l[0] = "A"; v[0] = "A";
+        l[1] = "B"; v[1] = "B";
+        n = 2;
+    }
+    /* else: RSP1/RSP1A/RSP1B, or any RSPduo mode/tuner - nothing to
+       select here (n stays 0)                                           */
+
+    if (labels) { labels[0] = l[0]; labels[1] = l[1]; labels[2] = l[2]; }
+    if (values) { values[0] = v[0]; values[1] = v[1]; values[2] = v[2]; }
+    return n;
+}
+
+
+/* Selects Tuner 1 or B directly - the click handler for the two new
+ * always-visible buttons. A no-op if the requested tuner is already
+ * active (matching how clicking the currently-selected tuner should
+ * obviously do nothing), otherwise dispatches to whichever of the two
+ * existing switch mechanisms actually applies, exactly the same logic
+ * already used by the legacy button's right-click handler - this isn't
+ * a new way of switching tuners, just a new (and more discoverable) way
+ * of reaching the same, already-tested switch.                          */
+static void monitor_select_tuner(int want_b)
+{
+    if (!monitor_tuner_switch_available()) return;
+    if (!monitor_tuner_config_enabled(want_b)) return;
+    if (monitor_tuner_b_active() == (want_b != 0)) return;   /* already there */
+
+    if (g_state.cfg.dual_channel || g_state.master_slave_active)
+        monitor_toggle_tuner_sel();
+    else if (g_last_known_hwVer == SDRPLAY_RSPduo_ID)
+        monitor_switch_single_tuner_live();
+}
+
+/* The click handler for the two Tuner 1/Tuner 2 buttons in the default
+ * (non-legacy) mode - there's no separate Monitor button in this mode at
+ * all, so these two buttons have to cover everything it used to do
+ * (start/stop/toggle audio) as well as tuner selection.
+ *
+ * If the requested tuner is already the active one, this is exactly a
+ * Monitor click always was - simulated by sending the same WM_COMMAND a
+ * real click on the (now hidden, but still fully functional) Monitor
+ * button would generate, rather than duplicating that already-tested
+ * start/stop/toggle logic here.
+ *
+ * If the OTHER tuner was requested: while idle, there's no live session
+ * to restart - just point the config at the requested tuner first (the
+ * same persistence monitor_switch_single_tuner_live() itself would do),
+ * then start exactly as above. While already running in some form,
+ * switch live via monitor_select_tuner() instead of treating this as a
+ * stop/start - the whole point of a live switch is not to interrupt
+ * anything.                                                             */
+/* Applies an antenna selection (Section 13.1) live via the exact same
+ * apply_antenna_and_biast() call settings_save() already uses for a live
+ * antenna change while listening/recording - proven safe to call
+ * directly from the main thread with a session active, no new plumbing
+ * needed. Persisted to duodx.ini too, so it survives a restart, but NOT
+ * what a schedule/hourly entry will use next time one starts or repeats
+ * - each entry carries its own antenna field (Section 8) and applies
+ * that at promotion time regardless of whatever was picked here ad hoc
+ * in between, which is the "scheduler takes precedence" behaviour this
+ * was specifically asked for - it falls out of the existing promotion
+ * logic already overwriting cfg.antenna, with nothing extra needed here
+ * to enforce it.                                                        */
+static void antenna_apply(const char *value)
+{
+    IniPatchEntry e[1];
+
+    if (!strcmp(g_state.cfg.antenna, value)) return;   /* already this one */
+
+    strncpy(g_state.cfg.antenna, value, sizeof(g_state.cfg.antenna) - 1);
+    g_state.cfg.antenna[sizeof(g_state.cfg.antenna) - 1] = '\0';
+
+    e[0].key = "antenna";
+    snprintf(e[0].value, sizeof(e[0].value), "%s", value);
+    if (!ini_patch_values("duodx.ini", e, 1)) {
+        /* Previously not checked at all - the antenna selection still
+         * applied live and the button still showed the new value even
+         * if this write silently failed (e.g. duodx.ini open/locked in
+         * another program, or a permissions problem), with nothing to
+         * indicate anything had gone wrong. It would then look "reset"
+         * back to whatever's actually on disk the next time anything
+         * reloads config from there (session end, Timer arming), which
+         * is confusing without this warning to explain why.             */
+        LOG_WARN("Could not save antenna=%s to duodx.ini (error %lu) - "
+                 "applied for this session only, will not survive a "
+                 "restart or session-end reload.", value, GetLastError());
+    }
+
+    if (g_worker_active)
+        apply_antenna_and_biast(&g_state);
+
+    if (g_hBtnAnt) {
+        const char *labels[3], *values[3];
+        int n = antenna_slot_info(labels, values);
+        int i;
+        for (i = 0; i < n; i++) {
+            if (!strcmp(values[i], value)) {
+                SetWindowTextA(g_hBtnAnt, labels[i]);
+                break;
+            }
+        }
+    }
+}
+
+/* Left-click on the antenna button (Section 13.1) - same TrackPopupMenu
+ * pattern as the Tuning Step and Mode menus, listing whatever
+ * antenna_slot_info() says the connected device actually offers.        */
+static void antenna_show_menu(HWND hwnd, int screen_x, int screen_y)
+{
+    const char *labels[3], *values[3];
+    int n = antenna_slot_info(labels, values);
+    HMENU hMenu;
+    int i, cmd;
+
+    if (n <= 0) return;
+
+    hMenu = CreatePopupMenu();
+    for (i = 0; i < n; i++) {
+        AppendMenuA(hMenu, MF_STRING |
+                    (!strcmp(g_state.cfg.antenna, values[i]) ? MF_CHECKED : 0),
+                    4030 + i, labels[i]);
+    }
+
+    SetForegroundWindow(hwnd);
+    cmd = TrackPopupMenu(hMenu,
+                TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                screen_x, screen_y, 0, hwnd, NULL);
+    PostMessageA(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(hMenu);
+
+    if (cmd >= 4030 && cmd < 4030 + n)
+        antenna_apply(values[cmd - 4030]);
+}
+
+static void monitor_ab_button_click(HWND hwnd, int is_b)
+{
+    int avail = monitor_tuner_switch_available();
+    int cfg_en = monitor_tuner_config_enabled(is_b);
+    int b_active = monitor_tuner_b_active();
+    int switching = avail && cfg_en && (b_active != (is_b != 0));
+
+    if (switching && g_worker_active) {
+        monitor_select_tuner(is_b);
+        /* Clicking the currently-active tuner's own button to "turn it
+         * off" doesn't stop that tuner specifically - it falls through
+         * to the WM_COMMAND(IDC_BTN_MONITOR) send below, which mutes
+         * audio entirely (g_monitor.enabled=0), since there's only ever
+         * one shared audio/meter path regardless of which tuner it's
+         * currently following. Clicking the other tuner's button
+         * afterward, to switch to and hear it, only used to change
+         * g_monitor.tuner_sel above - g_monitor.enabled stayed exactly
+         * as muted as the previous click left it, so nothing was audible
+         * and the button didn't look "on" until a second click on what
+         * was now already the selected tuner happened to fall through to
+         * that same WM_COMMAND send and finally re-enable it. Ensuring
+         * it's on here means a single click on a different tuner's
+         * button both switches to it and actually starts monitoring it,
+         * matching what pressing that button clearly means.             */
+        if (!g_monitor.enabled) {
+            g_monitor.enabled = 1;
+            if (g_hBtnMonitor) InvalidateRect(g_hBtnMonitor, NULL, TRUE);
+        }
+        return;
+    }
+
+    if (switching) {
+        /* Idle - nothing to restart, just make sure the tuner that's
+         * about to start is the one actually requested.                 */
+        if (g_state.cfg.dual_channel || g_state.master_slave_active) {
+            g_monitor.tuner_sel = is_b ? 1 : 0;
+        } else if (g_last_known_hwVer == SDRPLAY_RSPduo_ID) {
+            IniPatchEntry e[1];
+            const char *tuner = is_b ? "B" : "A";
+            strncpy(g_state.cfg.rspduo_single_tuner, tuner,
+                    sizeof(g_state.cfg.rspduo_single_tuner) - 1);
+            e[0].key = "rspduo_single_tuner";
+            snprintf(e[0].value, sizeof(e[0].value), "%s", tuner);
+            ini_patch_values("duodx.ini", e, 1);
+        }
+    }
+
+    SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_MONITOR, BN_CLICKED),
+                 (LPARAM)g_hBtnMonitor);
+}
+
 /* Keeps the Monitor button's label matched to whether there's actually a
- * Tuner B to switch to - matches whichever physical tuner is actually
- * active ("Tuner A"/"Tuner B") either way, single-tuner mode included
+ * Tuner 2 to switch to - matches whichever physical tuner is actually
+ * active ("Tuner 1"/"Tuner 2") either way, single-tuner mode included
  * (previously showed a bare "Monitor" there with no A/B indication at
  * all). Also forces tuner_sel back to
  * A in single-tuner mode, since there's no B data to listen to anyway.
@@ -11379,13 +13820,13 @@ static void monitor_sync_button_label(void)
     if (!has_tuner_b) {
         g_monitor.tuner_sel = 0;
         tuner_sel = 0;
+    }
+    if (!has_tuner_b)
         SetWindowTextA(g_hBtnMonitor,
                         !strcmp(g_state.cfg.rspduo_single_tuner, "B")
-                        ? "Tuner B" : "Tuner A");
-    } else {
-        SetWindowTextA(g_hBtnMonitor,
-                        tuner_sel == 1 ? "Tuner B" : "Tuner A");
-    }
+                        ? "Tuner 2" : "Tuner 1");
+    else
+        SetWindowTextA(g_hBtnMonitor, tuner_sel == 1 ? "Tuner 2" : "Tuner 1");
     if (!has_tuner_b || !coherent) {
         if (g_monitor.freq_locked) {
             g_monitor.freq_locked = 0;
@@ -11394,6 +13835,17 @@ static void monitor_sync_button_label(void)
     }
     if (g_hBtnFreqLock) EnableWindow(g_hBtnFreqLock, has_tuner_b && coherent);
     InvalidateRect(g_hBtnMonitor, NULL, TRUE);
+    if (g_hBtnTunerA && g_hBtnTunerB) {
+        /* Tuner 1 is the primary start/stop control now (it does
+         * everything the old Monitor button did, on top of tuner
+         * selection), so it stays usable even on single-tuner hardware -
+         * only Tuner 2 is gated on there actually being a second tuner
+         * to switch to.                                                  */
+        EnableWindow(g_hBtnTunerA, TRUE);
+        EnableWindow(g_hBtnTunerB, monitor_tuner_switch_available());
+        InvalidateRect(g_hBtnTunerA, NULL, TRUE);
+        InvalidateRect(g_hBtnTunerB, NULL, TRUE);
+    }
     if (g_hFreqDigits) InvalidateRect(g_hFreqDigits, NULL, TRUE);
     g_last_has_tuner_b   = has_tuner_b;
     g_last_tuner_sel     = tuner_sel;
@@ -11519,6 +13971,103 @@ static int monitor_draw_button(LPDRAWITEMSTRUCT di)
     return TRUE;
 }
 
+/* Owner-draw for the two Tuner 1/Tuner 2 buttons that are now the primary
+ * start/stop + tuner-select controls whenever genuinely dual-tuner-
+ * capable (RSPduo) hardware is connected and that mode is selected in
+ * Settings (Section 14.1, which also has the option to go back to the
+ * original single Monitor button instead - and single-tuner hardware
+ * always uses that original button regardless of the setting, since
+ * there's no real choice to offer there). Each button keeps its own
+ * fixed identity colour (A: a blue-violet 65,65,165; B: red 165,0,0 -
+ * darkened twice now from the originally-specified 102,102,255/255,0,0,
+ * same hues) at ALL times, whether selected or not - unlike the earlier
+ * design, the colour itself no longer changes to green on selection;
+ * the small LED (below) is the sole "currently active" indicator now.
+ * The one exception is plain single-tuner RSPduo mode (dual_channel and
+ * Master/Slave both off) - there, only one tuner is actually running at
+ * a time, so the one that ISN'T currently configured shows "greyed"
+ * instead of its own colour, to distinguish "available but not what's
+ * running" from genuinely-simultaneous dual mode where both are equally
+ * live. See monitor_tuner_greyed().                                     */
+static int tuner_ab_draw_button(LPDRAWITEMSTRUCT di, int is_b)
+{
+    int dis    = (di->itemState & ODS_DISABLED) != 0;
+    int down   = (di->itemState & ODS_SELECTED) != 0;
+    int greyed = !dis && monitor_tuner_greyed(is_b);
+    COLORREF face;
+    HBRUSH b;
+    HPEN p;
+    HGDIOBJ ob, op, of;
+
+    if (dis || greyed) {
+        face = down ? COL_BTN_HOT : COL_BTN_DIS;
+    } else {
+        /* Darkened twice now - originally 102,102,255/255,0,0, then
+         * 85,85,215/215,0,0, now further down to this.                  */
+        COLORREF base = is_b ? RGB(165, 0, 0) : RGB(65, 65, 165);
+        if (down) {
+            int r = GetRValue(base) + 25; if (r > 255) r = 255;
+            int g = GetGValue(base) + 25; if (g > 255) g = 255;
+            int bl = GetBValue(base) + 25; if (bl > 255) bl = 255;
+            face = RGB(r, g, bl);
+        } else {
+            face = base;
+        }
+    }
+
+    b = CreateSolidBrush(face);
+    FillRect(di->hDC, &di->rcItem, g_hbrBg);
+    p = CreatePen(PS_SOLID, 1, COL_PANEL_EDGE);
+    ob = SelectObject(di->hDC, b);
+    op = SelectObject(di->hDC, p);
+    RoundRect(di->hDC, di->rcItem.left, di->rcItem.top,
+              di->rcItem.right, di->rcItem.bottom, 5, 5);
+    SelectObject(di->hDC, ob);
+    SelectObject(di->hDC, op);
+    DeleteObject(b);
+    DeleteObject(p);
+
+    SetBkMode(di->hDC, TRANSPARENT);
+    /* White text on the two identity colours and on down/pressed grey;
+     * dimmed on plain disabled/greyed, matching every other button.     */
+    SetTextColor(di->hDC, (dis || greyed) ? COL_TEXT_DIM : RGB(255, 255, 255));
+    of = SelectObject(di->hDC, g_hFontUI);
+    {
+        /* Small "listening" LED at the right edge - lit whenever THIS
+         * tuner is both the active one and actually audible right now
+         * (g_monitor.enabled). The sole "currently active" indicator on
+         * these buttons now that the whole-button fill no longer
+         * changes on selection.                                        */
+        int listening = !dis && g_monitor.enabled &&
+                         (monitor_tuner_b_active() == (is_b != 0));
+        int led_r = 4;
+        int led_cx = di->rcItem.right - 11;
+        int led_cy = (di->rcItem.top + di->rcItem.bottom) / 2;
+        RECT text_rect = di->rcItem;
+        text_rect.right = led_cx - led_r - 4;
+        DrawTextA(di->hDC, is_b ? "Tuner 2" : "Tuner 1", -1, &text_rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        /* No outline pen here (unlike the shared draw_led() used
+         * elsewhere) - at this small a size, a stroked 1px border is
+         * what makes the circle look faceted/diamond-shaped rather than
+         * round; a plain filled Ellipse with no border reads as a clean
+         * round dot instead.                                            */
+        {
+            COLORREF led_col = listening ? RGB(10, 245, 25) : RGB(40, 40, 40);
+            HBRUSH lb = CreateSolidBrush(led_col);
+            HGDIOBJ olb = SelectObject(di->hDC, lb);
+            HGDIOBJ olp = SelectObject(di->hDC, GetStockObject(NULL_PEN));
+            Ellipse(di->hDC, led_cx - led_r, led_cy - led_r,
+                    led_cx + led_r, led_cy + led_r);
+            SelectObject(di->hDC, olb);
+            SelectObject(di->hDC, olp);
+            DeleteObject(lb);
+        }
+    }
+    SelectObject(di->hDC, of);
+    return TRUE;
+}
+
 static void paint_window(HWND hwnd)
 {
     PAINTSTRUCT ps;
@@ -11535,7 +14084,10 @@ static void paint_window(HWND hwnd)
     /* Background */
     FillRect(dc, &cr, g_hbrBg);
 
-    UiSnapshot s = g_ui;   /* snapshot */
+    UiSnapshot s;   /* snapshot */
+    EnterCriticalSection(&g_ui_lock);
+    s = g_ui;
+    LeaveCriticalSection(&g_ui_lock);
 
     /* ---- Title bar strip (baseline-aligned) ---- */
     {
@@ -11572,6 +14124,59 @@ static void paint_window(HWND hwnd)
     /* ---- Frequency line (baseline-aligned) ---- */
     {
         int baseline = 60;
+
+        /* Live clock, right-aligned, lined up with the recording/finished
+         * LED above it (not the state text next to that LED - the LED's
+         * own x position, so the two form a clean vertical line). Slightly
+         * larger and brighter than before (g_hFontVal / COL_TEXT rather
+         * than g_hFontUI / COL_TEXT_DIM) so it's actually easy to read at
+         * a glance. Follows the same UTC/local choice as the rest of the
+         * app (use_utc). Optional via show_clock.                        */
+        int clock_left = cr.right;
+        if (g_clock_show) {
+            SYSTEMTIME ct;
+            if (g_clock_utc) GetSystemTime(&ct); else GetLocalTime(&ct);
+            char cb[40];
+            snprintf(cb, sizeof(cb), "%02d:%02d:%02d %s",
+                     ct.wHour, ct.wMinute, ct.wSecond,
+                     g_clock_utc ? "UTC" : "local");
+            HGDIOBJ of = SelectObject(dc, g_hFontVal);
+            SIZE csz; GetTextExtentPoint32A(dc, cb, (int)strlen(cb), &csz);
+            SelectObject(dc, of);
+            clock_left = cr.right - 14 - 110; /* matches led_x above: the LED's
+                                                  own x position, not the state
+                                                  text 14px to its right      */
+            draw_text_base(dc, clock_left, baseline, cb,
+                           COL_TEXT, g_hFontVal);
+        }
+
+        /* Scheduling status, placed to the left of the clock - the single
+         * place this is now shown (Section 3.2), covering idle preview,
+         * an active armed wait, and while Listening alike, with full
+         * start/stop detail rather than just a start time. Previously
+         * split across this spot (start time only) and a second location
+         * near the Start/Stop buttons (full detail, but only while not
+         * Listening) - s.sched is now built once, the same way, for
+         * every state (see the snapshot code above) and drawn only here. */
+        if (s.sched[0]) {
+            HGDIOBJ of = SelectObject(dc, g_hFontUI);
+            SIZE nsz; GetTextExtentPoint32A(dc, s.sched, (int)strlen(s.sched), &nsz);
+            SelectObject(dc, of);
+            draw_text_base(dc, clock_left - 20 - nsz.cx, baseline, s.sched,
+                           COL_ACCENT, g_hFontUI);
+        }
+    }
+
+    /* ---- CF / Usable Coverage line - own row, below the clock/schedule
+     * line above rather than sharing it. CF and Coverage grow rightward
+     * from the left edge, while the schedule status grows leftward from
+     * the clock on the right - on one shared row, a long dual-tuner CF
+     * string next to a long multi-entry schedule status collided visibly
+     * in the middle. Separate rows removes the collision entirely rather
+     * than trying to guess a width neither one is ever guaranteed to
+     * fit within.                                                        */
+    {
+        int baseline = 84;
         char fb[128];
         snprintf(fb, sizeof(fb), "CF: %s", s.freq[0] ? s.freq : "-");
         int w = draw_text_base(dc, 14, baseline, fb, COL_TEXT, g_hFontVal);
@@ -11582,45 +14187,13 @@ static void paint_window(HWND hwnd)
             draw_text_base(dc, 14 + w + 24, baseline, sb,
                            COL_TEXT_DIM, g_hFontUI);
         }
-
-        /* Live clock, right-aligned, small and dim. Follows the same UTC/local
-         * choice as the rest of the app (use_utc). Optional via show_clock.   */
-        int clock_left = cr.right;
-        if (g_clock_show) {
-            SYSTEMTIME ct;
-            if (g_clock_utc) GetSystemTime(&ct); else GetLocalTime(&ct);
-            char cb[40];
-            snprintf(cb, sizeof(cb), "%02d:%02d:%02d %s",
-                     ct.wHour, ct.wMinute, ct.wSecond,
-                     g_clock_utc ? "UTC" : "local");
-            HGDIOBJ of = SelectObject(dc, g_hFontUI);
-            SIZE csz; GetTextExtentPoint32A(dc, cb, (int)strlen(cb), &csz);
-            SelectObject(dc, of);
-            clock_left = cr.right - 110; /* aligns with state text left edge */
-            draw_text_base(dc, clock_left, baseline, cb,
-                           COL_TEXT_DIM, g_hFontUI);
-        }
-
-        /* Next scheduled start, placed to the left of the clock. Hourly
-         * mode populates this exact same display (g_state.next_start) as
-         * the multi-entry schedule does, so without distinguishing them
-         * here, an hourly wait and a genuine schedule wait look
-         * identical - "(hourly)" only appears when that's actually what's
-         * being waited for.                                              */
-        if (s.next[0]) {
-            char nb[64];
-            snprintf(nb, sizeof(nb), "Scheduled%s: %s",
-                     g_state.cfg.hourly_enable ? " (hourly)" : "", s.next);
-            HGDIOBJ of = SelectObject(dc, g_hFontUI);
-            SIZE nsz; GetTextExtentPoint32A(dc, nb, (int)strlen(nb), &nsz);
-            SelectObject(dc, of);
-            draw_text_base(dc, clock_left - 20 - nsz.cx, baseline, nb,
-                           COL_ACCENT, g_hFontUI);
-        }
     }
 
     /* ---- Signal meters panel ---- */
-    int panelTop = 74;
+    int panelTop = 100;  /* was 74 - CF/Coverage moved to its own row at
+                                baseline 84 (below the clock/schedule row) to
+                                fix a text collision, so everything below
+                                needs to shift down to make room for it */
     {
         RECT p = { 12, panelTop, cr.right - 12, panelTop + 86 };
         draw_panel(dc, p);
@@ -11630,16 +14203,16 @@ static void paint_window(HWND hwnd)
         /* Single-tuner data always lands in the "A slot" (s.peak_a/
          * s.overload_a) regardless of which physical tuner it actually
          * came from - stream_callback_single() doesn't know or care
-         * which one it is. So when single-tuner mode has selected B, the
-         * live data needs to be drawn on the row labelled B instead of
-         * the row labelled A, rather than relabelling a row - keeps "A"
-         * and "B" meaning what they say, with only which one shows a
-         * signal changing.                                               */
+         * which one it is. So when single-tuner mode has selected Tuner
+         * 2, the live data needs to be drawn on the row labelled 2
+         * instead of the row labelled 1, rather than relabelling a row -
+         * keeps "1" and "2" meaning what they say, with only which one
+         * shows a signal changing.                                      */
         int single_b_active = !g_state.cfg.dual_channel &&
                                !strcmp(g_state.cfg.rspduo_single_tuner, "B");
 
-        /* Channel A */
-        draw_text(dc, 22, panelTop + 30, "A", COL_TEXT, g_hFontVal);
+        /* Channel 1 */
+        draw_text(dc, 22, panelTop + 30, "1", COL_TEXT, g_hFontVal);
         RECT ma = { 44, panelTop + 30, cr.right - 120, panelTop + 48 };
         draw_meter(dc, ma,
                    (!single_b_active && (s.recording || s.listening)) ? s.peak_a : -90.0f,
@@ -11656,9 +14229,9 @@ static void paint_window(HWND hwnd)
                       (!single_b_active && s.overload_a) ? COL_SEG_RED : COL_TEXT, g_hFontVal);
         }
 
-        /* Channel B - live when either genuinely dual/Master-Slave, or
+        /* Channel 2 - live when either genuinely dual/Master-Slave, or
          * single-tuner mode has selected B (see single_b_active above).  */
-        draw_text(dc, 22, panelTop + 56, "B", COL_TEXT, g_hFontVal);
+        draw_text(dc, 22, panelTop + 56, "2", COL_TEXT, g_hFontVal);
         RECT mb = { 44, panelTop + 56, cr.right - 120, panelTop + 74 };
         draw_meter(dc, mb,
                    single_b_active ? ((s.recording || s.listening) ? s.peak_a : -90.0f)
@@ -11672,7 +14245,15 @@ static void paint_window(HWND hwnd)
                 else
                     snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_a);
             } else if (!s.dual && !s.master_slave) {
-                snprintf(db, sizeof(db), "  (single)");
+                /* Single-tuner mode, Tuner 1 currently selected - same
+                 * "(unused)" wording as channel A's own single_b_active
+                 * case above uses when B is selected instead, rather
+                 * than the "(single)" this used to say here specifically
+                 * - two different words for the same situation (this
+                 * row's tuner isn't the one currently selected) depending
+                 * on which physical tuner happened to be active read as
+                 * inconsistent switching between Tuner 1 and Tuner 2.    */
+                snprintf(db, sizeof(db), "  (unused)");
             } else if (s.peak_b <= -90.0f || !(s.recording || s.listening)) {
                 snprintf(db, sizeof(db), "  --- dBFS");
             } else {
@@ -11808,7 +14389,7 @@ static void paint_window(HWND hwnd)
                            RGB(10, 245, 25), g_hFontUI);
         }
 
-        /* MASTER/SLAVE indicator: lit whenever Tuner B is being recorded
+        /* MASTER/SLAVE indicator: lit whenever Tuner 2 is being recorded
          * by the separate hidden slave process rather than the normal
          * Dual_Tuner path (i.e. the two tuners are on different
          * frequencies this session). Amber to read as "different mode",
@@ -11846,11 +14427,13 @@ static void paint_window(HWND hwnd)
         int monY2 = cr.bottom - monH2 - BOTTOM_MON_GAP;
         int bbY2 = g_monitor_bar_visible_eff ? (monY2 - bbh2 - BOTTOM_BTN_GAP)
                                               : (cr.bottom - bbh2 - BOTTOM_MON_GAP);
-        /* Device-info text (RSPdx / Ant / GR / LNA / SR) removed here -
-         * the Scheduled status still uses this row when armed and
-         * waiting (time-exclusive with Carrier below, so no collision). */
-        if (s.sched[0])
-            draw_text_base(dc, 14, bbY2 + 17, s.sched, COL_ACCENT, g_hFontUI);
+        /* Device-info text (RSPdx / Ant / GR / LNA / SR) removed here.
+         * The scheduling status used to also be drawn on this row when
+         * armed and waiting, but that meant it showed in two different
+         * places with two different levels of detail depending on
+         * whether Monitor/Listening was on. It's now drawn once, always,
+         * to the left of the clock instead (Section 3.2) - see s.sched
+         * in the snapshot code above and its draw call further up.      */
 
         /* Carrier readout - back on the info-strip row, aligned
          * horizontally above the frequency dial (g_hFreqDigits). No
@@ -11861,25 +14444,51 @@ static void paint_window(HWND hwnd)
          * smaller (16pt) - see g_hFontCarrier. Queries the dial's actual
          * current position rather than a hardcoded offset, since that
          * row's layout shifts with window width.                        */
-        if (g_monitor.enabled && g_monitor.carrier_offset_valid_pub &&
-                g_monitor.carrier_locked_pub && g_hFreqDigits) {
+        if (g_monitor.enabled && g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] &&
+                g_monitor.carrier_settled_pub[g_monitor.tuner_sel] && g_state.cfg.show_carrier_offset &&
+                g_hFreqDigits) {
             RECT fr;
             GetWindowRect(g_hFreqDigits, &fr);
             MapWindowPoints(NULL, hwnd, (POINT *)&fr, 2);
 
             double dial_hz = (g_monitor.tuner_sel == 1) ? g_monitor.freq_hz_b
                                                           : g_monitor.freq_hz;
-            double carrier_hz = dial_hz + (double)g_monitor.carrier_offset_hz_pub;
+            /* carrier_offset_calib_hz is a small manual correction (Settings,
+             * Monitor tab) for calibrating this display against a known
+             * GPSDO reference - it only ever adjusts what's shown here,
+             * never the actual measurement or the recorded IQ data.        */
+            double carrier_hz = dial_hz + (double)g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel]
+                                 + g_state.cfg.carrier_offset_calib_hz;
             char cb[32];
-            snprintf(cb, sizeof(cb), "%.4f", carrier_hz / 1000.0);
+            /* A 5th decimal digit (0.01 Hz resolution in kHz terms) - not
+             * meaningful for everyday listening, but useful precision to
+             * have on screen specifically while calibrating.               */
+            snprintf(cb, sizeof(cb), "%.5f", carrier_hz / 1000.0);
+            /* Same figure as above, just isolated and shown directly in Hz -
+             * the absolute frequency line takes some reading to judge "how
+             * far off is this station", this says it plainly.              */
+            double hz_deviation = (double)g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel]
+                                   + g_state.cfg.carrier_offset_calib_hz;
+            char hzb[24];
+            snprintf(hzb, sizeof(hzb), "  (%+.1f Hz)", hz_deviation);
 
             int cx = fr.left;
             int cy = bbY2 + 20;
+            g_carrierOffsetRect.left = cx;
+            g_carrierOffsetRect.top  = cy - 18;
+            g_carrierOffsetRect.bottom = cy + 6;
             cx += draw_text_base(dc, cx, cy, "OFFSET: ", COL_TEXT_DIM, g_hFontUI);
             cx += draw_text_base(dc, cx, cy, cb, COL_SEG_AMBER, g_hFontCarrier);
             cx += draw_text_base(dc, cx, cy, " kHz", COL_TEXT_DIM, g_hFontUI);
-            if (g_monitor.carrier_settled_pub)
-                draw_text_base(dc, cx + 6, cy, "(lock)", COL_SEG_GREEN, g_hFontUI);
+            cx += draw_text_base(dc, cx, cy, hzb, COL_TEXT_DIM, g_hFontUI);
+            /* Click target for calibration (WM_LBUTTONDOWN in WndProc) -
+             * the whole readout, not just the amber figure, since there's
+             * nothing else on this row to conflict with and a wider
+             * target is easier to hit without needing to be precise.     */
+            g_carrierOffsetRect.right = cx;
+            g_carrierOffsetRectValid = 1;
+        } else {
+            g_carrierOffsetRectValid = 0;
         }
 
         /* Low-profile divider between the button row above and the
@@ -11917,8 +14526,23 @@ static void gui_refresh_monitor_bar_visibility(void)
     int cmd = vis ? SW_SHOW : SW_HIDE;
     g_monitor_bar_visible_eff = vis;
 
-    if (g_hBtnMonitor)      ShowWindow(g_hBtnMonitor,      cmd);
-    if (g_hBtnFreqLock)     ShowWindow(g_hBtnFreqLock,     cmd);
+    if (g_hBtnMonitor)      ShowWindow(g_hBtnMonitor,
+                                 (cmd == SW_SHOW && monitor_use_single_button())
+                                 ? SW_SHOW : SW_HIDE);
+    if (g_hBtnTunerA)       ShowWindow(g_hBtnTunerA,
+                                 (cmd == SW_SHOW && !monitor_use_single_button())
+                                 ? SW_SHOW : SW_HIDE);
+    if (g_hBtnTunerB)       ShowWindow(g_hBtnTunerB,
+                                 (cmd == SW_SHOW && !monitor_use_single_button())
+                                 ? SW_SHOW : SW_HIDE);
+    /* Genuinely disables (not just visually mutes) whichever of the two
+     * isn't actually usable per current Settings - see
+     * monitor_tuner_config_enabled()'s own comment for why.             */
+    if (g_hBtnTunerA)       EnableWindow(g_hBtnTunerA, monitor_tuner_config_enabled(0));
+    if (g_hBtnTunerB)       EnableWindow(g_hBtnTunerB, monitor_tuner_config_enabled(1));
+    if (g_hBtnFreqLock)     ShowWindow(g_hBtnFreqLock,
+                                 (cmd == SW_SHOW && !monitor_use_single_button())
+                                 ? SW_SHOW : SW_HIDE);
     if (g_hFreqDigits)      ShowWindow(g_hFreqDigits,      cmd);
     if (g_hMonHzLbl)        ShowWindow(g_hMonHzLbl,        cmd);
     if (g_hMonModeLbl)      ShowWindow(g_hMonModeLbl,      cmd);
@@ -11949,7 +14573,10 @@ static void layout_children(HWND hwnd)
     GetClientRect(hwnd, &cr);
 
     /* Geometry mirrors the painter. */
-    int panelTop = 74;
+    int panelTop = 100;  /* was 74 - CF/Coverage moved to its own row at
+                                baseline 84 (below the clock/schedule row) to
+                                fix a text collision, so everything below
+                                needs to shift down to make room for it */
     int ctrTop   = panelTop + 96;
     int diskY    = ctrTop + 64;
 
@@ -11993,7 +14620,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
-        SetTextColor(dc, COL_TEXT);
+        /* Matches SUNRISE/SUNSET's own label colour (Section 3.3) - both
+         * are small caption-style labels sitting above the value they
+         * describe, so reads as the same kind of thing.                 */
+        SetTextColor(dc, (HWND)lp == g_hAntLbl ? COL_TEXT_DIM : COL_TEXT);
         SetBkColor(dc, COL_BG);
         return (LRESULT)g_hbrBg;
     }
@@ -12002,6 +14632,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         LPDRAWITEMSTRUCT di = (LPDRAWITEMSTRUCT)lp;
         if (di->CtlType == ODT_BUTTON && di->CtlID == IDC_BTN_MONITOR)
             return monitor_draw_button(di);
+        if (di->CtlType == ODT_BUTTON && di->CtlID == IDC_BTN_TUNER_A)
+            return tuner_ab_draw_button(di, 0);
+        if (di->CtlType == ODT_BUTTON && di->CtlID == IDC_BTN_TUNER_B)
+            return tuner_ab_draw_button(di, 1);
         if (di->CtlType == ODT_BUTTON && di->CtlID == IDC_BTN_NOTCH_ENABLE)
             return notch_draw_button(di);
         if (di->CtlType == ODT_BUTTON && di->CtlID == IDC_BTN_HPF_ENABLE)
@@ -12032,7 +14666,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 /* Green when AGC is currently enabled. */
                 face = down ? RGB(40, 120, 80) : COL_BTN_START;
             } else if (di->CtlID == IDC_BTN_FREQ_LOCK && !dis && g_monitor.freq_locked) {
-                /* Green when Monitor A/B frequencies are locked together. */
+                /* Green when Tuner 1/2 frequencies are locked together. */
                 face = down ? RGB(40, 120, 80) : COL_BTN_START;
             } else if (di->CtlID == IDC_BTN_SCHED_TOGGLE &&
                        (g_state.cfg.schedule_only || g_state.cfg.hourly_enable)) {
@@ -12082,21 +14716,63 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ERASEBKGND:
         return 1;   /* handled in WM_PAINT (double-buffered) */
 
+    case WM_LBUTTONDOWN: {
+        /* Click-to-calibrate on the OFFSET readout itself - same menu as
+         * the S-meter's right-click (show_carrier_calib_menu()), just
+         * reached directly from the figure it actually calibrates rather
+         * than a different control entirely. g_carrierOffsetRectValid is
+         * false whenever the readout isn't currently shown (paint_window()
+         * clears it), so this is a no-op then rather than acting on a
+         * stale rect from the last time it was visible.                   */
+        POINT pt;
+        pt.x = (int)(short)LOWORD(lp);
+        pt.y = (int)(short)HIWORD(lp);
+        if (g_carrierOffsetRectValid && PtInRect(&g_carrierOffsetRect, pt)) {
+            POINT screen_pt = pt;
+            ClientToScreen(hwnd, &screen_pt);
+            show_carrier_calib_menu(hwnd, screen_pt.x, screen_pt.y);
+            return 0;
+        }
+        break;
+    }
+
     case WM_PAINT:
         paint_window(hwnd);
         return 0;
 
     case WM_TIMER:
         if (wp == ID_TIMER_CLOCK) {
-            if (g_clock_show) {
-                /* Tick the clock once a second. Repaint only the top strip
-                 * where the clock lives (cheap; the monitor handles the
-                 * rest during a recording, and this keeps the clock smooth
-                 * at idle too).                                           */
+            /* Tick once a second. Repaint only the top strip where the
+             * clock and the scheduling status both live (cheap; the
+             * monitor handles the rest during a recording). Done
+             * unconditionally now, not just when g_clock_show is on -
+             * the scheduling text anchored next to the clock's position
+             * still needs to stay fresh even with the clock itself
+             * hidden, otherwise it would only ever update on whatever
+             * other repaint happened to come along.                     */
+            {
                 RECT cr; GetClientRect(hwnd, &cr);
                 RECT top = { 0, 0, cr.right, 74 };
                 InvalidateRect(hwnd, &top, FALSE);
             }
+            /* Tuner 1/2's LED only ever repaints when something explicit
+             * triggers it (a click, a session starting) - nothing
+             * refreshes it periodically the way the meters do. If its
+             * underlying state (g_monitor.enabled, tuner_sel) is ever
+             * momentarily inconsistent right at a transition - such as
+             * a scheduled/timer recording beginning while Monitor was
+             * already on - the LED could end up frozen showing that one
+             * bad moment for the rest of an unattended recording, since
+             * nothing else would touch it again until the session ends.
+             * Cheap enough to just repaint unconditionally once a
+             * second so this self-corrects quickly regardless of cause.
+             * FALSE (don't erase background first) - the owner-draw
+             * handler already fully repaints the entire button (fill,
+             * border, text) on its own, so erasing first just inserts a
+             * visible blank frame beforehand for no reason - which is
+             * what was showing up as a once-a-second flicker.           */
+            if (g_hBtnTunerA) InvalidateRect(g_hBtnTunerA, NULL, FALSE);
+            if (g_hBtnTunerB) InvalidateRect(g_hBtnTunerB, NULL, FALSE);
             if (!g_worker_active) {
                 /* Only meaningful at minute granularity - once a minute is
                  * enough to keep "next: HH:MM" from going stale sitting
@@ -12112,64 +14788,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_BTN_TOGGLE: {
-            int genuinely_nothing_scheduled = !(g_state.cfg.schedule_only ||
-                                                 g_state.cfg.hourly_enable ||
-                                                 g_state.cfg.start_time[0]);
-            if (g_worker_active && g_state.listening && !g_toggle_btn_recording &&
-                    genuinely_nothing_scheduled) {
-                /* Genuinely just listening (Monitor pressed, nothing at all
-                 * scheduled) - this press means "start recording now"
-                 * rather than "stop". Reuses the same g_record_now signal
-                 * a scheduled wait already respects, so the transition
-                 * falls through recording_worker's existing wait-then-
-                 * record logic with no special case needed there.
-                 * gui_set_recording_ui(1) commits this visually too -
-                 * immediately shows Stop and marks g_toggle_btn_recording,
-                 * the same as a cold Record/Start press already does -
-                 * previously this branch only set g_record_now with no
-                 * button update at all, so pressing Start here gave no
-                 * feedback whatsoever and looked like it had done
-                 * nothing, even on the rare case it actually had.        */
+            /* Record/Stop toggle, Timer owning all scheduling separately
+             * (Section 3.1/3.2) - but still needs to distinguish "Monitor
+             * is running, nothing recording yet" from "already recording"
+             * or "fully idle", not just worker_active/not. Record/Stop is
+             * disabled entirely while Timer is armed (see gui_set_
+             * recording_ui()/gui_set_listening_ui()), so the only way
+             * g_worker_active && g_state.listening can be true while this
+             * button is even clickable is a plain Monitor press with
+             * Timer off - committing to recording on that already-
+             * running receiver, rather than stopping it, is what pressing
+             * Record here has always meant.                             */
+            if (g_worker_active && g_state.listening && !g_toggle_btn_recording) {
                 g_record_now = 1;
                 gui_set_recording_ui(1);
-            } else if (g_worker_active && g_state.listening && !g_toggle_btn_recording) {
-                /* Monitor-initiated listening, but a schedule/hourly/
-                 * start_time wait is genuinely already active (Timer was
-                 * armed before Monitor was pressed) - checking only
-                 * g_toggle_btn_recording here, as the branch above used
-                 * to do alone, meant this looked identical to "nothing
-                 * scheduled" and pressing Start jumped straight into an
-                 * immediate ad-hoc recording that bypassed the real wait
-                 * entirely. Commit to the existing wait instead - the
-                 * same thing a cold Record/Start press already does for
-                 * this exact wait - and let it continue governing when
-                 * recording actually begins, rather than short-circuiting
-                 * it with g_record_now.
-                 *
-                 * Exception: if the session has already fallen through to
-                 * the generic "no schedule at all" loop (g_toggle_btn_
-                 * recording having been reset to 0 by an earlier Timer-off
-                 * downgrade, then Timer turned back on before Start was
-                 * pressed) - there is no real wait left underneath to
-                 * notice g_toggle_btn_recording on its own; that loop only
-                 * responds to g_record_now. Not setting it there wouldn't
-                 * bypass a real wait, it would just leave the button
-                 * showing Stop forever with nothing actually happening
-                 * until Stop is pressed - worse than the original bug,
-                 * not better. So g_record_now is also set in that specific
-                 * case, trading a possibly-mistimed ad-hoc recording for a
-                 * session that actually progresses instead of one that's
-                 * silently stuck.                                         */
-                if (g_in_generic_listen_wait) g_record_now = 1;
-                gui_set_recording_ui(1);
             } else if (g_worker_active) {
-                /* Covers both an actual recording in progress, and Record
-                 * having been pressed for an hourly/schedule/start_time
-                 * wait that pre-opened the device for Monitor's benefit
-                 * (g_toggle_btn_recording is 1 in that case too, even
-                 * though g_state.listening is also 1) - the button already
-                 * correctly reads "Stop" here, and clicking it should
-                 * actually stop, not silently skip ahead into recording.  */
                 gui_stop_session(0);
             } else {
                 gui_start_session();
@@ -12178,18 +14811,73 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case IDC_BTN_SCHED_TOGGLE: {
-            /* Unified Timer button: Schedule and Hourly are two mutually
-             * exclusive automatic-recording modes, but previously only
-             * Schedule had a main-window control at all - Hourly could
-             * only be seen or changed from Settings, with nothing on the
-             * main window even hinting it was active. This button now
-             * arms/disarms whichever mode is configured, and
-             * timer_last_mode remembers which one to re-arm on the next
-             * OFF-to-ON press, since turning both off loses that
-             * information otherwise (see the Config field comment).      */
+            /* Timer now owns the whole scheduling lifecycle on its own
+             * (Section 3.1/3.2) - turning it on both arms schedule/hourly
+             * mode AND starts the session waiting for it, replacing the
+             * previous two-step "enable Timer, then also press Start".
+             * Turning it off is a full stop, exactly like pressing Stop -
+             * no more "cancel just the wait, keep something running in a
+             * half-armed state" middle ground, which was the source of
+             * most of the Tuner 1/2 and Monitor inconsistencies this
+             * session kept turning up. Record/Stop (IDC_BTN_TOGGLE) is
+             * now a plain, independent ad-hoc toggle that doesn't need to
+             * reason about any of this at all.                          */
             int currently_on = g_state.cfg.schedule_only || g_state.cfg.hourly_enable;
             IniPatchEntry entries[2];
             int n = 0;
+
+            if (!currently_on) {
+                /* Turning ON in schedule mode specifically (not hourly,
+                 * which uses its own separate hourly_start/stop/window
+                 * fields and doesn't need any schedule_N_* entries at
+                 * all) with nothing actually scheduled had nothing to
+                 * ever wait for - recording_worker() proceeds straight
+                 * past its own schedule_count>0 promotion block (a no-op
+                 * when there's nothing to promote) and into Step 1
+                 * regardless, starting an ad-hoc-equivalent recording off
+                 * whatever the base config happens to say, not something
+                 * the operator actually asked for by arming Timer.
+                 * Refusing to arm at all, with a clear reason, beats
+                 * silently recording something unintended - a fresh ini
+                 * reload here (rather than trusting g_state.cfg.schedule_
+                 * count, which could be stale from an earlier session)
+                 * gives an accurate answer regardless of what's changed
+                 * in duodx.ini since this session started.               */
+                int want_hourly_check = !strcmp(g_state.cfg.timer_last_mode, "hourly");
+                if (!want_hourly_check) {
+                    Config check;
+                    config_set_defaults(&check);
+                    config_load_ini(&check, "duodx.ini");
+                    if (check.schedule_count == 0) {
+                        LOG_ERROR("Timer: no schedule entries configured - "
+                                  "add at least one on the Schedule tab "
+                                  "before arming Timer in schedule mode, "
+                                  "or switch to Hourly Recording instead.");
+                        return 0;
+                    }
+                    /* Entry 1 specifically, not any later entry - a blank
+                     * start_time on a LATER entry genuinely means
+                     * something ("start right after the previous entry
+                     * ends"), but entry 1 has no previous entry for that
+                     * to apply to, so a blank time there only ever means
+                     * "start immediately" (recording_worker() logs
+                     * exactly that as a warning, not an error, since it's
+                     * treated as intentional). Confirmed as unintended in
+                     * practice: an entry added via + Add and Saved
+                     * without actually filling in a time yet, followed by
+                     * arming Timer, silently started recording right away
+                     * with whatever the base config's frequency/gain
+                     * happened to be - not something the operator had
+                     * actually configured or asked for.                  */
+                    if (check.schedule[0].start_time[0] == '\0') {
+                        LOG_ERROR("Timer: schedule entry 1 has no start "
+                                  "time set - it would record immediately "
+                                  "with the current Receiver tab settings. "
+                                  "Set a start time first.");
+                        return 0;
+                    }
+                }
+            }
 
             if (currently_on) {
                 const char *which = g_state.cfg.schedule_only ? "schedule_only" : "hourly_enable";
@@ -12223,6 +14911,51 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 LOG_INFO("Timer disabled (%s).", was_schedule ? "schedule" : "hourly");
             } else {
                 int want_hourly = !strcmp(g_state.cfg.timer_last_mode, "hourly");
+                /* Any prior session that ran without schedule_only set
+                 * (plain Monitor/Listen, or an ad-hoc Record) zeroes
+                 * g_state.cfg.schedule_count in memory at its own cold
+                 * start - correctly, for that session, so a disabled
+                 * schedule's leftover entries stay inert - but nothing
+                 * was putting it back afterward. The actual recording
+                 * this arms still runs correctly regardless (recording_
+                 * worker() does its own fresh reload from duodx.ini at
+                 * its cold start either way), but the "Scheduled: ..."
+                 * text computed here, from this same stale in-memory
+                 * copy, kept reading "no entries configured" even with
+                 * one genuinely sitting in the ini file.
+                 *
+                 * Reloading just the schedule fields here, unconditional
+                 * on g_worker_active, closes a gap the previous version
+                 * of this fix had: it only reloaded when nothing was
+                 * running yet at all, so turning Timer on while Monitor
+                 * was already active (a very ordinary thing to do) still
+                 * left this stale, since schedule_count only ever got
+                 * zeroed by the Monitor session's own cold start, not
+                 * ever put back until something else reloaded it. Schedule
+                 * data isn't actually in use by a monitoring-only session
+                 * the way dual_channel or the tuned frequencies are, so
+                 * refreshing just this part is safe regardless of what's
+                 * currently running - unlike a full config reload, which
+                 * could disrupt live session state that genuinely is in
+                 * use.                                                   */
+                {
+                    Config fresh;
+                    config_set_defaults(&fresh);
+                    config_load_ini(&fresh, "duodx.ini");
+                    if (g_worker_active) {
+                        /* Something's already running - only the schedule
+                         * fields are safe to refresh here, not the whole
+                         * struct (which could disrupt live session state
+                         * that's genuinely in use, like dual_channel or
+                         * the tuned frequencies).                        */
+                        g_state.cfg.schedule_count = fresh.schedule_count;
+                        g_state.cfg.schedule_total_count = fresh.schedule_total_count;
+                        memcpy(g_state.cfg.schedule, fresh.schedule,
+                               sizeof(g_state.cfg.schedule));
+                    } else {
+                        g_state.cfg = fresh;
+                    }
+                }
                 if (want_hourly) g_state.cfg.hourly_enable = 1;
                 else             g_state.cfg.schedule_only = 1;
                 LOG_INFO("Timer enabled (%s).", want_hourly ? "hourly" : "schedule");
@@ -12234,41 +14967,80 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SetWindowTextA(g_hBtnToggle, gui_record_btn_idle_label());
                 InvalidateRect(g_hBtnToggle, NULL, FALSE);
             }
-            if (currently_on && g_worker_active && !g_state.stream_running) {
-                /* Currently waiting for a scheduled/hourly time.
-                 * currently_on being true already proves this really was
-                 * an armed wait (checked above, before disabling it),
-                 * regardless of whether Monitor or Record originally
-                 * started it. If the device is open for listening - which
-                 * it always is during this kind of wait, since it's
-                 * pre-opened specifically so Monitor works - cancel just
-                 * the scheduled plan and keep listening running, rather
-                 * than tearing the whole session down and taking Monitor
-                 * with it. Falls back to a full stop only if somehow not
-                 * listening at all, which shouldn't normally happen here. */
-                if (g_state.listening) {
-                    g_downgrade_to_listening = 1;
-                } else {
-                    gui_stop_session(0);
+            /* Record/Stop and Timer are deliberately kept as two fully
+             * separate controls rather than one merging into the other's
+             * job - Timer owns scheduled/hourly recording end to end, and
+             * Record/Stop is for ad-hoc use only, available whenever
+             * Timer isn't armed. Disabling (not hiding) it while Timer is
+             * on keeps the layout stable and makes the relationship
+             * visible - it only ever shows "Stop" once an actual ad-hoc
+             * recording has been started by pressing it, never as a
+             * side-effect of Timer's own state.                         */
+            if (currently_on) {
+                /* Turning OFF - full stop, whatever is currently running
+                 * (a scheduled wait, a Timer-driven recording, or even an
+                 * ad-hoc one - Timer off means "stop everything" now, no
+                 * exceptions).                                           */
+                /* gui_refresh_idle_timer_text() (called just above) only
+                 * actually updates g_ui.sched while g_worker_active is
+                 * already false - but the stop just requested below is
+                 * asynchronous, so that guard was skipping the update
+                 * entirely here, leaving the "Scheduled: ..."/"NEXT AT"
+                 * text showing stale (if abbreviated by WM_APP_DONE's own
+                 * partial handling) information until something else -
+                 * the next minute tick, at worst - happened to refresh
+                 * it. Clear it directly here instead, since Timer being
+                 * turned off unconditionally means there's nothing left
+                 * to show regardless of how long the stop itself takes.  */
+                g_ui.sched[0] = '\0';
+                EnterCriticalSection(&g_next_lock);
+                g_state.next_start[0] = '\0';
+                g_state.next_stop[0]  = '\0';
+                LeaveCriticalSection(&g_next_lock);
+                if (g_hwnd) {
+                    RECT cr; GetClientRect(g_hwnd, &cr);
+                    RECT strip = { 0, cr.bottom - 36, cr.right, cr.bottom - 10 };
+                    InvalidateRect(g_hwnd, &strip, FALSE);
                 }
-            } else if (!currently_on && g_worker_active && g_state.listening &&
-                       g_in_generic_listen_wait && !g_toggle_btn_recording) {
-                /* Turning Timer back ON, but this listening session had
-                 * already fallen through to the generic "no schedule"
-                 * loop from an earlier Timer-off downgrade (see the
-                 * branch above). That loop only ever watches
-                 * g_record_now, so simply flipping the ini flag back on
-                 * here does nothing on its own - the just re-armed
-                 * schedule would silently be ignored and Start would
-                 * begin an immediate ad-hoc recording instead of waiting
-                 * (see the g_in_generic_listen_wait comment in
-                 * IDC_BTN_TOGGLE for that fallback). Restart listening
-                 * cleanly instead, so recording_worker re-reads the
-                 * config fresh and enters a genuine wait for the
-                 * schedule/hourly time, exactly as a brand new Monitor
-                 * press already would.                                   */
-                gui_stop_session(1);
-                if (g_hwnd) PostMessageA(g_hwnd, WM_APP_RESTART_LISTENING, 0, 0);
+                if (g_worker_active) {
+                    gui_stop_session(0);
+                    /* Deliberately NOT enabling Record/Stop here yet -
+                     * gui_stop_session() only requests the stop, it
+                     * doesn't block until the worker thread has actually
+                     * finished draining/closing everything. Enabling it
+                     * immediately left it briefly clickable while still
+                     * reading "Stop" from the Timer session that was
+                     * only just asked to end, not actually gone yet.
+                     * WM_APP_DONE re-enables it for real once that stop
+                     * has genuinely completed.                          */
+                } else {
+                    EnableWindow(g_hBtnToggle, TRUE);
+                }
+            } else {
+                /* Turning ON - disabling immediately is safe either way,
+                 * nothing asynchronous to wait for here.                 */
+                EnableWindow(g_hBtnToggle, FALSE);
+                if (!g_worker_active) {
+                    /* Nothing running at all - start the session now,
+                     * same as a cold Record/Start press already does;
+                     * recording_worker() itself takes care of entering
+                     * the actual wait for the scheduled/hourly time.     */
+                    gui_start_session();
+                } else if (g_state.listening && !g_toggle_btn_recording) {
+                    /* Monitor was already running on its own (no
+                     * recording in progress) - restart cleanly so it
+                     * actually begins waiting for the schedule/hourly
+                     * time, rather than continuing to just sit there
+                     * listening with the newly-armed Timer having no
+                     * effect until something else prompts a restart.     */
+                    gui_stop_session(1);
+                    if (g_hwnd) PostMessageA(g_hwnd, WM_APP_RESTART_LISTENING, 0, 0);
+                }
+                /* else: an ad-hoc recording is already actively in
+                 * progress - let it finish naturally. recording_worker's
+                 * own end-of-recording check for schedule_only/hourly_
+                 * enable already picks this up at that point, the same
+                 * way it already continues into a repeat cycle.         */
             }
             return 0;
         }
@@ -12344,6 +15116,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 InvalidateRect(g_hBtnMonitor, NULL, TRUE);
             }
             return 0;
+        case IDC_BTN_TUNER_A:
+            monitor_ab_button_click(hwnd, 0);
+            return 0;
+        case IDC_BTN_TUNER_B:
+            monitor_ab_button_click(hwnd, 1);
+            return 0;
+        case IDC_BTN_ANT: {
+            RECT r;
+            GetWindowRect(g_hBtnAnt, &r);
+            antenna_show_menu(hwnd, r.left, r.bottom);
+            return 0;
+        }
         case IDC_BTN_FREQ_LOCK:
             /* Keeps Monitor A/B's frequencies in sync for quick side-by-side
              * antenna/tuner comparisons at the same frequency - only means
@@ -12371,9 +15155,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 LeaveCriticalSection(&g_monitor.settings_lock);
             }
             InvalidateRect(g_hBtnFreqLock, NULL, TRUE);
-            return 0;
-        case IDC_COMBO_MON_MODE:
-            if (HIWORD(wp) == CBN_SELCHANGE) monitor_apply_mode_from_combo();
             return 0;
         case IDC_BTN_NOTCH_ENABLE:
             g_monitor.notch_enabled = !g_monitor.notch_enabled;
@@ -12489,6 +15270,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             gui_start_listening();
         return 0;
 
+    case WM_APP_TUNER_CONFIG_CHANGED:
+        /* A full relayout - safe here, layout_children()/monitor_layout()
+         * are also called from WM_SIZE, so they're already expected to
+         * run regardless of g_worker_active - covers both the Tuner 1/2
+         * enabled state (monitor_tuner_config_enabled(), same as before)
+         * and the antenna quick-select buttons' visibility/labels
+         * (antenna_slot_info()), which depend on the same just-finalised
+         * dual_channel/master_slave_active state and need the same
+         * mid-session refresh for the same reason.                      */
+        if (g_hwnd) layout_children(g_hwnd);
+        return 0;
+
     case WM_APP_RESTART_LISTENING:
         /* Posted right after gui_stop_session(1) blocked until the old
          * worker thread's routine actually returned - its own WM_APP_DONE
@@ -12518,6 +15311,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* Pick up any monitor_bar_visible change that arrived while this
          * session was running - see g_monitor_bar_visible_eff.           */
         gui_refresh_monitor_bar_visibility();
+        /* A schedule entry can force cfg fields away from what the
+         * Receiver tab actually says for the rest of that session - most
+         * notably dual_channel getting forced off for an entry whose
+         * Tuner 2 field is left blank (Section 8). That's correct while
+         * the session's still running, but once it's genuinely over
+         * (Stop pressed, or the whole schedule finished with nothing set
+         * to repeat), g_state.cfg was just sitting there with that
+         * override baked in - nothing ever put it back, so Tuner 1/2's
+         * enabled state (and anything else that reads cfg) kept
+         * reflecting the last session's schedule instead of the actual
+         * Receiver tab settings, even at a full idle. Reloading here
+         * discards anything schedule-specific that only ever lived in
+         * memory - the ini file itself was never touched by any of that -
+         * and puts the idle UI back in sync with what Settings actually
+         * says, the same as if the app had just started fresh.           */
+        {
+            Config fresh;
+            config_set_defaults(&fresh);
+            config_load_ini(&fresh, "duodx.ini");
+            g_state.cfg = fresh;
+        }
+        /* g_cancel_listening is reset here, once this reload has actually
+         * put dual_channel/master_slave_active back in sync with the base
+         * config, rather than earlier in the worker thread as soon as the
+         * teardown itself finished. Between those two points - session
+         * fully ended (g_worker_active already 0) but this reload not yet
+         * run - dual_channel and master_slave_active still read as 0
+         * (left that way by the teardown), which is indistinguishable
+         * from a genuine, settled single-tuner idle state to anything
+         * checking them. monitor_tuner_greyed()'s existing guard on this
+         * flag (added for the "still tearing down" window) only helps if
+         * the flag is still set for this later window too - resetting it
+         * early here was exactly why that guard didn't fully fix the
+         * Tuner 2 grey flicker: by the time a repaint actually landed in
+         * the gap, g_cancel_listening had already gone back to 0.        */
+        g_cancel_listening = 0;
+        if (g_hwnd) layout_children(g_hwnd);
+        /* Same Timer-armed check as gui_set_recording_ui()/gui_set_
+         * listening_ui() - the reload just above can change schedule_
+         * only/hourly_enable back to whatever Settings actually says,
+         * and Record/Stop's enabled state needs to follow that even at
+         * a full session end, not just the two mid-session transitions
+         * those functions already cover.                                */
+        if (g_hBtnToggle)
+            EnableWindow(g_hBtnToggle,
+                         !(g_state.cfg.schedule_only || g_state.cfg.hourly_enable));
         /* Leave the final FINISHED snapshot on screen; do NOT auto-close.
          * Pull the final elapsed time and file size from the frozen values
          * so the display keeps the last recording's length instead of
@@ -12555,7 +15394,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_ui.finished = 1;
             strncpy(g_ui.state, "FINISHED", sizeof(g_ui.state) - 1);
         } else {
-            strncpy(g_ui.state, "FINISHED", sizeof(g_ui.state) - 1);
+            /* Something was genuinely recorded (a file was opened and
+             * samples were written), but the session didn't run to its
+             * own natural end - Stop was pressed manually instead, or a
+             * multi-entry schedule still has entries left. "FINISHED"
+             * here would claim the recording completed on its own terms
+             * when it didn't; the greyed-out LED already distinguishes
+             * this from a real finish (green), but the word itself was
+             * previously the same either way, which read as misleading -
+             * a completed recording and a manually-cut-short one looked
+             * identical apart from colour.                              */
+            strncpy(g_ui.state, "STOPPED", sizeof(g_ui.state) - 1);
         }
         g_ui.next[0] = '\0';   /* clear scheduled time on stop/finish */
         gui_set_recording_ui(0);
@@ -12578,18 +15427,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_CLOSE:
-        if (g_worker_active) {
-            const char *msg;
-            if (g_state.listening && !g_toggle_btn_recording)
-                msg = "Still listening (not recording). Stop and exit?";
-            else if (g_state.listening)
-                msg = "A recording is armed and waiting to start "
-                      "(hourly/scheduled). Cancel it and exit?";
-            else
-                msg = "A recording is in progress. Stop and exit?";
-            if (MessageBoxA(hwnd, msg, "DuoDX",
-                    MB_YESNO | MB_ICONQUESTION) != IDYES)
+        if (g_worker_active && !g_state.listening) {
+            /* Actively recording right now - not just listening, and not
+             * just armed/waiting for a future scheduled start (both of
+             * those still show g_state.listening=1, since no file is
+             * being written yet either way). This is the only case that
+             * actually risks losing in-progress data, so it's the only
+             * one that still asks before closing.                       */
+            if (MessageBoxA(hwnd, "A recording is in progress. Stop and exit?",
+                    "DuoDX", MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return 0;
+            gui_stop_session(1);
+        } else if (g_worker_active) {
+            /* Listening only, or armed/waiting for a scheduled start -
+             * nothing being written yet, so just stop cleanly and close
+             * without asking.                                           */
             gui_stop_session(1);
         }
         /* Remember window size/position for next launch. Uses
@@ -12645,15 +15497,15 @@ static HWND mk_button(HWND parent, int id, const char *text)
  * RSPduo Master/Slave mode
  *
  * sdrplay_api_Update(..., sdrplay_api_Tuner_B, sdrplay_api_Update_Tuner_Frf,
- * ...) reports success but does not reliably move Tuner B's actual RF
+ * ...) reports success but does not reliably move Tuner 2's actual RF
  * frequency in Dual_Tuner mode on this hardware/driver combination (three
  * different call orderings/timings were tried and all failed identically -
  * confirmed by directly analysing recorded IQ data, not just trusting the
  * API's return code). The one mechanism documented to give a tuner its own
  * independent frequency reliably is RSPduo Master/Slave mode - which the
  * SDRplay API models as two separate application sessions, not one dual
- * session. So Tuner A records normally in this process (Master), and
- * Tuner B is recorded by a second, hidden instance of this same exe
+ * session. So Tuner 1 records normally in this process (Master), and
+ * Tuner 2 is recorded by a second, hidden instance of this same exe
  * (Slave), launched automatically. Both write their own single-channel
  * Linrad file, each with its own correct header.
  * ========================================================================= */
@@ -12698,7 +15550,7 @@ static long cmdline_get_int_value(const char *cmdline, const char *key)
 /* -------------------------------------------------------------------------
  * launch_slave_b_process
  *
- * Starts the hidden slave instance for Tuner B. A named, auto-reset event
+ * Starts the hidden slave instance for Tuner 2. A named, auto-reset event
  * (keyed by this process's PID) lets Stop signal the slave to end
  * cleanly; a Job Object ties the slave's lifetime to this process so it
  * can never be left running as an orphan if the master exits or crashes.
@@ -12768,7 +15620,7 @@ static int launch_slave_b_process(AppState *state, const char *outfile_b,
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
-    LOG_INFO("Master/Slave: slave process started (PID %lu) for Tuner B -> %s",
+    LOG_INFO("Master/Slave: slave process started (PID %lu) for Tuner 2 -> %s",
              (unsigned long)state->slave_pid, outfile_b);
 
     /* Live monitor / B meter reader - connects to the slave's own monitor
@@ -12780,8 +15632,8 @@ static int launch_slave_b_process(AppState *state, const char *outfile_b,
                                                 slave_b_monitor_reader_thread,
                                                 state, 0, NULL);
     if (!state->slave_monitor_thread) {
-        LOG_WARN("Master/Slave: could not start the Tuner B monitor reader "
-                 "thread - Monitor B and the B level meter will be "
+        LOG_WARN("Master/Slave: could not start the Tuner 2 monitor reader "
+                 "thread - Monitor 2 and its level meter will be "
                  "unavailable this session (recording is unaffected).");
         state->slave_monitor_running = 0;
     }
@@ -12802,7 +15654,7 @@ static void stop_slave_b_process(AppState *state)
      * telling the slave to stop meant that wait was essentially
      * guaranteed to time out every single time, silently orphaning the
      * reader thread (still blocked, still running) well past this
-     * function's return - right as a restart (e.g. a Tuner B frequency
+     * function's return - right as a restart (e.g. a Tuner 2 frequency
      * change) could be about to spin up a brand new slave process and
      * reader thread of its own. Signalling first gives the pipe a real
      * chance to break within the wait below instead of none at all.    */
@@ -12837,12 +15689,49 @@ static void stop_slave_b_process(AppState *state)
     state->master_slave_active = 0;
 }
 
+/* Verifies Tuner 2's file on the master, now that the slave has genuinely
+ * exited (stop_slave_b_process() must have already been called) - see the
+ * VerifyBShared struct's own comment for why this can't be left to the
+ * slave's own verify_recording() call: that result went to a headless
+ * background process's own log, which nobody ever actually sees. Same
+ * output_format/expected_output_rate_hz apply to both tuners (they share
+ * IF/bandwidth/sample rate), so a temporary copy of the master's own cfg
+ * with just output_file swapped to Tuner 2's is enough to reuse
+ * verify_recording() as-is. Deliberately split out from
+ * stop_slave_b_process() (which used to do this inline, immediately on
+ * stopping) so the caller can control exactly where in the log this
+ * appears relative to Tuner 1's own verification and the "Recording
+ * complete" summary, rather than it always landing wherever the slave
+ * happened to be stopped - which was during stream teardown, well before
+ * either of those.                                                       */
+static void verify_slave_b_recording(AppState *state)
+{
+    if (!g_verify_b_shmem_view)
+        return;
+    if (g_verify_b_shmem_view->ready &&
+            g_verify_b_shmem_view->samples_written > 0 &&
+            state->output_file_b[0]) {
+        Config cfg_b = state->cfg;
+        strncpy(cfg_b.output_file, state->output_file_b,
+                sizeof(cfg_b.output_file) - 1);
+        cfg_b.output_file[sizeof(cfg_b.output_file) - 1] = '\0';
+        LOG_INFO("Verifying Tuner 2 file: %s", cfg_b.output_file);
+        verify_recording(&cfg_b, g_verify_b_shmem_view->samples_written);
+    }
+    UnmapViewOfFile(g_verify_b_shmem_view);
+    g_verify_b_shmem_view = NULL;
+    if (g_verify_b_shmem) {
+        CloseHandle(g_verify_b_shmem);
+        g_verify_b_shmem = NULL;
+    }
+}
+
 /* -------------------------------------------------------------------------
  * slave_b_monitor_reader_thread
  *
- * Connects to the Tuner B slave's monitor pipe (as a client) and
+ * Connects to the Tuner 2 slave's monitor pipe (as a client) and
  * continuously reads its live IQ stream, purely for this process's own
- * use: updating the Tuner B level meter and, when the user has Monitor B
+ * use: updating the Tuner 2 level meter and, when the user has Monitor B
  * selected, feeding the live audio DSP chain. Entirely separate from the
  * recording itself, which the slave writes to disk on its own regardless
  * of whether anything is connected to this pipe - a stalled or absent
@@ -12866,8 +15755,8 @@ static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param)
         if (pipe == INVALID_HANDLE_VALUE) {
             connect_attempts++;
             if (connect_attempts > 100) {
-                LOG_WARN("Monitor: could not connect to Tuner B's live "
-                         "stream after 20s - Monitor B and the B level "
+                LOG_WARN("Monitor: could not connect to Tuner 2's live "
+                         "stream after 20s - Monitor 2 and its level "
                          "meter will be unavailable this session "
                          "(recording is unaffected).");
                 return 0;
@@ -12879,8 +15768,51 @@ static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param)
         if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
         return 0;
     }
-    LOG_OK("Monitor: connected to Tuner B's live stream (%s) - "
-           "Monitor B and the B level meter are now live.", pipe_name_mon);
+    LOG_OK("Monitor: connected to Tuner 2's live stream (%s) - "
+           "Monitor 2 and its level meter are now live.", pipe_name_mon);
+
+    /* Opens the same gain-sharing mapping the slave created (Section
+     * 13.6) - see its own creation comment there for why this needs to
+     * exist at all. Not fatal if this fails; the S-meter dBm reading for
+     * Tuner 2 just stays at whatever g_curr_gain_b's default (0.0) gives,
+     * same as before this existed.                                      */
+    {
+        char shmem_name[64];
+        snprintf(shmem_name, sizeof(shmem_name),
+                 "DuoDXGainB_%lu", (unsigned long)GetCurrentProcessId());
+        g_gain_b_shmem = OpenFileMappingA(FILE_MAP_READ, FALSE, shmem_name);
+        if (g_gain_b_shmem) {
+            g_gain_b_shmem_view = (double *)MapViewOfFile(
+                g_gain_b_shmem, FILE_MAP_READ, 0, 0, sizeof(double));
+        }
+    }
+
+    /* Verification-relay mapping (Section 6) - opened early here, not in
+     * stop_slave_b_process() where it's actually read, for the same
+     * reason as the gain-sharing mapping above: a named mapping only
+     * stays alive as long as some process holds an open handle to it.
+     * The slave creates it, writes to it, then closes its own handle as
+     * part of its own cleanup before exiting - opening it late, only
+     * after confirming the slave had exited, meant the mapping's last
+     * reference was already gone by the time the master ever tried,
+     * and OpenFileMappingA simply failed with "not found". Opening it
+     * here instead, while the slave's own handle is still open, means
+     * the master's own handle keeps the object alive regardless of
+     * what the slave does with its own handle later. Deliberately not
+     * cleaned up when this thread exits (which happens before the slave
+     * process has necessarily finished writing its final value) -
+     * stop_slave_b_process() reads it later, once the slave has actually
+     * exited, and closes it itself at that point.                       */
+    {
+        char shmem_name[64];
+        snprintf(shmem_name, sizeof(shmem_name),
+                 "DuoDXVerifyB_%lu", (unsigned long)GetCurrentProcessId());
+        g_verify_b_shmem = OpenFileMappingA(FILE_MAP_READ, FALSE, shmem_name);
+        if (g_verify_b_shmem) {
+            g_verify_b_shmem_view = (VerifyBShared *)MapViewOfFile(
+                g_verify_b_shmem, FILE_MAP_READ, 0, 0, sizeof(VerifyBShared));
+        }
+    }
 
     while (state->slave_monitor_running) {
         DWORD nread = 0;
@@ -12893,6 +15825,8 @@ static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param)
             }
             break;   /* slave stopped / pipe broke - normal at session end */
         }
+
+        if (g_gain_b_shmem_view) g_curr_gain_b = *g_gain_b_shmem_view;
 
         {
             unsigned int nframes = nread / 4;
@@ -12911,8 +15845,10 @@ static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param)
             }
             if (peak > 0) {
                 float db = 20.0f * log10f((float)peak / 32767.0f);
+                EnterCriticalSection(&g_peak_lock);
                 if (db > state->peak_dbfs_b)
                     state->peak_dbfs_b = db;
+                LeaveCriticalSection(&g_peak_lock);
             }
 
             if (g_monitor.tuner_sel == 1)
@@ -12921,13 +15857,15 @@ static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param)
     }
 
     CloseHandle(pipe);
+    if (g_gain_b_shmem_view) { UnmapViewOfFile(g_gain_b_shmem_view); g_gain_b_shmem_view = NULL; }
+    if (g_gain_b_shmem)      { CloseHandle(g_gain_b_shmem);          g_gain_b_shmem = NULL; }
     return 0;
 }
 
 /* -------------------------------------------------------------------------
  * run_slave_b_session - the hidden slave process's entire lifetime.
  * Loads the same duodx.ini as the master for shared settings, resolves
- * Tuner B's own values (falling back to Tuner A's - identical resolution
+ * Tuner 2's own values (falling back to Tuner 1's - identical resolution
  * rule to the old Dual_Tuner setup), then records a single-channel Linrad
  * file until the duration elapses, the master signals stop, or the master
  * process itself disappears.
@@ -12947,18 +15885,20 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
     SIZE_T ring_size;
 
     memset(&g_state, 0, sizeof(g_state));
-    g_state.out_file    = INVALID_HANDLE_VALUE;
-    g_state.out_file_b  = INVALID_HANDLE_VALUE;
-    g_state.pipe_handle = INVALID_HANDLE_VALUE;
+    g_state.out_file        = INVALID_HANDLE_VALUE;
+    g_state.out_file_b      = INVALID_HANDLE_VALUE;
+    g_state.pipe_handle     = INVALID_HANDLE_VALUE;
+    g_state.mon_pipe_handle = INVALID_HANDLE_VALUE;
 
     config_set_defaults(&g_state.cfg);
     config_load_ini(&g_state.cfg, "duodx.ini");
 
     g_state.log_fp = fopen("duodx_slave_b.log", "a");
-    LOG_INFO("=== DuoDX Slave (Tuner B) starting, master PID %lu ===",
-             (unsigned long)master_pid);
+    if (g_state.cfg.verbose)
+        LOG_INFO("=== DuoDX Slave (Tuner 2) starting, master PID %lu ===",
+                 (unsigned long)master_pid);
 
-    /* Resolve Tuner B's effective settings - same fallback-to-A rule the
+    /* Resolve Tuner 2's effective settings - same fallback-to-A rule the
      * old Dual_Tuner setup used - then make this session look, to every
      * other part of the engine, like an ordinary single-tuner recording. */
     {
@@ -13039,7 +15979,7 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
 
     if (g_state.device.hwVer == SDRPLAY_RSPduo_ID)
         strncpy(device_name, "RSPduo", 63);
-    LOG_INFO("Slave: using device %s (SerNo %s) as Tuner B / Slave",
+    LOG_INFO("Slave: using device %s (SerNo %s) as Tuner 2 / Slave",
              device_name, g_state.device.SerNo);
 
     g_state.device.tuner            = sdrplay_api_Tuner_B;
@@ -13058,7 +15998,7 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
         goto slave_release_device;
     }
     /* Channel structs are keyed by physical tuner, not by Master/Slave
-     * role - since this session requested Tuner B, its params come back
+     * role - since this session requested Tuner 2, its params come back
      * in rxChannelB (rxChannelA is NULL here, confirmed by direct log
      * evidence: a Slave/Tuner_B session leaves rxChannelA unpopulated).
      * ch_a_params is reused purely as a generic "the channel struct we're
@@ -13066,7 +16006,7 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
      * physical tuner it represents.                                     */
     g_state.ch_a_params = g_state.dev_params->rxChannelB;
     if (!g_state.ch_a_params) {
-        LOG_ERROR("Slave: rxChannelB (Tuner B's channel) is NULL - "
+        LOG_ERROR("Slave: rxChannelB (Tuner 2's channel) is NULL - "
                   "GetDeviceParams did not return it for this session.");
         goto slave_release_device;
     }
@@ -13076,11 +16016,35 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
 
     ring_size = (SIZE_T)(g_state.cfg.sample_rate_hz) * 4
                 * (SIZE_T)g_state.cfg.ring_buffer_sec;
-    if (ring_size < RING_BUFFER_MIN_BYTES)
+    if (ring_size < RING_BUFFER_MIN_BYTES) {
+        LOG_WARN("ring_buffer_sec too small - clamped to minimum %d MB.",
+                 RING_BUFFER_MIN_BYTES / (1024 * 1024));
         ring_size = RING_BUFFER_MIN_BYTES;
+    }
     if (ring_init(&g_state.ring, ring_size) != 0) {
         LOG_ERROR("Slave: ring buffer allocation failed.");
         goto slave_release_device;
+    }
+    /* Same reasoning as the main (Master/single-tuner) allocation site -
+     * ring_init() rounds up to a power of 2 and silently caps at
+     * RING_BUFFER_MAX_BYTES, so the actual buffered duration can differ
+     * from what ring_buffer_sec asked for in either direction.           */
+    {
+        SIZE_T slave_bytes_per_sec = (SIZE_T)(g_state.cfg.sample_rate_hz) * 4;
+        if (g_state.ring.size < ring_size) {
+            LOG_WARN("Slave: ring_buffer_sec=%d requested %zu MB - capped "
+                     "to the %d MB maximum (%.1f seconds at this sample "
+                     "rate, not %d).",
+                     g_state.cfg.ring_buffer_sec, ring_size / (1024 * 1024),
+                     RING_BUFFER_MAX_BYTES / (1024 * 1024),
+                     (double)g_state.ring.size / (double)slave_bytes_per_sec,
+                     g_state.cfg.ring_buffer_sec);
+        }
+        if (g_state.cfg.verbose)
+            LOG_INFO("Slave: allocating ring buffer: %zu MB (%.1f seconds "
+                     "at this sample rate)",
+                     g_state.ring.size / (1024 * 1024),
+                     (double)g_state.ring.size / (double)slave_bytes_per_sec);
     }
 
     if (!listen_only) {
@@ -13094,6 +16058,8 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
             goto slave_free_ring;
         }
         if (g_state.cfg.output_format == FORMAT_SDRUNO ||
+                g_state.cfg.output_format == FORMAT_PERSEUS ||
+                g_state.cfg.output_format == FORMAT_JAGUAR ||
                 ((g_state.cfg.output_format == FORMAT_WINRAD ||
                   g_state.cfg.output_format == FORMAT_SDRCONNECT) &&
                  g_state.cfg.large_file_mode == LARGE_FILE_SPLIT)) {
@@ -13104,6 +16070,18 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
         if (g_state.cfg.output_format == FORMAT_SDRUNO) {
             /* SDRuno never gets RF64 - see the OutputFormat enum comment. */
             if (!write_sdruno_header(g_state.out_file, &g_state.cfg)) {
+                LOG_ERROR("Slave: header write failed.");
+                goto slave_close_file;
+            }
+        } else if (g_state.cfg.output_format == FORMAT_PERSEUS) {
+            /* Perseus never gets RF64 either - same reasoning as SDRuno. */
+            if (!write_perseus_header(g_state.out_file, &g_state.cfg)) {
+                LOG_ERROR("Slave: header write failed.");
+                goto slave_close_file;
+            }
+        } else if (g_state.cfg.output_format == FORMAT_JAGUAR) {
+            /* Jaguar never gets RF64 either - same reasoning as Perseus. */
+            if (!write_jaguar_header(g_state.out_file, &g_state.cfg)) {
                 LOG_ERROR("Slave: header write failed.");
                 goto slave_close_file;
             }
@@ -13134,50 +16112,108 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
         LOG_INFO("Slave: recording to %s (%.4f MHz)",
                  g_state.cfg.output_file, g_state.cfg.frequency_hz / 1e6);
     } else {
-        LOG_INFO("Slave: listen-only, no file - streaming Tuner B live to "
+        LOG_INFO("Slave: listen-only, no file - streaming Tuner 2 live to "
                  "the master (%.4f MHz)", g_state.cfg.frequency_hz / 1e6);
     }
 
-    /* Dedicated named pipe so the master process can monitor Tuner B live
-     * (audio + level meter) - Tuner B's real IQ data only exists in this
-     * process, so this is the only way the master can see it at all. This
-     * reuses the writer thread's existing, already-working pipe-write
-     * path (the same one used for the user-facing external IQ monitoring
-     * feature) - no new code needed there, just point pipe_handle at it. */
+    /* Dedicated named pipe so the master process can monitor Tuner 2 live
+     * (audio + level meter) - Tuner 2's real IQ data only exists in this
+     * process, so this is the only way the master can see it at all.
+     * Its own handle and overlapped I/O state (mon_pipe_handle, not the
+     * general pipe_enable feature's pipe_handle) - see that field's own
+     * comment in AppState for why they're kept separate. Plain
+     * PIPE_NOWAIT (no FILE_FLAG_OVERLAPPED) was tried here first and
+     * turned out to be genuinely unreliable in practice - for at least
+     * one user it silently delivered nothing at all, every single time,
+     * despite the pipe reporting a successful client connection. Proper
+     * overlapped I/O is the correct way to get the same "never blocks
+     * the writer thread" behaviour without depending on that mode's
+     * quirks.                                                           */
     {
         char pipe_name_mon[64];
         snprintf(pipe_name_mon, sizeof(pipe_name_mon),
                  "\\\\.\\pipe\\DuoDXMonB_%lu", (unsigned long)master_pid);
-        /* PIPE_NOWAIT only, no FILE_FLAG_OVERLAPPED - see the identical
-         * comment on the general monitor pipe above for why: this handle
-         * is written with a NULL OVERLAPPED throughout, which is only
-         * well-defined (all-or-nothing per write) without the overlapped
-         * flag. Root cause of the Tuner B monitor's pulsing/glitching. */
-        g_state.pipe_handle = CreateNamedPipeA(
+        g_state.mon_pipe_handle = CreateNamedPipeA(
             pipe_name_mon,
-            PIPE_ACCESS_OUTBOUND,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1, 256 * 1024, 0, 0, NULL);
-        if (g_state.pipe_handle == INVALID_HANDLE_VALUE) {
+        if (g_state.mon_pipe_handle == INVALID_HANDLE_VALUE) {
             LOG_WARN("Slave: could not create monitor pipe '%s' (error %lu) "
-                     "- live monitoring of Tuner B will be unavailable this "
+                     "- live monitoring of Tuner 2 will be unavailable this "
                      "session (recording is unaffected).",
                      pipe_name_mon, GetLastError());
         } else {
-            /* Puts the pipe into a listening state so the master's
-             * CreateFile can actually attach - see the identical comment
-             * on the general monitor pipe above. Without this, whether
-             * the master's connect attempt succeeds at all was down to
-             * unspecified/leftover pipe state rather than anything this
-             * code actually arranged - the intermittent "could not
-             * connect after 20s" was this, not a slow master.           */
-            if (!ConnectNamedPipe(g_state.pipe_handle, NULL) &&
-                    GetLastError() != ERROR_PIPE_LISTENING &&
-                    GetLastError() != ERROR_PIPE_CONNECTED)
-                LOG_WARN("Slave: monitor pipe '%s': ConnectNamedPipe error "
-                         "%lu - the master may not be able to attach.",
-                         pipe_name_mon, GetLastError());
-            LOG_INFO("Slave: monitor pipe ready: %s", pipe_name_mon);
+            memset(&g_state.mon_pipe_ov, 0, sizeof(g_state.mon_pipe_ov));
+            g_state.mon_pipe_ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+            g_state.mon_pipe_write_pending = 0;
+            /* Overlapped ConnectNamedPipe returns immediately - either the
+             * master's CreateFile is already waiting (ERROR_PIPE_CONNECTED,
+             * genuinely already connected) or it isn't yet
+             * (ERROR_IO_PENDING, connection completes whenever the master
+             * gets there - no need to wait for it here, the first write
+             * attempt below will simply keep failing harmlessly until it
+             * does).                                                     */
+            if (!ConnectNamedPipe(g_state.mon_pipe_handle, &g_state.mon_pipe_ov)) {
+                DWORD cerr = GetLastError();
+                if (cerr != ERROR_PIPE_CONNECTED && cerr != ERROR_IO_PENDING)
+                    LOG_WARN("Slave: monitor pipe '%s': ConnectNamedPipe error "
+                             "%lu - the master may not be able to attach.",
+                             pipe_name_mon, cerr);
+            }
+            if (g_state.cfg.verbose)
+                LOG_INFO("Slave: monitor pipe ready: %s", pipe_name_mon);
+        }
+    }
+
+    /* Bridges Tuner 2's real applied gain (currGain, from event_callback's
+     * sdrplay_api_GainChange handling below) to the master process, for
+     * the S-meter's dBm calculation (Section 13.6). event_callback is
+     * shared code, running in this process too for the slave's own
+     * device handle - it already tracks g_curr_gain_b correctly, but
+     * that's a plain process-local global, invisible to the master
+     * process which is a separate process entirely in Master/Slave
+     * mode. Without this bridge the master's own copy of g_curr_gain_b
+     * simply never receives a Tuner_B gain event at all (its device
+     * handle only ever covers Tuner 1), stays at its 0.0 default for the
+     * whole session, and the dBm formula (dBFS minus applied gain) ends
+     * up subtracting nothing instead of the ~50 dB it should - which is
+     * what was surfacing as Tuner 2's S-meter reading roughly that much
+     * louder than Tuner 1's for the exact same actual signal.           */
+    {
+        char shmem_name[64];
+        snprintf(shmem_name, sizeof(shmem_name),
+                 "DuoDXGainB_%lu", (unsigned long)master_pid);
+        g_gain_b_shmem = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                             PAGE_READWRITE, 0, sizeof(double), shmem_name);
+        if (g_gain_b_shmem) {
+            g_gain_b_shmem_view = (double *)MapViewOfFile(
+                g_gain_b_shmem, FILE_MAP_WRITE, 0, 0, sizeof(double));
+            if (g_gain_b_shmem_view) *g_gain_b_shmem_view = g_curr_gain_b;
+        }
+        if (!g_gain_b_shmem_view)
+            LOG_WARN("Slave: could not set up gain-sharing memory (error %lu) "
+                     "- Tuner 2's S-meter dBm reading may be inaccurate on "
+                     "the master (recording is unaffected).", GetLastError());
+    }
+
+    /* Verification-relay mapping (Section 6) - separate handle/name/struct
+     * from the gain-sharing one just above. Not fatal if this fails either
+     * - the master just won't verify Tuner 2's file for this session,
+     * same as before this existed.                                       */
+    {
+        char shmem_name[64];
+        snprintf(shmem_name, sizeof(shmem_name),
+                 "DuoDXVerifyB_%lu", (unsigned long)master_pid);
+        g_verify_b_shmem = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                             PAGE_READWRITE, 0, sizeof(VerifyBShared), shmem_name);
+        if (g_verify_b_shmem) {
+            g_verify_b_shmem_view = (VerifyBShared *)MapViewOfFile(
+                g_verify_b_shmem, FILE_MAP_WRITE, 0, 0, sizeof(VerifyBShared));
+            if (g_verify_b_shmem_view) {
+                g_verify_b_shmem_view->samples_written = 0;
+                g_verify_b_shmem_view->ready = 0;
+            }
         }
     }
 
@@ -13203,8 +16239,9 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
         if (err == sdrplay_api_StartPending) {
             init_attempts++;
             if (init_attempts == 1 || init_attempts % 10 == 0)
-                LOG_INFO("Slave: waiting for master to start (attempt %d)...",
-                         init_attempts);
+                if (g_state.cfg.verbose)
+                    LOG_INFO("Slave: waiting for master to start (attempt %d)...",
+                             init_attempts);
             if (init_attempts > 150) {
                 LOG_ERROR("Slave: master never became ready - giving up.");
                 goto slave_stop_writer;
@@ -13251,7 +16288,8 @@ static int run_slave_b_session(const char *outfile, int duration_sec,
         }
     }
 
-    LOG_INFO("Slave: stopping stream.");
+    if (g_state.cfg.verbose)
+        LOG_INFO("Slave: stopping stream.");
     sdrplay_api_Uninit(g_state.device.dev);
     g_state.stream_running = 0;
 
@@ -13270,10 +16308,16 @@ slave_stop_writer:
         if (g_state.segment_samples_written > 0 &&
                 (g_state.cfg.output_format == FORMAT_SDRUNO ||
                  g_state.cfg.output_format == FORMAT_WINRAD ||
+                 g_state.cfg.output_format == FORMAT_PERSEUS ||
+                 g_state.cfg.output_format == FORMAT_JAGUAR ||
                  g_state.cfg.output_format == FORMAT_SDRCONNECT))
             finalize_output_header(g_state.out_file, &g_state.cfg, g_state.segment_samples_written);
         CloseHandle(g_state.out_file);
         g_state.out_file = INVALID_HANDLE_VALUE;
+    }
+    if (g_verify_b_shmem_view) {
+        g_verify_b_shmem_view->samples_written = g_state.segment_samples_written;
+        g_verify_b_shmem_view->ready = 1;
     }
     if (g_state.segment_samples_written > 0)
         verify_recording(&g_state.cfg, g_state.segment_samples_written);
@@ -13284,6 +16328,15 @@ slave_close_file:
         CloseHandle(g_state.pipe_handle);
         g_state.pipe_handle = INVALID_HANDLE_VALUE;
     }
+    if (g_state.mon_pipe_handle != INVALID_HANDLE_VALUE) {
+        if (g_state.mon_pipe_ov.hEvent) CloseHandle(g_state.mon_pipe_ov.hEvent);
+        CloseHandle(g_state.mon_pipe_handle);
+        g_state.mon_pipe_handle = INVALID_HANDLE_VALUE;
+    }
+    if (g_gain_b_shmem_view) { UnmapViewOfFile(g_gain_b_shmem_view); g_gain_b_shmem_view = NULL; }
+    if (g_gain_b_shmem)      { CloseHandle(g_gain_b_shmem);          g_gain_b_shmem = NULL; }
+    if (g_verify_b_shmem_view) { UnmapViewOfFile(g_verify_b_shmem_view); g_verify_b_shmem_view = NULL; }
+    if (g_verify_b_shmem)      { CloseHandle(g_verify_b_shmem);          g_verify_b_shmem = NULL; }
     if (g_state.out_file != INVALID_HANDLE_VALUE) {
         CloseHandle(g_state.out_file);
         g_state.out_file = INVALID_HANDLE_VALUE;
@@ -13295,7 +16348,7 @@ slave_release_device:
 slave_close_api:
     sdrplay_api_Close();
 slave_done:
-    LOG_INFO("=== DuoDX Slave (Tuner B) exiting (rc=%d) ===", rc);
+    LOG_INFO("=== DuoDX Slave (Tuner 2) exiting (rc=%d) ===", rc);
     if (g_state.slave_stop_event) CloseHandle(g_state.slave_stop_event);
     if (master_handle) CloseHandle(master_handle);
     if (g_state.log_fp) fclose(g_state.log_fp);
@@ -13319,6 +16372,15 @@ slave_done:
  * this first pass proves out.
  * ========================================================================= */
 static HWND   g_hSettingsWnd  = NULL;
+/* Remembers where the Settings window was last moved to, so re-opening it
+ * later in the same session reopens in the same place instead of always
+ * resetting to its default position relative to the main window. Not
+ * persisted to duodx.ini - deliberately just for-this-run, the same way
+ * Windows itself only remembers a moved window for as long as it's open.
+ * INT_MIN on either axis means "hasn't been positioned yet this session,
+ * use the default placement".                                           */
+static int    g_settings_last_x = INT_MIN;
+static int    g_settings_last_y = INT_MIN;
 static HWND   g_hSetRateCombo = NULL;
 static HWND   g_hSetRangeStart = NULL;
 static HWND   g_hSetRangeEnd   = NULL;
@@ -13328,6 +16390,12 @@ static HWND   g_hSetAgc       = NULL;
 static HWND   g_hSetTuner1En  = NULL;
 static HWND   g_hSetTuner2En  = NULL;
 static HWND   g_hSetCoherentLbl = NULL;
+static HWND   g_hSetCoherentFormatWarn = NULL;   /* Recording tab: same-CF
+                                    dual + a format other than Linrad */
+static HWND   g_hSetCoherentFormatWarn2 = NULL;
+static HWND   g_hSetSchedMsNote1 = NULL;
+static HWND   g_hSetSchedMsNote2 = NULL;
+static HWND   g_hSetSchedMsNote3 = NULL;
 static HWND   g_hSetFreqB     = NULL;
 static HWND   g_hSetGrB       = NULL;
 static HWND   g_hSetGrBSame   = NULL;
@@ -13337,9 +16405,22 @@ static HWND   g_hSetDuration  = NULL;
 static HWND   g_hSetFormat    = NULL;
 static HWND   g_hSetLargeModeLbl = NULL;
 static HWND   g_hSetLargeMode    = NULL;
+static HWND   g_hSetJaguarWarnRec = NULL;
+static HWND   g_hSetJaguarWarnRec2 = NULL;
+static HWND   g_hSetJaguarWarnDev = NULL;
+static HWND   g_hSetJaguarWarnDev2 = NULL;
+static HWND   g_hSetPerseusWarnRec = NULL;
+static HWND   g_hSetPerseusWarnRec2 = NULL;
+static HWND   g_hSetPerseusWarnDev = NULL;
+static HWND   g_hSetPerseusWarnDev2 = NULL;
 static HWND   g_hSetLatitude     = NULL;
 static HWND   g_hSetLongitude    = NULL;
 static HWND   g_hSetShowSun      = NULL;
+static HWND   g_hSetGithubLink   = NULL;
+static HWND   g_hSetEmailLink    = NULL;
+static HWND   g_hSetShowOffset   = NULL;
+static HWND   g_hSetCarrierCalib = NULL;
+static HWND   g_hBtnAutoCal      = NULL;
 static HWND   g_hSetPath      = NULL;
 static HWND   g_hSetHdr       = NULL;
 static HWND   g_hSetHdrHint   = NULL;
@@ -13363,6 +16444,7 @@ static HWND g_hSetSchedStart   = NULL;
 static HWND g_hSetSchedDuration = NULL;
 static HWND g_hSetSchedFreq    = NULL;
 static HWND g_hSetSchedFreqB   = NULL;
+static HWND g_hSetSchedFreqSync = NULL;
 static HWND g_hSetSchedAntenna = NULL;
 static HWND g_hSetSchedOutfile = NULL;
 static HWND g_hSetHourlyEn     = NULL;
@@ -13398,7 +16480,6 @@ static HWND   g_hSetNotchRfB  = NULL;
 static HWND   g_hSetNotchDabB = NULL;
 static HWND   g_hSetRingSec   = NULL;
 static HWND   g_hSetSpinupEn  = NULL;
-static HWND   g_hSetSpinupBytes = NULL;
 static HWND   g_hSetMonInterval = NULL;
 static HWND   g_hSetSMeterMode  = NULL;
 static HWND   g_hSetSMeterCal   = NULL;
@@ -13442,6 +16523,10 @@ static int ini_patch_values(const char *path, IniPatchEntry *entries, int n_entr
     char tmp_path[MAX_PATH_LEN];
     FILE *out;
     int i, ok = 1;
+    int match_count[32] = {0};   /* Local to this call, not the struct
+        itself - avoids touching IniPatchEntry (and every one of its many
+        call sites) just to detect duplicate keys in the file. 32 is
+        comfortably more than any call site ever passes in one go. */
 
     if (!fp) return 0;
 
@@ -13485,8 +16570,8 @@ static int ini_patch_values(const char *path, IniPatchEntry *entries, int n_entr
                 char *val_start, *comment, *scan;
                 char newline_buf[1200];
 
-                if (entries[j].applied) continue;
                 if (strcmp(keybuf, entries[j].key) != 0) continue;
+                if (j < 32) match_count[j]++;
 
                 val_start = eq + 1;
                 comment = NULL;
@@ -13540,6 +16625,13 @@ static int ini_patch_values(const char *path, IniPatchEntry *entries, int n_entr
         DeleteFileA(tmp_path);
         return 0;
     }
+    for (i = 0; i < n_entries && i < 32; i++) {
+        if (match_count[i] > 1)
+            LOG_WARN("duodx.ini has %d duplicate '%s =' lines - all were "
+                     "kept in sync just now, but worth removing the extra "
+                     "one(s) by hand to avoid relying on this.",
+                     match_count[i], entries[i].key);
+    }
     return 1;
 
 fail_free:
@@ -13589,6 +16681,16 @@ static int ini_rewrite_schedule(const char *path, ScheduleEntry *entries, int co
         int is_sched_line = 0;
 
         while (*p == ' ' || *p == '\t') p++;
+        if (!strncmp(p, "; --- Schedule entries",
+                     sizeof("; --- Schedule entries") - 1)) {
+            /* Old marker comment from a previous save - drop it here too,
+             * not just the schedule_N_ data lines below it, or it stays
+             * in the file forever accumulating one more empty copy of
+             * itself on every single save (which is exactly what left
+             * ~90 of them stacked up with nothing under any but the
+             * last). A fresh one is written just below whenever count>0. */
+            continue;
+        }
         if (*p != ';' && *p != '#' && *p != '\n' && *p != '\0' &&
                 (eq = strchr(p, '=')) != NULL) {
             char keybuf[64];
@@ -13634,14 +16736,24 @@ static int ini_rewrite_schedule(const char *path, ScheduleEntry *entries, int co
             format_duration_hms(e->duration_sec, dur, sizeof(dur));
             fprintf(out, "schedule_%d_start_time  = %s\n", i + 1, e->start_time);
             fprintf(out, "schedule_%d_duration    = %s\n", i + 1, dur);
-            if (e->frequency_hz > 0.0)
-                fprintf(out, "schedule_%d_frequency   = %.6g\n", i + 1, e->frequency_hz / 1e6);
-            if (e->freq_b_hz > 0.0)
-                fprintf(out, "schedule_%d_freq_b      = %.6g\n", i + 1, e->freq_b_hz / 1e6);
+            /* frequency/freq_b are meaningless once freq_sync is set -
+             * apply_schedule_entry() ignores them entirely in favour of
+             * the Receiver tab's baseline CF, re-read fresh at fire time
+             * (see ScheduleEntry's own comment) - so they're left out of
+             * the file rather than written as a stale, unused snapshot
+             * that could be misread as what actually applies.            */
+            if (!e->freq_sync) {
+                if (e->frequency_hz > 0.0)
+                    fprintf(out, "schedule_%d_frequency   = %.6g\n", i + 1, e->frequency_hz / 1e6);
+                if (e->freq_b_hz > 0.0)
+                    fprintf(out, "schedule_%d_freq_b      = %.6g\n", i + 1, e->freq_b_hz / 1e6);
+            }
             if (e->antenna[0])
                 fprintf(out, "schedule_%d_antenna     = %s\n", i + 1, e->antenna);
             if (e->output_file[0])
                 fprintf(out, "schedule_%d_output_file = %s\n", i + 1, e->output_file);
+            if (e->freq_sync)
+                fprintf(out, "schedule_%d_freq_sync   = 1\n", i + 1);
             fprintf(out, "\n");
         }
     }
@@ -13663,23 +16775,28 @@ fail_free2:
 }
 
 /* Populates the Sample Rate/IF/Bandwidth combo from VALID_COMBOS - the
- * exact same table validate_config() checks against, so nothing sold
- * here can ever fail that check. When dual_only is set, only entries
- * valid for RSPduo dual/Master-Slave mode are listed. */
-/* Populates the Sample Rate/IF/Bandwidth combo from VALID_COMBOS - the
  * exact same table validate_config() checks against, so nothing shown
- * here can ever fail that check. dual_only restricts to RSPduo dual/
- * Master-Slave-compatible entries; hdr_only restricts to the one entry
+ * here can ever fail that check. hdr_only restricts to the one entry
  * HDR mode requires (6 Msps, 1620 kHz IF) - apply_hdr_mode() silently
  * disables HDR at Start time if any other combo is picked, so filtering
- * here up front avoids that surprise. */
-static void settings_populate_ratecombo(int dual_only, int hdr_only)
+ * here up front avoids that surprise.
+ *
+ * dual excludes Zero-IF entries entirely - confirmed architectural limit,
+ * not just an untested combination: the RSPduo can only run two tuners
+ * simultaneously in Low-IF mode, Coherent or Master/Slave alike (see the
+ * matching note in validate_config()). master_slave_only further restricts
+ * to the confirmed Master/Slave-compatible subset - ADC rate exactly 6 or
+ * 8 Msps, any Low-IF IF/BW (see MASTER_SLAVE_SR_OK's comment above
+ * VALID_COMBOS for how this was measured). Pass 0 for both when
+ * single-tuner, where neither restriction applies.                       */
+static void settings_populate_ratecombo(int dual, int master_slave_only, int hdr_only)
 {
     int i;
     SendMessageA(g_hSetRateCombo, CB_RESETCONTENT, 0, 0);
     for (i = 0; i < NUM_VALID_COMBOS; i++) {
         const ValidCombo *c = &VALID_COMBOS[i];
-        if (dual_only && !c->dual_ok) continue;
+        if (dual && c->if_khz == 0) continue;
+        if (master_slave_only && !MASTER_SLAVE_SR_OK(c->adc_rate_hz)) continue;
         if (hdr_only && !(c->if_khz == 1620 &&
                            fabs(c->adc_rate_hz - 6000000.0) < 1.0)) continue;
         SendMessageA(g_hSetRateCombo, CB_ADDSTRING, 0, (LPARAM)c->note);
@@ -13705,7 +16822,21 @@ static void settings_select_ratecombo_for_current(void)
             found = 1;
         }
     }
-    SendMessageA(g_hSetRateCombo, CB_SETCURSEL, (WPARAM)list_idx, 0);
+    /* If the combo actually configured right now (duodx.ini) isn't in the
+     * current - possibly Master/Slave-filtered - list, leave nothing
+     * selected (CB_ERR) rather than silently defaulting to whatever
+     * happens to be first in the filtered list. settings_save() already
+     * skips writing sample_rate_msps/if_khz/bw_khz entirely when nothing
+     * is selected (CB_GETCURSEL == CB_ERR), so this just leaves the
+     * existing, working value in duodx.ini untouched instead of Save
+     * silently overwriting it with an arbitrary different combo the next
+     * time Save is pressed for any reason - previously, opening Settings
+     * while a currently-incompatible combo was configured (e.g. a Zero-IF
+     * rate that isn't 6/8 Msps, with both tuners checked on different
+     * frequencies) could quietly swap the real, working sample rate out
+     * from under the user on the next Save, regardless of which tab they
+     * actually meant to change.                                          */
+    SendMessageA(g_hSetRateCombo, CB_SETCURSEL, (WPARAM)(found ? list_idx : -1), 0);
 }
 
 /* HDR mode only works at ten specific centre frequencies - apply_hdr_mode()
@@ -13802,21 +16933,53 @@ static void settings_update_hourly_hint(void)
     InvalidateRect(g_hSetHourlyHint, NULL, TRUE);
 }
 
-/* Shows/hides the COHERENT label next to the frequency row - same
- * definition as the main window's own indicator (Section 7.3 of the
- * guide): both tuners active and tuned to the same frequency.           */
-static void settings_update_coherent_indicator(void)
+/* Whether both tuners are enabled and tuned to the same frequency right
+ * now, per the Receiver tab's own fields - shared between the COHERENT
+ * label (below) and the Recording tab's interleaved-format warning,
+ * since both need exactly this same condition.                         */
+static int settings_is_coherent(void)
 {
     LRESULT t1 = SendMessageA(g_hSetTuner1En, BM_GETCHECK, 0, 0) == BST_CHECKED;
     LRESULT t2 = SendMessageA(g_hSetTuner2En, BM_GETCHECK, 0, 0) == BST_CHECKED;
     char f1[32], f2[32];
-    int coherent;
 
     GetWindowTextA(g_hSetDualT1Freq, f1, sizeof(f1));
     GetWindowTextA(g_hSetFreqB, f2, sizeof(f2));
-    coherent = t1 && t2 && f1[0] && f2[0] && fabs(atof(f1) - atof(f2)) < 1e-6;
+    return t1 && t2 && f1[0] && f2[0] && fabs(atof(f1) - atof(f2)) < 1e-4;
+}
 
-    ShowWindow(g_hSetCoherentLbl, coherent ? SW_SHOW : SW_HIDE);
+/* Shows/hides the COHERENT label next to the frequency row - same
+ * definition as the main window's own indicator (Section 7.3 of the
+ * guide): both tuners active and tuned to the same frequency. Also
+ * shows/hides the Recording tab's warning about same-CF dual only being
+ * supported in Linrad - same "coherent" condition, just checked against
+ * whichever format is currently selected there, and this is the one
+ * place both tab's tuner-checkbox/frequency changes AND the Recording
+ * tab's own format-combo changes both already funnel through (the
+ * latter via settings_update_format_dependent_state() calling
+ * settings_update_dual_enable_state() calling this), so it's the
+ * natural single place to keep both in sync from.                      */
+static void settings_update_coherent_indicator(void)
+{
+    int coherent = settings_is_coherent();
+    LRESULT fsel;
+
+    ShowWindow(g_hSetCoherentLbl,
+               (coherent && g_settings_active_tab == 0) ? SW_SHOW : SW_HIDE);
+
+    fsel = g_hSetFormat ? SendMessageA(g_hSetFormat, CB_GETCURSEL, 0, 0) : CB_ERR;
+    {
+        /* Matches the runtime check exactly (Section 8.2 of the guide) -
+         * Linrad and WavViewDX both support same-CF interleaved dual;
+         * SDRuno, SDR Connect, Winrad, Perseus and Jaguar don't.         */
+        int unsupported = (fsel == FORMAT_SDRUNO || fsel == FORMAT_SDRCONNECT ||
+                            fsel == FORMAT_WINRAD || fsel == FORMAT_PERSEUS ||
+                            fsel == FORMAT_JAGUAR);
+        int show = (coherent && unsupported && g_settings_active_tab == 2)
+                   ? SW_SHOW : SW_HIDE;
+        ShowWindow(g_hSetCoherentFormatWarn, show);
+        ShowWindow(g_hSetCoherentFormatWarn2, show);
+    }
 }
 
 /* Explicit dim-state tracking for the Tuner 2 / Same as T1 (GR, LNA) /
@@ -13831,13 +16994,13 @@ static void settings_update_coherent_indicator(void)
  * of relying on EnableWindow - see the BN_CLICKED cases for
  * IDC_SET_TUNER2_EN / IDC_SET_GRB_SAME / IDC_SET_LNAB_SAME /
  * IDC_SET_B_SAME_CORR.                                                    */
-static HWND g_set_check_dim_hwnd[4];
-static int  g_set_check_dim_state[4];
+static HWND g_set_check_dim_hwnd[6];
+static int  g_set_check_dim_state[6];
 
 static int settings_check_is_dim(HWND h)
 {
     int i;
-    for (i = 0; i < 4; i++)
+    for (i = 0; i < 6; i++)
         if (g_set_check_dim_hwnd[i] == h) return g_set_check_dim_state[i];
     return 0;
 }
@@ -13846,7 +17009,7 @@ static void settings_set_check_dim(HWND h, int active)
 {
     int i;
     EnableWindow(h, TRUE);
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 6; i++) {
         if (g_set_check_dim_hwnd[i] == h || g_set_check_dim_hwnd[i] == NULL) {
             g_set_check_dim_hwnd[i] = h;
             g_set_check_dim_state[i] = !active;
@@ -13871,22 +17034,217 @@ static void settings_set_edit_readonly(HWND h, int enabled)
     EnableWindow(h, enabled);
 }
 
+/* Reads the Sample Rate/IF/BW and Decimation combos exactly as currently
+ * set in the dialog - which may not be saved yet - and resolves them to
+ * the actual output sample rate that would result, the same computation
+ * validate_config() does (see its cfg->expected_output_rate_hz), just
+ * read live from the dialog's own controls instead of a saved Config.
+ * Returns 0.0 if the current Sample Rate/IF/BW selection can't be
+ * resolved (nothing selected yet, or - it shouldn't happen, but
+ * defensively - its text doesn't match any VALID_COMBOS entry).         */
+static double settings_current_output_rate_hz(void)
+{
+    LRESULT sel = g_hSetRateCombo ? SendMessageA(g_hSetRateCombo, CB_GETCURSEL, 0, 0) : CB_ERR;
+    if (sel == CB_ERR) return 0.0;
+    {
+        char sel_text[128];
+        int i;
+        static const int decim_values[6] = { 1, 2, 4, 8, 16, 32 };
+        LRESULT dsel = g_hSetDecim ? SendMessageA(g_hSetDecim, CB_GETCURSEL, 0, 0) : 0;
+        int dval = (dsel != CB_ERR && dsel >= 0 && dsel < 6) ? decim_values[dsel] : 1;
+        SendMessageA(g_hSetRateCombo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)sel_text);
+        for (i = 0; i < NUM_VALID_COMBOS; i++) {
+            if (strcmp(VALID_COMBOS[i].note, sel_text) != 0) continue;
+            return VALID_COMBOS[i].output_rate_hz / dval;
+        }
+    }
+    return 0.0;
+}
+
 /* Shows the "large file handling" combo when Winrad or SDR Connect output
  * format is selected AND the Recording tab (where it lives) is the active
  * one. Not shown for Linrad/WavViewDX (no 4 GiB WAV header limit to work
- * around) or for SDRuno - SDRuno itself doesn't support RF64 playback, so
- * that format always splits at 4 GiB with no user-facing choice; Winrad
+ * around) or for SDRuno/Perseus - neither's own playback software supports
+ * RF64, so both always split at 4 GiB with no user-facing choice; Winrad
  * exists specifically as the RF64-capable alternative. Format selection
  * alone isn't enough to gate visibility: this control is tagged for tab 2
  * like everything else on Recording, so switching to a different tab must
- * still hide it even if the format condition would otherwise say "show". */
+ * still hide it even if the format condition would otherwise say "show".
+ *
+ * Also handles the Jaguar and Perseus sample-rate mismatch warnings
+ * (Recording and Device tabs) - genuine Jaguar hardware only ever
+ * produces exactly 1.6 or 2.0 Msps, and genuine Perseus hardware only
+ * ever produces 125k/250k/500k/1M/2M sps, and at least one real reader
+ * (WavViewDX) trusts the Jaguar flags byte over the file's own stated
+ * sample rate for anything that isn't exactly 2 Msps, silently computing
+ * the wrong duration/pitch for a Jaguar file recorded at any other rate.
+ * One warning lives next to the format choice itself (Recording tab),
+ * the other next to the rate choice (Device tab), covering whichever
+ * one gets set second.                                                 */
+/* Whether Bias-T is actually available for the antenna/tuner currently
+ * selected, confirmed against SDRplay's own datasheets and reviews
+ * rather than assumed:
+ *   RSP1: no Bias-T at all, on any device this old.
+ *   RSP1A / RSP1B: single fixed port, Bias-T always available on it.
+ *   RSP2: Port B only - Port A and Hi-Z don't have it. ("Port B can also
+ *   be used with the 4.7V bias tee" - SDRplay's own RSP2 launch review.)
+ *   RSPdx / RSPdxR2: Port B only, same as RSP2 - NOT "all ports" (an
+ *   earlier assumption in this codebase and the User Guide, corrected
+ *   here after checking multiple independent sources, including
+ *   SDRplay's own retailer spec sheets: "Bias-T ... only available on
+ *   Port B").
+ *   RSPduo: Tuner 2's SMA port only - never Tuner 1, Hi-Z or 50 ohm.
+ *   ("Tuner 2 (& Bias T): SMA female connector ... with selectable 4.7V
+ *   DC out" - SDRplay's own RSPduo technical spec; no equivalent
+ *   mention anywhere for Tuner 1.)                                      */
+static int settings_bias_t_available(void)
+{
+    char ant[16];
+    /* CB_GETCURSEL + CB_GETLBTEXT reads the combo's actual current
+     * selection directly from the list, rather than GetWindowTextA
+     * against the edit portion - the latter can still be showing the
+     * previous selection's text at the exact moment CBN_SELCHANGE is
+     * being handled (confirmed: it was reporting Bias-T available on
+     * Antenna C and dimmed on B, exactly backwards - a one-selection
+     * lag reading each choice's predecessor rather than itself). Falls
+     * back to GetWindowTextA only if nothing in the list is selected
+     * (CBS_DROPDOWN also allows free-typed text, though nothing
+     * legitimate would be typed here outside the five fixed choices).   */
+    LRESULT sel = SendMessageA(g_hSetDualT1Antenna, CB_GETCURSEL, 0, 0);
+    if (sel != CB_ERR)
+        SendMessageA(g_hSetDualT1Antenna, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)ant);
+    else
+        GetWindowTextA(g_hSetDualT1Antenna, ant, sizeof(ant));
+
+    /* g_last_known_hwVer == 0 specifically means "device type not
+     * actually known yet", not "device without a Bias-T restriction" -
+     * conflating the two was the bug (confirmed: reported as Bias-T
+     * showing available on every antenna, intermittently). It's 0
+     * whenever Settings opens before any Monitor/Record session has run
+     * yet this launch, and open_settings_dialog() deliberately skips its
+     * own device probe (refresh_known_device_type()) whenever the device
+     * is already in use elsewhere - correct, since probing concurrently
+     * with an active session's own sdrplay_api_Open()/Close() calls is a
+     * confirmed crash, not just a theoretical race - so there's a real,
+     * legitimate window where the device is genuinely unidentified at
+     * this exact moment. Defaulting to "dimmed" here is the safe choice:
+     * briefly under-offering Bias-T on a device that does support it,
+     * until it's actually been identified, is a minor inconvenience;
+     * defaulting the other way risks the checkbox actually being ticked
+     * and silently doing nothing once the real device turns out not to
+     * support it on the current port.                                   */
+    if (g_last_known_hwVer == 0)
+        return 0;
+
+    if (g_last_known_hwVer == SDRPLAY_RSP1_ID)
+        return 0;
+
+    if (g_last_known_hwVer == SDRPLAY_RSPdx_ID || g_last_known_hwVer == SDRPLAY_RSPdxR2_ID ||
+            g_last_known_hwVer == SDRPLAY_RSP2_ID)
+        return !strcmp(ant, "B");
+
+    if (g_last_known_hwVer == SDRPLAY_RSPduo_ID) {
+        /* Tuner 2's own SMA port has Bias-T regardless of whether Tuner 1
+         * is also active alongside it - it's a property of that port,
+         * not something that only applies in a single-Tuner-2-only
+         * session. The previous t2 && !t1 check wrongly excluded any
+         * dual/Master-Slave session, or even a single-Tuner-1 session
+         * where Tuner 2 also happens to be checked with a different
+         * antenna selected for Tuner 1 - confirmed by ear: dimmed with
+         * Tuner 2 checked and Tuner 1's own antenna set to 50 ohm,
+         * where it should have been available since Tuner 2 was active. */
+        int t2 = SendMessageA(g_hSetTuner2En, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        return t2;
+    }
+
+    return 1;   /* only remaining known type is RSP1A/RSP1B - always available */
+}
+
+/* Applies settings_bias_t_available() to the checkbox - dimmed rather
+ * than EnableWindow(FALSE), same reasoning as every other conditionally-
+ * unavailable checkbox in this dialog (see settings_set_check_dim()'s
+ * own comment): a genuinely disabled control's text renders in Windows'
+ * own bright, hard-to-read-on-dark-background disabled colour, which
+ * this dialog avoids everywhere else. Force-unticks and blanks the
+ * saved value if it's no longer available, rather than silently keeping
+ * a stale "on" that would apply to the wrong port once Saved.           */
+static void settings_update_bias_t_state(void)
+{
+    int avail = settings_bias_t_available();
+    settings_set_check_dim(g_hSetBiasT, avail);
+    if (!avail && SendMessageA(g_hSetBiasT, BM_GETCHECK, 0, 0) == BST_CHECKED)
+        SendMessageA(g_hSetBiasT, BM_SETCHECK, BST_UNCHECKED, 0);
+}
+
+static void settings_update_dual_enable_state(void);
+
 static void settings_update_format_dependent_state(void)
 {
+    /* Keeps the Receiver tab's Tuner 2 dim/show state (and the rate combo
+     * it in turn repopulates) in sync with whatever just changed here -
+     * previously this only happened on a direct click on one of the
+     * Tuner/HDR/Same-as-T1 checkboxes themselves, so a Device tab change
+     * (sample rate combo, HDR) or a tab switch could leave the Receiver
+     * tab showing Tuner 2 controls in a stale state (visible when they
+     * shouldn't be, dimmed when they shouldn't be, or the "same AGC/DC/
+     * IQ" sub-row shown/hidden inconsistently) until something else
+     * happened to trigger a refresh.                                    */
+    settings_update_dual_enable_state();
+
     LRESULT fsel = g_hSetFormat ? SendMessageA(g_hSetFormat, CB_GETCURSEL, 0, 0) : CB_ERR;
     int show = (fsel == FORMAT_WINRAD || fsel == FORMAT_SDRCONNECT)
                && (g_settings_active_tab == 2);
     if (g_hSetLargeModeLbl) ShowWindow(g_hSetLargeModeLbl, show ? SW_SHOW : SW_HIDE);
     if (g_hSetLargeMode)    ShowWindow(g_hSetLargeMode,    show ? SW_SHOW : SW_HIDE);
+
+    {
+        double rate = settings_current_output_rate_hz();
+        int jaguar_wrong_rate = (fsel == FORMAT_JAGUAR) && rate > 0.0 &&
+                                 fabs(rate - 2000000.0) > 1.0;
+        if (g_hSetJaguarWarnRec) {
+            ShowWindow(g_hSetJaguarWarnRec,
+                       (jaguar_wrong_rate && g_settings_active_tab == 2) ? SW_SHOW : SW_HIDE);
+            ShowWindow(g_hSetJaguarWarnRec2,
+                       (jaguar_wrong_rate && g_settings_active_tab == 2) ? SW_SHOW : SW_HIDE);
+        }
+        if (g_hSetJaguarWarnDev) {
+            ShowWindow(g_hSetJaguarWarnDev,
+                       (jaguar_wrong_rate && g_settings_active_tab == 1) ? SW_SHOW : SW_HIDE);
+            ShowWindow(g_hSetJaguarWarnDev2,
+                       (jaguar_wrong_rate && g_settings_active_tab == 1) ? SW_SHOW : SW_HIDE);
+        }
+
+        /* Genuine Perseus hardware only ever produces 125k/250k/500k/1M/
+         * 2M sps - confirmed against the Perseus SDR's own published
+         * sample rate list. Same warning mechanism as the Jaguar check
+         * just above: one copy next to the format choice (Recording
+         * tab), one next to the rate choice (Device tab).               */
+        {
+            static const double PERSEUS_VALID_HZ[] = {
+                125000.0, 250000.0, 500000.0, 1000000.0, 2000000.0
+            };
+            int perseus_wrong_rate = 0;
+            if (fsel == FORMAT_PERSEUS && rate > 0.0) {
+                int i, ok = 0;
+                for (i = 0; i < (int)(sizeof(PERSEUS_VALID_HZ) / sizeof(PERSEUS_VALID_HZ[0])); i++) {
+                    if (fabs(rate - PERSEUS_VALID_HZ[i]) < 1.0) { ok = 1; break; }
+                }
+                perseus_wrong_rate = !ok;
+            }
+            if (g_hSetPerseusWarnRec) {
+                ShowWindow(g_hSetPerseusWarnRec,
+                           (perseus_wrong_rate && g_settings_active_tab == 2) ? SW_SHOW : SW_HIDE);
+                ShowWindow(g_hSetPerseusWarnRec2,
+                           (perseus_wrong_rate && g_settings_active_tab == 2) ? SW_SHOW : SW_HIDE);
+            }
+            if (g_hSetPerseusWarnDev) {
+                ShowWindow(g_hSetPerseusWarnDev,
+                           (perseus_wrong_rate && g_settings_active_tab == 1) ? SW_SHOW : SW_HIDE);
+                ShowWindow(g_hSetPerseusWarnDev2,
+                           (perseus_wrong_rate && g_settings_active_tab == 1) ? SW_SHOW : SW_HIDE);
+            }
+        }
+    }
 }
 
 static void settings_update_dual_enable_state(void)
@@ -13919,8 +17277,22 @@ static void settings_update_dual_enable_state(void)
      * checkbox, but the conflict is the same one HDR already resolves
      * against dual_channel at session start (validate_config()) - this
      * just surfaces it in the dialog instead of leaving it to a runtime
-     * warning.                                                          */
-    EnableWindow(g_hSetHdr, (BOOL)!dual);
+     * warning. Also unavailable outright on anything other than an
+     * RSPdx/RSPdx R2 (the checkbox's own "(RSPdx)" label). Uses the same
+     * dim-but-enabled mechanism as Tuner 2's own unavailable-right-now
+     * controls (settings_set_check_dim(), IDC_SET_HDR's own BN_CLICKED
+     * case below) rather than plain EnableWindow(), for the same reason
+     * that exists at all - Windows' own disabled-text colour reads as
+     * too bright/hard to distinguish from normal text against this dark
+     * theme.                                                            */
+    {
+        int hdr_device_ok = (g_last_known_hwVer == SDRPLAY_RSPdx_ID ||
+                              g_last_known_hwVer == SDRPLAY_RSPdxR2_ID ||
+                              g_last_known_hwVer == 0);   /* not known yet -
+                                                              don't restrict
+                                                              on a guess */
+        settings_set_check_dim(g_hSetHdr, !dual && hdr_device_ok);
+    }
     if (dual && hdr) {
         SendMessageA(g_hSetHdr, BM_SETCHECK, BST_UNCHECKED, 0);
         hdr = 0;
@@ -13945,7 +17317,18 @@ static void settings_update_dual_enable_state(void)
     settings_set_check_dim(g_hSetBSameCorr, dual);
     {
         int same_corr = SendMessageA(g_hSetBSameCorr, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        int cmd_b = (dual && !same_corr) ? SW_SHOW : SW_HIDE;
+        /* Only ever actually shown on the Receiver tab (tab 0) - these
+         * are tagged for it like everything else on that page, and the
+         * general per-tab hide pass in settings_select_tab() already
+         * hides them on every other tab. Without the g_settings_active_tab
+         * check below, this unconditional ShowWindow(SW_SHOW) undid that
+         * hide again immediately afterward on every OTHER tab too, since
+         * settings_update_dual_enable_state() runs at the end of every
+         * tab switch (via settings_update_format_dependent_state()), not
+         * just when actually on the Receiver tab - confirmed as the cause
+         * of Tuner 2's AGC/DC/IQ/RF Notch/DAB Notch checkboxes bleeding
+         * through onto every other tab whenever dual mode was active.    */
+        int cmd_b = (dual && !same_corr && g_settings_active_tab == 0) ? SW_SHOW : SW_HIDE;
         if (g_hSetAgcB)      ShowWindow(g_hSetAgcB,      cmd_b);
         if (g_hSetDcB)       ShowWindow(g_hSetDcB,       cmd_b);
         if (g_hSetIqB)       ShowWindow(g_hSetIqB,       cmd_b);
@@ -13953,9 +17336,22 @@ static void settings_update_dual_enable_state(void)
         if (g_hSetNotchDabB) ShowWindow(g_hSetNotchDabB, cmd_b);
     }
 
-    settings_populate_ratecombo((int)dual, (int)hdr);
+    /* Both tuners checked (Coherent or Master/Slave alike) excludes
+     * Zero-IF entirely - architectural RSPduo limit, confirmed by ear, see
+     * settings_populate_ratecombo()'s comment. Master/Slave specifically
+     * (different CF) is further restricted to 6/8 Msps ADC rate - also
+     * confirmed by testing. Coherent (same CF) has no restriction beyond
+     * Zero-IF exclusion, so settings_is_coherent() (which already checks
+     * both-checked AND same-CF) tells us which case this is: dual &&
+     * !coherent means Master/Slave.                                       */
+    settings_populate_ratecombo(dual, dual && !settings_is_coherent(), (int)hdr);
     settings_select_ratecombo_for_current();
     settings_update_coherent_indicator();
+    /* Catches the RSPduo case (Bias-T depends on which tuner(s) are
+     * checked, via settings_bias_t_available()'s single_b check) -
+     * everything else it depends on (antenna choice) is refreshed
+     * separately, from IDC_SET_DUALT1_ANTENNA's own change handler.      */
+    settings_update_bias_t_state();
 }
 
 /* settings_update_duration_hms() removed - the Duration field itself now
@@ -13989,6 +17385,58 @@ static void settings_schedule_update_nav_ui(void)
     InvalidateRect(g_hSetSchedDel, NULL, TRUE);
 }
 
+/* Fills g_hSetSchedFreq/g_hSetSchedFreqB from the Receiver tab's live
+ * Tuner 1/Tuner 2 frequency fields and makes them read-only, when
+ * g_hSetSchedFreqSync is checked - shared by settings_schedule_load_
+ * current_from_array() (Prev/Next/Add/Delete), the checkbox's own click
+ * handler, and settings_select_tab() (switching to Schedule after
+ * editing the Receiver tab elsewhere), so there's one place this can
+ * ever go out of sync rather than three.
+ *
+ * Only mirrors a tuner that's actually checked on the Receiver tab -
+ * previously mirrored both fields unconditionally, which meant a
+ * single-Tuner-1 session still got Tuner 2's leftover field value
+ * written into Frequency 2, even though Tuner 2 was never in use.
+ * Matches settings_save()'s own single_b handling (Tuner 2 alone means
+ * ITS field is the one that's actually the primary/applied frequency,
+ * not Tuner 1's), so Frequency 1 mirrors whichever tuner is genuinely
+ * the active one rather than always Tuner 1's field specifically.       */
+static void settings_schedule_apply_freq_sync(void)
+{
+    int on = SendMessageA(g_hSetSchedFreqSync, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    int t1 = SendMessageA(g_hSetTuner1En, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    int t2 = SendMessageA(g_hSetTuner2En, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    int dual = t1 && t2;
+    int single_b = t2 && !t1;
+    /* Genuine read-only (EM_SETREADONLY) rather than settings_set_edit_
+     * readonly()'s EnableWindow() - a disabled field greys out and reads
+     * as "unavailable", which isn't the intent here: synced still means
+     * "look at this, it's live and correct", just not something to type
+     * a different value into. ES_READONLY blocks keyboard input while
+     * leaving the control fully enabled - normal colour (see WM_CTLCOLOR-
+     * EDIT's COL_CF_VALUE branch, which only drops to the dimmed colour
+     * for a genuinely disabled field, and these never are one), and text
+     * still selectable/copyable.                                        */
+    SendMessageA(g_hSetSchedFreq, EM_SETREADONLY, on, 0);
+    SendMessageA(g_hSetSchedFreqB, EM_SETREADONLY, on, 0);
+    /* Same reasoning as settings_set_check_dim()'s own InvalidateRect -
+     * the colour picked in WM_CTLCOLOREDIT only actually shows up at the
+     * next repaint, and nothing else here would otherwise prompt one.    */
+    InvalidateRect(g_hSetSchedFreq, NULL, TRUE);
+    InvalidateRect(g_hSetSchedFreqB, NULL, TRUE);
+    if (on && g_settings_schedule_count > 0) {
+        char buf[32];
+        GetWindowTextA(single_b ? g_hSetFreqB : g_hSetDualT1Freq, buf, sizeof(buf));
+        SetWindowTextA(g_hSetSchedFreq, buf);
+        if (dual) {
+            GetWindowTextA(g_hSetFreqB, buf, sizeof(buf));
+            SetWindowTextA(g_hSetSchedFreqB, buf);
+        } else {
+            SetWindowTextA(g_hSetSchedFreqB, "");
+        }
+    }
+}
+
 /* Loads g_settings_schedule[g_settings_schedule_idx] into the visible
  * fields, or blanks them all if there are no entries.                   */
 static void settings_schedule_load_current_from_array(void)
@@ -14001,19 +17449,29 @@ static void settings_schedule_load_current_from_array(void)
         SetWindowTextA(g_hSetSchedFreqB, "");
         SetWindowTextA(g_hSetSchedOutfile, "");
         SetWindowTextA(g_hSetSchedAntenna, "");
+        SendMessageA(g_hSetSchedFreqSync, BM_SETCHECK, BST_UNCHECKED, 0);
     } else {
         ScheduleEntry *e = &g_settings_schedule[g_settings_schedule_idx];
         SetWindowTextA(g_hSetSchedStart, e->start_time);
         format_duration_hms(e->duration_sec, buf, sizeof(buf));
         SetWindowTextA(g_hSetSchedDuration, buf);
+        /* This entry's OWN stored freq_sync, not whatever the checkbox
+         * happened to be left at from the last entry viewed - each entry
+         * remembers its own choice independently (see ScheduleEntry's own
+         * comment on the field). settings_schedule_apply_freq_sync()
+         * below reads this right back out via BM_GETCHECK to decide
+         * whether to mirror the Receiver tab fields, so it has to be set
+         * before that call, not after.                                   */
+        SendMessageA(g_hSetSchedFreqSync, BM_SETCHECK,
+                     e->freq_sync ? BST_CHECKED : BST_UNCHECKED, 0);
         if (e->frequency_hz > 0.0) {
-            snprintf(buf, sizeof(buf), "%.6g", e->frequency_hz / 1e6);
+            format_mhz_min3(e->frequency_hz, buf, sizeof(buf));
             SetWindowTextA(g_hSetSchedFreq, buf);
         } else {
             SetWindowTextA(g_hSetSchedFreq, "");
         }
         if (e->freq_b_hz > 0.0) {
-            snprintf(buf, sizeof(buf), "%.6g", e->freq_b_hz / 1e6);
+            format_mhz_min3(e->freq_b_hz, buf, sizeof(buf));
             SetWindowTextA(g_hSetSchedFreqB, buf);
         } else {
             SetWindowTextA(g_hSetSchedFreqB, "");
@@ -14021,6 +17479,13 @@ static void settings_schedule_load_current_from_array(void)
         SetWindowTextA(g_hSetSchedOutfile, e->output_file);
         SetWindowTextA(g_hSetSchedAntenna, e->antenna);
     }
+    /* Overrides whatever was just loaded above with the Receiver tab's
+     * live values, if the sync checkbox is on - deliberately done last,
+     * as a separate pass, rather than folded into the if/else above, so
+     * this stays the one function whose behaviour actually depends on
+     * the checkbox (see its own comment) instead of that logic being
+     * duplicated here too.                                              */
+    settings_schedule_apply_freq_sync();
     settings_schedule_update_nav_ui();
 }
 
@@ -14055,6 +17520,8 @@ static void settings_schedule_save_current_to_array(void)
     GetWindowTextA(g_hSetSchedAntenna, buf, sizeof(buf));
     strncpy(e->antenna, buf, sizeof(e->antenna) - 1);
     e->antenna[sizeof(e->antenna) - 1] = '\0';
+
+    e->freq_sync = SendMessageA(g_hSetSchedFreqSync, BM_GETCHECK, 0, 0) == BST_CHECKED;
 }
 
 static void settings_load_controls(void)
@@ -14071,7 +17538,7 @@ static void settings_load_controls(void)
     /* Tuner 1 column: always the primary config values, whether Tuner 1
      * is actually the active one right now or not (harmless when not -
      * the fields are simply greyed out in that case).                   */
-    snprintf(buf, sizeof(buf), "%.6g", g_settings_cfg.frequency_hz / 1e6);
+    format_mhz_min3(g_settings_cfg.frequency_hz, buf, sizeof(buf));
     SetWindowTextA(g_hSetDualT1Freq, buf);
     snprintf(buf, sizeof(buf), "%d", g_settings_cfg.gain_reduction);
     SetWindowTextA(g_hSetDualT1Gr, buf);
@@ -14084,14 +17551,14 @@ static void settings_load_controls(void)
      * Tuner 2's real settings), otherwise the separate _b values used in
      * true dual mode.                                                   */
     if (single_b) {
-        snprintf(buf, sizeof(buf), "%.6g", g_settings_cfg.frequency_hz / 1e6);
+        format_mhz_min3(g_settings_cfg.frequency_hz, buf, sizeof(buf));
         SetWindowTextA(g_hSetFreqB, buf);
         snprintf(buf, sizeof(buf), "%d", g_settings_cfg.gain_reduction);
         SetWindowTextA(g_hSetGrB, buf);
         snprintf(buf, sizeof(buf), "%d", g_settings_cfg.lna_state);
         SetWindowTextA(g_hSetLnaB, buf);
     } else {
-        snprintf(buf, sizeof(buf), "%.6g", g_settings_cfg.freq_b_hz / 1e6);
+        format_mhz_min3(g_settings_cfg.freq_b_hz, buf, sizeof(buf));
         SetWindowTextA(g_hSetFreqB, buf);
         snprintf(buf, sizeof(buf), "%d", g_settings_cfg.gain_reduction_b);
         SetWindowTextA(g_hSetGrB, buf);
@@ -14130,11 +17597,11 @@ static void settings_load_controls(void)
         else if (bw <= 1200) idx = 2;
         SendMessageA(g_hSetHdrBw, CB_SETCURSEL, (WPARAM)idx, 0);
     }
-    /* "Same as A" for Tuner B corrections/notches/AGC: true only if every
+    /* "Same as A" for Tuner 2 corrections/notches/AGC: true only if every
      * one of the five underlying _b fields is still at its -1 (inherit)
      * sentinel. If any of them was set independently (e.g. by hand-editing
      * duodx.ini), leave the box unchecked so re-saving doesn't silently
-     * collapse a deliberately different Tuner B setting back onto A.     */
+     * collapse a deliberately different Tuner 2 setting back onto A.     */
     SendMessageA(g_hSetBSameCorr, BM_SETCHECK,
                  (g_settings_cfg.agc_enable_b   < 0 &&
                   g_settings_cfg.dc_correct_b   < 0 &&
@@ -14142,7 +17609,7 @@ static void settings_load_controls(void)
                   g_settings_cfg.notch_rf_b     < 0 &&
                   g_settings_cfg.notch_dab_b    < 0) ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    /* The actual Tuner B values - default to matching Tuner A's own
+    /* The actual Tuner 2 values - default to matching Tuner 1's own
      * loaded value when still at the -1 inherit sentinel, so unchecking
      * "same as T1" starts from a sensible, already-familiar state rather
      * than everything defaulting off regardless of what A is set to.     */
@@ -14169,6 +17636,10 @@ static void settings_load_controls(void)
 
     SendMessageA(g_hSetMonVisible, BM_SETCHECK,
                  g_settings_cfg.monitor_bar_visible ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(g_hSetShowOffset, BM_SETCHECK,
+                 g_settings_cfg.show_carrier_offset ? BST_CHECKED : BST_UNCHECKED, 0);
+    snprintf(buf, sizeof(buf), "%.5f", g_settings_cfg.carrier_offset_calib_hz);
+    SetWindowTextA(g_hSetCarrierCalib, buf);
     {
         int ms = g_settings_cfg.monitor_interval_ms;
         int idx = 1; /* default 500 ms */
@@ -14211,13 +17682,6 @@ static void settings_load_controls(void)
     SetWindowTextA(g_hSetRingSec, buf);
     SendMessageA(g_hSetSpinupEn, BM_SETCHECK,
                  g_settings_cfg.spinup_enable ? BST_CHECKED : BST_UNCHECKED, 0);
-    {
-        int bytes = g_settings_cfg.spinup_bytes;
-        int idx = 0; /* default 1 MB if the stored value is unrecognised */
-        if (bytes >= 8 * 1024 * 1024) idx = 2;
-        else if (bytes >= 4 * 1024 * 1024) idx = 1;
-        SendMessageA(g_hSetSpinupBytes, CB_SETCURSEL, (WPARAM)idx, 0);
-    }
 
     SendMessageA(g_hSetGrBSame, BM_SETCHECK,
                  g_settings_cfg.gain_reduction_b < 0 ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -14325,9 +17789,15 @@ static void settings_save(void)
     int single_b = t2 && !t1;
 
     GetWindowTextA(single_b ? g_hSetFreqB : g_hSetDualT1Freq, buf, sizeof(buf));
-    entries[n].key = "frequency_mhz";
-    snprintf(entries[n].value, sizeof(entries[n].value), "%.6g", atof(buf));
+    entries[n].key = "frequency_hz";
+    snprintf(entries[n].value, sizeof(entries[n].value), "%.1f", atof(buf) * 1e6);
     n++;
+    /* Keeps the running session's own baseline reference (AppState, not
+     * cfg) in step with a genuine user edit here, rather than only
+     * picking this up on the next app launch - see baseline_frequency_hz's
+     * own comment for why a schedule entry's freq_sync needs this kept
+     * separate from cfg.frequency_hz in the first place.                 */
+    g_state.baseline_frequency_hz = atof(buf) * 1e6;
 
     GetWindowTextA(single_b ? g_hSetGrB : g_hSetDualT1Gr, buf, sizeof(buf));
     entries[n].key = "gain_reduction";
@@ -14339,16 +17809,17 @@ static void settings_save(void)
     snprintf(entries[n].value, sizeof(entries[n].value), "%d", atoi(buf));
     n++;
 
-    /* freq_b_mhz is only meaningful in true dual mode - in single-tuner-B
+    /* freq_b_hz is only meaningful in true dual mode - in single-tuner-B
      * mode, Tuner 2's fields were just read above as the primary values,
-     * so writing them again here as "Tuner B's" would duplicate/corrupt
+     * so writing them again here as "Tuner 2's" would duplicate/corrupt
      * the _b keys with primary-tuner data. Left untouched (whatever was
      * already on disk stays there) rather than written wrong.           */
     if (!single_b) {
         GetWindowTextA(g_hSetFreqB, buf, sizeof(buf));
-        entries[n].key = "freq_b_mhz";
-        snprintf(entries[n].value, sizeof(entries[n].value), "%.6g", atof(buf));
+        entries[n].key = "freq_b_hz";
+        snprintf(entries[n].value, sizeof(entries[n].value), "%.1f", atof(buf) * 1e6);
         n++;
+        g_state.baseline_freq_b_hz = atof(buf) * 1e6;
     }
 
     entries[n].key = "agc_enable";
@@ -14377,6 +17848,16 @@ static void settings_save(void)
     entries[n].key = "monitor_bar_visible";
     snprintf(entries[n].value, sizeof(entries[n].value), "%d",
              SendMessageA(g_hSetMonVisible, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
+    n++;
+
+    entries[n].key = "show_carrier_offset";
+    snprintf(entries[n].value, sizeof(entries[n].value), "%d",
+             SendMessageA(g_hSetShowOffset, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
+    n++;
+
+    GetWindowTextA(g_hSetCarrierCalib, buf, sizeof(buf));
+    entries[n].key = "carrier_offset_calib_hz";
+    snprintf(entries[n].value, sizeof(entries[n].value), "%.5f", atof(buf));
     n++;
 
     if (!single_b) {
@@ -14410,9 +17891,9 @@ static void settings_save(void)
         SendMessageA(g_hSetRateCombo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)sel_text);
         for (i = 0; i < NUM_VALID_COMBOS; i++) {
             if (strcmp(VALID_COMBOS[i].note, sel_text) != 0) continue;
-            entries[n].key = "sample_rate_msps";
-            snprintf(entries[n].value, sizeof(entries[n].value), "%.3g",
-                     VALID_COMBOS[i].adc_rate_hz / 1e6);
+            entries[n].key = "sample_rate_hz";
+            snprintf(entries[n].value, sizeof(entries[n].value), "%.1f",
+                     VALID_COMBOS[i].adc_rate_hz);
             n++;
             entries[n].key = "if_khz";
             snprintf(entries[n].value, sizeof(entries[n].value), "%d",
@@ -14457,12 +17938,12 @@ static void settings_save(void)
     }
 
     {
-        static const char *fmt_names[5] = { "linrad", "wavviewdx", "sdruno", "sdrconnect", "winrad" };
+        static const char *fmt_names[7] = { "linrad", "wavviewdx", "sdruno", "sdrconnect", "winrad", "perseus", "jaguar" };
         LRESULT fsel = SendMessageA(g_hSetFormat, CB_GETCURSEL, 0, 0);
         if (fsel == CB_ERR) fsel = 0;
         entries[n].key = "output_format";
         snprintf(entries[n].value, sizeof(entries[n].value), "%s",
-                 fmt_names[fsel < 5 ? fsel : 0]);
+                 fmt_names[fsel < 7 ? fsel : 0]);
         n++;
     }
 
@@ -14526,7 +18007,7 @@ static void settings_save(void)
         n++;
     }
 
-    /* Tuner B: AGC/DC/IQ/notch "same as A" checkbox covers all five
+    /* Tuner 2: AGC/DC/IQ/notch "same as A" checkbox covers all five
      * underlying _b sentinel fields at once (-1 = inherit from A, same
      * pattern as the existing gain_reduction_b / lna_state_b fields).   */
     if (SendMessageA(g_hSetBSameCorr, BM_GETCHECK, 0, 0) == BST_CHECKED) {
@@ -14536,10 +18017,10 @@ static void settings_save(void)
         entries[n].key = "notch_rf_b";     snprintf(entries[n].value, sizeof(entries[n].value), "-1"); n++;
         entries[n].key = "notch_dab_b";    snprintf(entries[n].value, sizeof(entries[n].value), "-1"); n++;
     } else {
-        /* Unchecked: read Tuner B's own controls, now that they actually
-         * exist - previously this copied Tuner A's current values here
+        /* Unchecked: read Tuner 2's own controls, now that they actually
+         * exist - previously this copied Tuner 1's current values here
          * instead, which is exactly what silently collapsed a
-         * deliberately different Tuner B setting back onto A on every
+         * deliberately different Tuner 2 setting back onto A on every
          * save, even ones unrelated to this checkbox.                    */
         int agc_b  = SendMessageA(g_hSetAgcB,      BM_GETCHECK, 0, 0) == BST_CHECKED;
         int dc_b   = SendMessageA(g_hSetDcB,       BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -14562,16 +18043,6 @@ static void settings_save(void)
     snprintf(entries[n].value, sizeof(entries[n].value), "%d",
              SendMessageA(g_hSetSpinupEn, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
     n++;
-
-    {
-        static const int spinup_values[3] = { 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024 };
-        LRESULT ssel = SendMessageA(g_hSetSpinupBytes, CB_GETCURSEL, 0, 0);
-        int sval = (ssel != CB_ERR && ssel >= 0 && ssel < 3)
-                       ? spinup_values[ssel] : 1024 * 1024;
-        entries[n].key = "spinup_bytes";
-        snprintf(entries[n].value, sizeof(entries[n].value), "%d", sval);
-        n++;
-    }
 
     {
         static const int mon_int_values[3] = { 200, 500, 1000 };
@@ -14752,8 +18223,46 @@ static void settings_save(void)
          * finished - even with Schedule: OFF and nothing actually armed.
          * Same fix already applied at the nightly schedule-reload day
          * rollover, for the same reason.                                 */
-        if (!g_state.cfg.schedule_only)
+        /* Only zero it while an actual recording is running - that's the
+         * one case this protects (see above): a mid-recording Settings
+         * save with Schedule now off shouldn't let the session roll into
+         * a stale schedule entry once it finishes. Applying this any
+         * time Schedule merely happens to be off at save time was wrong:
+         * it meant adding a fresh entry from Settings while idle with
+         * Timer still off (the entries write to disk unconditionally,
+         * schedule_only doesn't - see the Timer button, which is the
+         * only thing that arms it from OFF) left schedule_count at 0 in
+         * memory even though the entry genuinely exists on disk, so
+         * turning Timer on right afterward - which flips schedule_only
+         * directly without reloading config - showed "no entries
+         * configured" despite one being right there in the dialog.      */
+        if (!g_state.cfg.schedule_only && g_state.stream_running)
             g_state.cfg.schedule_count = 0;
+        /* If the save leaves nothing actually armed - Schedule off (or
+         * on with every entry just deleted) and Hourly off - any
+         * next_start/next_stop still showing is necessarily stale: nothing
+         * in the schedule editor writes to these directly, so without this
+         * they would keep echoing whatever the wait loop last latched onto
+         * before the edit, right up until the next full stop/start cycle.
+         * Deliberately display-only: this used to also cancel an
+         * in-progress wait (downgrade-to-listening or a full stop), but
+         * that risked cutting off a wait that was still genuinely valid
+         * whenever this ran during an unrelated Settings save mid-wait -
+         * config_load_ini() just above rereads schedule_only/schedule_count
+         * fresh from disk on every save, and if that reload ever disagreed
+         * with what the wait loop is actually doing (even transiently),
+         * this would tear down a session that should have kept running.
+         * Clearing the display fields alone can't do that - worst case is
+         * a stale label for a few seconds until the next natural refresh,
+         * not a lost recording.                                          */
+        if (!g_state.cfg.hourly_enable &&
+                (!g_state.cfg.schedule_only || g_state.cfg.schedule_count == 0) &&
+                !(g_worker_active && g_state.next_start[0])) {
+            EnterCriticalSection(&g_next_lock);
+            g_state.next_start[0] = '\0';
+            g_state.next_stop[0]  = '\0';
+            LeaveCriticalSection(&g_next_lock);
+        }
         monitor_sync_button_label();
         if (g_hBtnSchedToggle) {
             SetWindowTextA(g_hBtnSchedToggle,
@@ -14789,12 +18298,51 @@ static void settings_save(void)
              * already correct.                                          */
             g_ui.hdr_on = g_state.cfg.hdr_enable ? 1 : 0;
             if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+        } else {
+            /* A session IS active - everything above (monitor bar
+             * visibility, coverage text, HDR indicator) is deliberately
+             * left alone here, per the comment above. But a few things
+             * are read fresh directly from g_state.cfg every time the
+             * window happens to repaint, with no separate cached copy to
+             * refresh - the carrier offset calibration correction being
+             * the reason this else branch exists. Nothing else
+             * necessarily triggers a repaint right after Settings
+             * closes, so without this a just-saved calibration value (or
+             * anything else read the same way) would sit showing stale
+             * pixels until some unrelated event happened to repaint the
+             * window - which could be many seconds away, or effectively
+             * never during quiet listening, otherwise.                  */
+            if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
         }
         if (g_state.listening || g_state.stream_running) {
             int new_dual = g_state.cfg.dual_channel;
             int new_single_b = !strcmp(g_state.cfg.rspduo_single_tuner, "B");
-            int freq_b_changed = old_master_slave_active &&
-                    fabs(g_state.cfg.freq_b_hz - old_freq_b_hz) > 0.5;
+            /* Whether this save would make the session Master/Slave-
+             * eligible, using the exact same threshold recording_worker()
+             * itself uses to decide it at session start.                 */
+            int new_master_slave_eligible = new_dual &&
+                    fabs(g_state.cfg.frequency_hz - g_state.cfg.freq_b_hz) > 100.0;
+            /* Catches a save that changes Tuner 2's frequency FROM
+             * genuine Master/Slave mode - old_master_slave_active alone
+             * used to gate this whole check, which meant the opposite
+             * transition (Listening started on close/same frequencies,
+             * genuinely coherent dual with master_slave_active still 0,
+             * then a later Settings save moves Tuner 2's frequency far
+             * enough apart to newly qualify for Master/Slave) was never
+             * caught at all - the session just kept running in whatever
+             * mode it originally started in, with master_slave_active
+             * stuck at its stale original value for the rest of the
+             * session. That's what was surfacing as the MASTER/SLAVE
+             * indicator never lighting despite the two tuners genuinely
+             * being on different frequencies and both recording
+             * correctly - the underlying recording was fine (Tuner 2's
+             * frequency does get applied correctly on the next actual
+             * restart this now forces), only the flag - and everything
+             * that reads it for display - never found out.               */
+            int freq_b_changed =
+                    (old_master_slave_active &&
+                     fabs(g_state.cfg.freq_b_hz - old_freq_b_hz) > 0.5) ||
+                    (new_master_slave_eligible != (old_master_slave_active != 0));
             int freq_a_changed =
                     fabs(g_state.cfg.frequency_hz - old_frequency_hz) > 0.5;
             int combo_changed = (g_state.cfg.if_khz != old_if_khz) ||
@@ -14812,17 +18360,17 @@ static void settings_save(void)
                  * selection's label - Monitor needs pressing again to
                  * pick up the change.
                  *
-                 * Tuner B's frequency is included here too: it lives
+                 * Tuner 2's frequency is included here too: it lives
                  * entirely in the separate slave process, started once
                  * with that frequency on its command line - there's no
-                 * live-retune path to it at all, unlike Tuner A's gain/
+                 * live-retune path to it at all, unlike Tuner 1's gain/
                  * antenna just below. Without this check, saving a new
-                 * Tuner B frequency here updated the display and ini but
+                 * Tuner 2 frequency here updated the display and ini but
                  * left the slave silently still streaming its old one,
                  * with everything else (coverage text, level meter
                  * scaling) now assuming the new frequency instead.
                  *
-                 * Same reasoning for Tuner A's own CF and the Sample
+                 * Same reasoning for Tuner 1's own CF and the Sample
                  * Rate / IF / Bandwidth combo: neither has a live-retune
                  * path either (only gain/LNA/antenna do, just below).
                  * config_load_ini() a few lines up reloads g_state.cfg
@@ -14838,8 +18386,8 @@ static void settings_save(void)
                 LOG_WARN("A setting that needs the device reopened (tuner "
                          "selection, frequency, or sample rate/IF/BW) just "
                          "changed - stopping the current Listening session "
-                         "so it can restart correctly. Press the Tuner A / "
-                         "Tuner B button again to resume.");
+                         "so it can restart correctly. Press the Tuner 1 / "
+                         "Tuner 2 button again to resume.");
                 gui_stop_session(0);
             } else {
                 /* Gain/LNA and antenna are both worth pushing live here,
@@ -14850,6 +18398,17 @@ static void settings_save(void)
                  * on an already-running stream.                          */
                 gui_apply_live_gain(&g_state);
                 apply_antenna_and_biast(&g_state);
+                if (g_hBtnAnt) {
+                    const char *labels[3], *values[3];
+                    int n = antenna_slot_info(labels, values);
+                    int i;
+                    for (i = 0; i < n; i++) {
+                        if (!strcmp(values[i], g_state.cfg.antenna)) {
+                            SetWindowTextA(g_hBtnAnt, labels[i]);
+                            break;
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -14883,14 +18442,28 @@ static void settings_calc_range(void)
 
     if (!g_hSetRangeStart || !g_hSetRangeEnd || !g_hSetRangeHint) return;
 
-    /* Dual-tuner mode (both tuners checked) shares one ADC between the two
-     * tuners, which restricts the valid combinations to the small
-     * dual_ok=1 subset of VALID_COMBOS - all Low-IF (1620/2048 kHz), none
-     * Zero-IF. Searching the normal Zero-IF list here would silently set
-     * a combination that only fails later at Record, since validate_config
-     * checks dual_ok separately from everything this function touches. */
+    /* This calculator only ever searches Zero-IF combinations (the fixed
+     * ZIF_BW_LIST below) and only ever sets one frequency field
+     * (g_settings_cfg.frequency_hz) - it never touches freq_b_hz. Zero-IF
+     * is architecturally single-tuner only on the RSPduo (confirmed by
+     * ear, see the matching note in validate_config()) - Coherent and
+     * Master/Slave both require Low-IF - so with both tuners checked this
+     * calculator has nothing valid to offer; refuse rather than compute a
+     * Zero-IF result that can never actually be used. Pick a Low-IF
+     * combination directly from the Sample Rate / IF / Bandwidth dropdown
+     * instead (Section 5) - its span is fixed at up to ~1.5 MHz (1536 kHz
+     * filter) or ~5 MHz (2048 kHz/5000 kHz), so there's no calculation to
+     * do beyond choosing the centre frequency.                           */
     dual = (SendMessageA(g_hSetTuner1En, BM_GETCHECK, 0, 0) == BST_CHECKED) &&
            (SendMessageA(g_hSetTuner2En, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    if (dual) {
+        SetWindowTextA(g_hSetRangeHint,
+            "Not available with both tuners checked - Zero-IF (what this calculator searches) can't "
+            "be used with both tuners active. Pick a Low-IF combination directly from the Sample "
+            "Rate / IF / Bandwidth dropdown instead.");
+        InvalidateRect(g_hSetRangeHint, NULL, TRUE);
+        return;
+    }
 
     GetWindowTextA(g_hSetRangeStart, sbuf, sizeof(sbuf));
     GetWindowTextA(g_hSetRangeEnd, ebuf, sizeof(ebuf));
@@ -14930,69 +18503,32 @@ static void settings_calc_range(void)
         return;
     }
 
-    if (dual) {
-        /* Dual-tuner mode: search only the dual_ok combos directly,
-         * rather than a fixed BW list - the smallest bw_khz among them
-         * that's still >= span_khz, then the lowest ADC rate offering
-         * that bw_khz. All dual_ok entries happen to be if_khz=1620 or
-         * 2048; 1620 covers every bandwidth option (200/300/600/1536) at
-         * 6 Msps, while 2048 only offers 1536 at 8 Msps - so for any
-         * bandwidth both support, 1620's lower rate always wins on its
-         * own via the "lowest ADC rate" comparison below, with no need
-         * to special-case a preference between them. */
-        double max_dual_bw = 0.0;
-        for (i = 0; i < NUM_VALID_COMBOS; i++) {
-            const ValidCombo *c = &VALID_COMBOS[i];
-            if (!c->dual_ok) continue;
-            if (c->bw_khz > max_dual_bw) max_dual_bw = c->bw_khz;
-        }
-        if (span_khz > max_dual_bw) {
-            snprintf(hint, sizeof(hint),
-                "%.3f MHz span exceeds dual-tuner mode's %.0f kHz max (Low-IF only - see Appendix "
-                "A.2). Uncheck Tuner 2 for wider Zero-IF options, or split into sessions.",
-                span_khz / 1000.0, max_dual_bw);
-            SetWindowTextA(g_hSetRangeHint, hint);
-            InvalidateRect(g_hSetRangeHint, NULL, TRUE);
-            return;
-        }
-        for (i = 0; i < NUM_VALID_COMBOS; i++) {
-            const ValidCombo *c = &VALID_COMBOS[i];
-            if (!c->dual_ok || (double)c->bw_khz < span_khz) continue;
-            if (chosen_adc_hz == 0.0 || c->bw_khz < chosen_bw ||
-                    (c->bw_khz == chosen_bw && c->adc_rate_hz < chosen_adc_hz)) {
-                chosen_bw = c->bw_khz;
-                chosen_if = c->if_khz;
-                chosen_adc_hz = c->adc_rate_hz;
-                chosen_output_hz = c->output_rate_hz;
-            }
-        }
-    } else {
-        if (span_khz > 8000.0) {
-            snprintf(hint, sizeof(hint),
-                "%.3f MHz span exceeds the 8 MHz max - split into multiple sessions (Appendix A.1).",
-                span_khz / 1000.0);
-            SetWindowTextA(g_hSetRangeHint, hint);
-            InvalidateRect(g_hSetRangeHint, NULL, TRUE);
-            return;
-        }
+    if (span_khz > 8000.0) {
+        snprintf(hint, sizeof(hint),
+            "%.3f MHz span exceeds the 8 MHz max - split into multiple sessions (Appendix A.1).",
+            span_khz / 1000.0);
+        SetWindowTextA(g_hSetRangeHint, hint);
+        InvalidateRect(g_hSetRangeHint, NULL, TRUE);
+        return;
+    }
 
-        /* Smallest valid bw_khz that is >= span_khz. */
-        for (i = 0; i < (int)(sizeof(ZIF_BW_LIST) / sizeof(ZIF_BW_LIST[0])); i++) {
-            if ((double)ZIF_BW_LIST[i] >= span_khz) {
-                chosen_bw = ZIF_BW_LIST[i];
-                break;
-            }
+    /* Smallest valid bw_khz that is >= span_khz. */
+    for (i = 0; i < (int)(sizeof(ZIF_BW_LIST) / sizeof(ZIF_BW_LIST[0])); i++) {
+        if ((double)ZIF_BW_LIST[i] >= span_khz) {
+            chosen_bw = ZIF_BW_LIST[i];
+            break;
         }
-        chosen_if = 0;
+    }
+    chosen_if = 0;
 
-        /* Lowest Zero-IF sample rate offering that bw_khz. */
-        for (i = 0; i < NUM_VALID_COMBOS; i++) {
-            const ValidCombo *c = &VALID_COMBOS[i];
-            if (c->if_khz != 0 || c->bw_khz != chosen_bw) continue;
-            if (chosen_adc_hz == 0.0 || c->adc_rate_hz < chosen_adc_hz) {
-                chosen_adc_hz = c->adc_rate_hz;
-                chosen_output_hz = c->output_rate_hz;
-            }
+    /* Lowest Zero-IF sample rate offering that bw_khz. Used for both
+     * single-tuner and dual/Master-Slave sessions - see the note above. */
+    for (i = 0; i < NUM_VALID_COMBOS; i++) {
+        const ValidCombo *c = &VALID_COMBOS[i];
+        if (c->if_khz != 0 || c->bw_khz != chosen_bw) continue;
+        if (chosen_adc_hz == 0.0 || c->adc_rate_hz < chosen_adc_hz) {
+            chosen_adc_hz = c->adc_rate_hz;
+            chosen_output_hz = c->output_rate_hz;
         }
     }
 
@@ -15049,26 +18585,20 @@ static void settings_calc_range(void)
 
     {
         char buf[32];
-        snprintf(buf, sizeof(buf), "%.6g", g_settings_cfg.frequency_hz / 1e6);
+        format_mhz_min3(g_settings_cfg.frequency_hz, buf, sizeof(buf));
         SetWindowTextA(g_hSetDualT1Freq, buf);
     }
     settings_select_ratecombo_for_current();
 
-    if (dual) {
-        snprintf(hint, sizeof(hint),
-            "Tuner A CF=%.6g MHz, IF=%d kHz, BW=%d kHz, SR=%.1f Msps, decim=%d -> %.0f kHz output, "
-            "covers %.0f-%.0f kHz. Shared by both tuners - set Tuner B's own frequency separately if "
-            "it differs.",
-            g_settings_cfg.frequency_hz / 1e6, chosen_if, chosen_bw, chosen_adc_hz / 1e6,
-            g_settings_cfg.decimation, chosen_output_hz / g_settings_cfg.decimation / 1e3,
-            centre_khz - (double)chosen_bw / 2.0, centre_khz + (double)chosen_bw / 2.0);
-    } else {
-        snprintf(hint, sizeof(hint),
-            "CF=%.6g MHz, BW=%d kHz, SR=%.1f Msps, decim=%d -> %.0f kHz output, covers %.0f-%.0f kHz.",
-            g_settings_cfg.frequency_hz / 1e6, chosen_bw, chosen_adc_hz / 1e6,
-            g_settings_cfg.decimation, chosen_output_hz / g_settings_cfg.decimation / 1e3,
-            centre_khz - (double)chosen_bw / 2.0, centre_khz + (double)chosen_bw / 2.0);
-    }
+    /* dual is always false here - the guard at the top of this function
+     * already returns early whenever both tuners are checked, since this
+     * calculator only ever searches Zero-IF combinations. Single-tuner
+     * only from this point on.                                           */
+    snprintf(hint, sizeof(hint),
+        "CF=%.6g MHz, BW=%d kHz, SR=%.1f Msps, decim=%d -> %.0f kHz output, covers %.0f-%.0f kHz.",
+        g_settings_cfg.frequency_hz / 1e6, chosen_bw, chosen_adc_hz / 1e6,
+        g_settings_cfg.decimation, chosen_output_hz / g_settings_cfg.decimation / 1e3,
+        centre_khz - (double)chosen_bw / 2.0, centre_khz + (double)chosen_bw / 2.0);
     SetWindowTextA(g_hSetRangeHint, hint);
     InvalidateRect(g_hSetRangeHint, NULL, TRUE);
 }
@@ -15083,8 +18613,51 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         HDC dc = (HDC)wp;
         if ((HWND)lp == g_hSetHdrHint)
             SetTextColor(dc, g_settings_hdr_freq_valid ? COL_SEG_GREEN : COL_SEG_RED);
+        else if ((HWND)lp == g_hSetGithubLink || (HWND)lp == g_hSetEmailLink)
+            /* Reads as a clickable link rather than plain text - same
+             * cyan already used for "values" elsewhere in this dialog
+             * (COL_ACCENT), which also has the right connotation here. */
+            SetTextColor(dc, COL_ACCENT);
+        else if ((HWND)lp == g_hSetDualT1Freq || (HWND)lp == g_hSetFreqB ||
+                 (HWND)lp == g_hSetSchedFreq  || (HWND)lp == g_hSetSchedFreqB)
+            /* CF fields (Receiver tab Tuner 1/2, and Scheduler's mirrored
+             * Frequency 1/2) - a distinct colour of their own rather than
+             * plain COL_TEXT, so the value that actually matters most in
+             * this dialog stands out at a glance. Darkened (COL_CF_VALUE_
+             * DIM) specifically when genuinely disabled (the deselected
+             * Tuner's own field, EnableWindow(FALSE) via settings_set_
+             * edit_readonly() in settings_update_dual_enable_state()) -
+             * replacing Windows' own default disabled-edit grey, which
+             * read too light/bright against this dark theme. The
+             * Scheduler fields never take this branch: they're read-only
+             * via ES_READONLY when synced, not disabled (see
+             * settings_schedule_apply_freq_sync()), specifically so they
+             * keep the normal enabled colour instead of greying out -
+             * "can't be typed into" without looking unavailable.         */
+            SetTextColor(dc, IsWindowEnabled((HWND)lp) ? COL_CF_VALUE : COL_CF_VALUE_DIM);
+        else if ((HWND)lp == g_hSetJaguarWarnRec || (HWND)lp == g_hSetJaguarWarnRec2 ||
+                 (HWND)lp == g_hSetJaguarWarnDev || (HWND)lp == g_hSetJaguarWarnDev2 ||
+                 (HWND)lp == g_hSetPerseusWarnRec || (HWND)lp == g_hSetPerseusWarnRec2 ||
+                 (HWND)lp == g_hSetPerseusWarnDev || (HWND)lp == g_hSetPerseusWarnDev2)
+            SetTextColor(dc, COL_SEG_RED);
+        else if ((HWND)lp == g_hSetCoherentFormatWarn || (HWND)lp == g_hSetCoherentFormatWarn2)
+            /* Amber rather than the Jaguar/Perseus warnings' red - this
+             * one isn't quite the same severity (it's telling you the
+             * format needs changing or the frequencies need to differ,
+             * not that a rate is subtly wrong in a way that could go
+             * unnoticed), so a different bright colour keeps the two
+             * kinds of warning visually distinct from each other.       */
+            SetTextColor(dc, COL_SEG_AMBER);
         else if ((HWND)lp == g_hSetCoherentLbl)
             SetTextColor(dc, RGB(10, 245, 25));   /* exact match to the main window's COHERENT text */
+        else if ((HWND)lp == g_hSetSchedMsNote1 || (HWND)lp == g_hSetSchedMsNote2 ||
+                 (HWND)lp == g_hSetSchedMsNote3)
+            /* Informational rather than a warning about anything wrong
+             * with the current settings - COL_ACCENT (the same cyan
+             * used for values/accents elsewhere) rather than the amber/
+             * red used for the two warnings above, so it doesn't read
+             * as "something needs fixing" the way those do.             */
+            SetTextColor(dc, COL_ACCENT);
         else if (settings_check_is_dim((HWND)lp))
             /* Tuner 2 / Same as T1 (GR, LNA) / Tuner 2: same AGC.../ -
              * currently not clickable (see settings_set_check_dim()) but
@@ -15104,7 +18677,7 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         LPDRAWITEMSTRUCT di = (LPDRAWITEMSTRUCT)lp;
         if (di->CtlType == ODT_BUTTON &&
                 (di->CtlID == IDC_SET_SAVE || di->CtlID == IDC_SET_CANCEL ||
-                 di->CtlID == IDC_BTN_RANGE_CALC)) {
+                 di->CtlID == IDC_BTN_RANGE_CALC || di->CtlID == IDC_BTN_AUTO_CAL)) {
             int dis  = (di->itemState & ODS_DISABLED) != 0;
             int down = (di->itemState & ODS_SELECTED) != 0;
             COLORREF face = (di->CtlID == IDC_SET_SAVE)
@@ -15222,7 +18795,26 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         case IDC_SET_FREQ_B:
             if (HIWORD(wp) == EN_CHANGE) {
                 settings_update_hdr_hint();
-                settings_update_coherent_indicator();
+                /* Full refresh, not just the indicator - whether the two
+                 * CFs match now also decides which sample rates the
+                 * dropdown offers (settings_update_dual_enable_state()'s
+                 * own comment on this), so a frequency edit needs to
+                 * re-run that whole check, not just the COHERENT label. */
+                settings_update_dual_enable_state();
+            } else if (HIWORD(wp) == EN_KILLFOCUS) {
+                /* Reformats to format_mhz_min3()'s minimum-3-decimal style
+                 * the moment the field loses focus, same as what already
+                 * happens when a value is loaded from duodx.ini - without
+                 * this, a value typed by hand (15.35) stayed exactly as
+                 * typed instead of picking up the trailing zero (15.350)
+                 * every programmatically-set value already gets.          */
+                char buf[32];
+                HWND h = (HWND)lp;
+                GetWindowTextA(h, buf, sizeof(buf));
+                if (buf[0] != '\0') {
+                    format_mhz_min3(atof(buf) * 1e6, buf, sizeof(buf));
+                    SetWindowTextA(h, buf);
+                }
             }
             return 0;
         case IDC_SET_HOURLY_START:
@@ -15258,8 +18850,52 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 settings_update_hdr_hint();
             }
             return 0;
+        case IDC_SET_DUALT1_ANTENNA:
+            if (HIWORD(wp) == CBN_SELCHANGE || HIWORD(wp) == CBN_EDITCHANGE)
+                settings_update_bias_t_state();
+            return 0;
+        case IDC_SET_SCHED_FREQ:
+        case IDC_SET_SCHED_FREQ_B:
+            /* Same reformat-on-blur as IDC_SET_DUALT1_FREQ/IDC_SET_FREQ_B
+             * above - see that case's comment.                            */
+            if (HIWORD(wp) == EN_KILLFOCUS) {
+                char buf[32];
+                HWND h = (HWND)lp;
+                GetWindowTextA(h, buf, sizeof(buf));
+                if (buf[0] != '\0') {
+                    format_mhz_min3(atof(buf) * 1e6, buf, sizeof(buf));
+                    SetWindowTextA(h, buf);
+                }
+            }
+            return 0;
+        case IDC_SET_BIAST:
+            if (HIWORD(wp) == BN_CLICKED && settings_check_is_dim(g_hSetBiasT)) {
+                /* Antenna/tuner combination doesn't support Bias-T -
+                 * revert the click rather than letting it take effect.   */
+                SendMessageA(g_hSetBiasT, BM_SETCHECK, BST_UNCHECKED, 0);
+                return 0;
+            }
+            return 0;
+        case IDC_SET_GITHUB_LINK:
+            if (HIWORD(wp) == STN_CLICKED)
+                ShellExecuteA(g_hSettingsWnd, "open",
+                              "https://github.com/45south/DuoDX-recorder/releases",
+                              NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        case IDC_SET_EMAIL_LINK:
+            if (HIWORD(wp) == STN_CLICKED)
+                ShellExecuteA(g_hSettingsWnd, "open",
+                              "mailto:daveheadland@outlook.com",
+                              NULL, NULL, SW_SHOWNORMAL);
+            return 0;
         case IDC_SET_HDR:
             if (HIWORD(wp) == BN_CLICKED) {
+                if (settings_check_is_dim(g_hSetHdr)) {
+                    /* Dual channel active, or not an RSPdx/RSPdx R2 -
+                     * not actually selectable, revert the click.         */
+                    SendMessageA(g_hSetHdr, BM_SETCHECK, BST_UNCHECKED, 0);
+                    return 0;
+                }
                 settings_update_dual_enable_state();
                 settings_update_hdr_hint();
             }
@@ -15281,6 +18917,29 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             return 0;
         case IDC_SET_RATECOMBO:
             if (HIWORD(wp) == CBN_SELCHANGE) {
+                /* Apply the newly-picked combo to g_settings_cfg right
+                 * away, before anything below re-populates/re-selects
+                 * this same combo based on it - otherwise that refresh
+                 * reads the still-old sample_rate_hz/if_khz/bw_khz and
+                 * immediately re-selects whatever was picked before,
+                 * undoing this click before it ever takes visible
+                 * effect. */
+                {
+                    LRESULT rsel = SendMessageA(g_hSetRateCombo, CB_GETCURSEL, 0, 0);
+                    if (rsel != CB_ERR) {
+                        char rsel_text[128];
+                        int ri;
+                        SendMessageA(g_hSetRateCombo, CB_GETLBTEXT, (WPARAM)rsel,
+                                     (LPARAM)rsel_text);
+                        for (ri = 0; ri < NUM_VALID_COMBOS; ri++) {
+                            if (strcmp(VALID_COMBOS[ri].note, rsel_text) != 0) continue;
+                            g_settings_cfg.sample_rate_hz = VALID_COMBOS[ri].adc_rate_hz;
+                            g_settings_cfg.if_khz         = VALID_COMBOS[ri].if_khz;
+                            g_settings_cfg.bw_khz         = VALID_COMBOS[ri].bw_khz;
+                            break;
+                        }
+                    }
+                }
                 /* A different Sample Rate/IF/BW combo just got picked -
                  * any decimation left over from a previous combo no
                  * longer means what it used to (it can silently shrink
@@ -15290,7 +18949,12 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                  * it doesn't itself generate another CBN_SELCHANGE and
                  * loop back here.                                        */
                 if (g_hSetDecim) SendMessageA(g_hSetDecim, CB_SETCURSEL, 0, 0);
+                settings_update_format_dependent_state();
             }
+            return 0;
+        case IDC_SET_DECIM:
+            if (HIWORD(wp) == CBN_SELCHANGE)
+                settings_update_format_dependent_state();
             return 0;
         case IDC_SET_GR_B_SAME:
         case IDC_SET_LNA_B_SAME:
@@ -15360,11 +19024,20 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             return 0;
         case IDC_SET_SCHED_ADD:
             if (HIWORD(wp) == BN_CLICKED) {
+                /* Captured before the memset below clears it along with
+                 * everything else in the new entry - carries the
+                 * checkbox's current state (whatever it was showing for
+                 * the entry just being left) forward as the new entry's
+                 * own starting freq_sync, rather than it always resetting
+                 * to unchecked and needing to be manually re-ticked for
+                 * every single entry added.                              */
+                int sticky_sync = SendMessageA(g_hSetSchedFreqSync, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 settings_schedule_save_current_to_array();
                 if (g_settings_schedule_count < MAX_SCHEDULE_ENTRIES) {
                     g_settings_schedule_idx = g_settings_schedule_count;
                     memset(&g_settings_schedule[g_settings_schedule_idx], 0,
                            sizeof(ScheduleEntry));
+                    g_settings_schedule[g_settings_schedule_idx].freq_sync = sticky_sync;
                     g_settings_schedule_count++;
                     settings_schedule_load_current_from_array();
                 }
@@ -15382,8 +19055,45 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 settings_schedule_load_current_from_array();
             }
             return 0;
+        case IDC_SET_SCHED_FREQ_SYNC:
+            if (HIWORD(wp) == BN_CLICKED)
+                settings_schedule_apply_freq_sync();
+            return 0;
         case IDC_BTN_RANGE_CALC:
-            if (HIWORD(wp) == BN_CLICKED) settings_calc_range();
+            if (HIWORD(wp) == BN_CLICKED) {
+                settings_calc_range();
+                /* settings_calc_range() can change the Sample Rate/IF/BW
+                 * selection via CB_SETCURSEL, which doesn't itself fire
+                 * CBN_SELCHANGE - refresh explicitly so the Jaguar rate
+                 * warning reflects whatever it just picked.              */
+                settings_update_format_dependent_state();
+            }
+            return 0;
+        case IDC_BTN_AUTO_CAL:
+            if (HIWORD(wp) == BN_CLICKED) {
+                /* Same gating as the OFFSET display itself (see the
+                 * paint code) - only makes sense to zero out a reading
+                 * that's actually showing and trustworthy right now.     */
+                if (g_monitor.enabled && g_monitor.carrier_offset_valid_pub[g_monitor.tuner_sel] &&
+                        g_monitor.carrier_settled_pub[g_monitor.tuner_sel]) {
+                    /* The correction that would bring the CURRENT raw
+                     * measurement to exactly zero is just its own
+                     * negation - any calibration already in the field
+                     * doesn't matter here, since it's a plain additive
+                     * term either way (see the field's own comment).     */
+                    char buf[32];
+                    double new_calib = -(double)g_monitor.carrier_offset_hz_pub[g_monitor.tuner_sel];
+                    snprintf(buf, sizeof(buf), "%.5f", new_calib);
+                    SetWindowTextA(g_hSetCarrierCalib, buf);
+                } else {
+                    MessageBoxA(hwnd,
+                        "No valid, settled OFFSET reading right now - tune "
+                        "to a steady reference signal, make sure Monitor is "
+                        "on and the OFFSET display is actually showing, "
+                        "then try again.",
+                        "Auto Calibrate", MB_OK | MB_ICONINFORMATION);
+                }
+            }
             return 0;
         case IDC_SET_SAVE:
             settings_save();
@@ -15416,6 +19126,14 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY: {
+        /* Remember where it was for next time it's opened this session -
+         * see g_settings_last_x/y's own comment for why this isn't
+         * persisted to duodx.ini.                                       */
+        RECT wr;
+        if (GetWindowRect(hwnd, &wr)) {
+            g_settings_last_x = wr.left;
+            g_settings_last_y = wr.top;
+        }
         /* SetProp entries must be removed before the window goes away or
          * they leak - each tagged control had one added by
          * settings_tag_tab() while the dialog was being built. */
@@ -15544,6 +19262,22 @@ static LRESULT CALLBACK time_edit_subclass_proc(HWND hwnd, UINT msg,
         if (ch >= '0' && ch <= '9') {
             char buf[2];
             int newpos;
+            int textlen = GetWindowTextLengthA(hwnd);
+            if (textlen != field_len) {
+                /* The field doesn't yet hold the fixed "00:00:00"/"00:00"
+                 * template this whole overwrite-in-place scheme depends
+                 * on - most commonly a brand-new schedule entry, whose
+                 * start_time legitimately starts as "" (meaning "start
+                 * immediately after the previous entry", not a bug - see
+                 * the ScheduleEntry struct comment). Without this, typing
+                 * into an empty field has no existing colon characters to
+                 * preserve/skip over, so they never appear no matter what
+                 * gets typed - establish the template now, on the first
+                 * keystroke, then start filling in from position 0.      */
+                const char *tmpl = (field_len == 8) ? "00:00:00" : "00:00";
+                SendMessageA(hwnd, WM_SETTEXT, 0, (LPARAM)tmpl);
+                pos = 0;
+            }
             if (pos == colon_a || pos == colon_b) pos++;  /* typed "on" a colon = next slot */
             if (pos >= field_len) return 0;               /* field already full */
             if (!time_edit_digit_ok(hwnd, pos, ch)) return 0; /* would make an invalid time */
@@ -15630,6 +19364,19 @@ static LRESULT CALLBACK wheel_reversed_subclass_proc(HWND hwnd, UINT msg,
         return CallWindowProcA(orig, hwnd, msg, inverted, lp);
     }
 
+    if (msg == WM_SETFOCUS) {
+        /* Suppress the dotted/solid focus-rectangle outline these
+         * sliders otherwise draw around themselves once clicked or
+         * tabbed to - purely cosmetic (arrow-key/Page Up/Down keyboard
+         * adjustment still works exactly the same; only the visible
+         * outline is hidden). Let the control process focus normally
+         * first, then tell it to hide the focus cue.                    */
+        LRESULT r = CallWindowProcA(orig, hwnd, msg, wp, lp);
+        SendMessageA(hwnd, WM_UPDATEUISTATE,
+                     MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
+        return r;
+    }
+
     return CallWindowProcA(orig, hwnd, msg, wp, lp);
 }
 
@@ -15690,6 +19437,7 @@ static HWND settings_mk_check(HWND parent, HINSTANCE hInst, int id,
     return h;
 }
 
+
 /* Applies the OS dark visual style to a control - loaded dynamically so
  * the app still runs fine without uxtheme (just keeps default colours). */
 static void settings_apply_dark_theme(HWND h)
@@ -15720,6 +19468,11 @@ static void settings_select_tab(int tab_idx)
     for (i = 0; i < 7; i++)
         if (g_hSetTabBtn[i]) InvalidateRect(g_hSetTabBtn[i], NULL, TRUE);
     if (tab_idx == 0) settings_update_coherent_indicator();
+    /* Picks up any Receiver tab edit made before switching over here -
+     * without this, the Schedule tab's synced frequency fields could
+     * show a stale value from whenever sync was last (re)applied,
+     * rather than whatever the Receiver tab currently actually says.     */
+    if (tab_idx == 5) settings_schedule_apply_freq_sync();
     /* Re-apply the format-dependent override on top of the generic tab
      * show/hide above - settings_select_tab() alone would show this
      * control on Recording regardless of output format, and hide it on
@@ -15742,6 +19495,29 @@ static void open_settings_dialog(HWND parent)
         SetForegroundWindow(g_hSettingsWnd);
         return;
     }
+
+    /* g_set_check_dim_hwnd[]/g_set_check_dim_state[] (settings_set_check_
+     * dim()) are plain static globals, not cleared when this dialog's
+     * controls are destroyed on close - reused Settings sessions create
+     * entirely new HWNDs for the same six logical controls (Tuner 2,
+     * Same-as-T1 x2, Bias-T, HDR, the same-AGC/DC/IQ row), but the array
+     * only holds six slots, already filled with the PREVIOUS instance's
+     * now-stale HWNDs. If a new HWND doesn't happen to match one of those
+     * stale entries, settings_set_check_dim() finds neither a match nor
+     * an empty slot and silently does nothing - settings_check_is_dim()
+     * then always reports "not dimmed" for that control from then on,
+     * regardless of what actually computed it should be. Confirmed as
+     * the real cause of Bias-T (and potentially any of the other five)
+     * intermittently showing available when it shouldn't: the log showed
+     * the availability check itself computing the right answer every
+     * time, but the array silently failed to record it whenever this was
+     * a second-or-later dialog open with different HWNDs than the first.
+     * Clearing the whole array here, once per fresh dialog open, gives
+     * each instance's controls a clean set of slots to claim as their
+     * own values get computed below, rather than competing with a
+     * previous instance's leftovers for six already-exhausted slots.     */
+    memset(g_set_check_dim_hwnd, 0, sizeof(g_set_check_dim_hwnd));
+    memset(g_set_check_dim_state, 0, sizeof(g_set_check_dim_state));
 
     if (!g_worker_active && !g_device_busy) {
         /* Only safe to probe the API when nothing else has it open. If a
@@ -15781,7 +19557,7 @@ static void open_settings_dialog(HWND parent)
         ini_patch_values("duodx.ini", duo_fix, duo_fix_n);
         LOG_WARN("dual_channel/rspduo_single_tuner=B in duodx.ini looked "
                  "left over from a different (RSPduo) device - reset to "
-                 "single-tuner A for this one.");
+                 "single-tuner 1 for this one.");
         }
     }
 
@@ -15803,11 +19579,15 @@ static void open_settings_dialog(HWND parent)
 
     GetWindowRect(parent, &pr);
 
-    g_hSettingsWnd = CreateWindowExA(WS_EX_DLGMODALFRAME, "DuoDXSettingsWindow",
-        "DuoDX Settings",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        pr.left + 40, pr.top + 40, win_w, win_h,
-        parent, NULL, hInst, NULL);
+    {
+        int wx = (g_settings_last_x != INT_MIN) ? g_settings_last_x : pr.left + 40;
+        int wy = (g_settings_last_y != INT_MIN) ? g_settings_last_y : pr.top + 40;
+        g_hSettingsWnd = CreateWindowExA(WS_EX_DLGMODALFRAME, "DuoDXSettingsWindow",
+            "DuoDX Settings",
+            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            wx, wy, win_w, win_h,
+            parent, NULL, hInst, NULL);
+    }
     if (!g_hSettingsWnd) return;
 
     x = 16; row = 34;
@@ -15929,14 +19709,20 @@ static void open_settings_dialog(HWND parent)
                                    "Hi-Z Notch (RSPduo Tuner 1)", x, y0, 260);
     y0 += row;
 
+    /* Blank row - visually separates Tuner 1's settings above from the
+     * Tuner 2 checkbox and its own settings below, which otherwise ran
+     * straight into each other with nothing to mark where one tuner's
+     * block ends and the other's begins.                                */
+    y0 += row;
+
     g_hSetBSameCorr = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_B_SAME_CORR,
         "Tuner 2: same AGC/DC/IQ/notch settings as Tuner 1", x, y0, 400);
     y0 += row;
 
-    /* Tuner B's own AGC/DC/IQ/notch controls - only relevant (and only
+    /* Tuner 2's own AGC/DC/IQ/notch controls - only relevant (and only
      * ever shown) when the checkbox above is unchecked; see
      * settings_update_dual_enable_state() for the show/hide logic. Same
-     * three-then-two layout as Tuner A's own controls above.             */
+     * three-then-two layout as Tuner 1's own controls above.             */
     g_hSetAgcB = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_AGC_B,
                                     "AGC Enable", x, y0, 145);
     g_hSetDcB = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_DC_B,
@@ -15979,6 +19765,52 @@ static void open_settings_dialog(HWND parent)
     settings_tag_tab(g_hSetRateCombo);
     y0 += row;
 
+    /* Decimation lives here rather than on the Recording tab - it's an
+     * extra factor applied on top of whatever the Sample Rate / IF / BW
+     * combo above already selects (Section 5.4), so it reads more
+     * naturally right underneath that control than on a separate tab.
+     * The Frequency Range calculator below also resets this to 1 (off)
+     * whenever it applies a new combination, for the same reason.       */
+    settings_mk_label(g_hSettingsWnd, hInst, "Decimation", x, y0, label_w);
+    g_hSetDecim = CreateWindowExA(0, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
+                ctl_x, y0 - 2, ctl_w, 22 + 120,
+                g_hSettingsWnd, (HMENU)(INT_PTR)IDC_SET_DECIM, hInst, NULL);
+    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"1 (off)");
+    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"2");
+    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"4");
+    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"8");
+    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"16");
+    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"32");
+    if (g_hFontUI) SendMessageA(g_hSetDecim, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    settings_apply_dark_theme(g_hSetDecim);
+    settings_tag_tab(g_hSetDecim);
+    y0 += row;
+
+    /* Jaguar and Perseus each only ever run at their own fixed set of
+     * sample rates, so at most one of these two warnings is ever visible
+     * at a time (settings_update_format_dependent_state() shows/hides
+     * them based on which format is actually selected). Both pairs sit
+     * at the exact same position rather than one stacked below the
+     * other - previously Perseus's copy was laid out beneath Jaguar's,
+     * so the warning visibly jumped to a different height depending on
+     * which format happened to be selected, even though only one is
+     * ever on screen at once.                                           */
+    g_hSetJaguarWarnDev = settings_mk_label(g_hSettingsWnd, hInst,
+        "Warning: Jaguar output format expects exactly 1.6 or 2.0 Msps -",
+        x, y0, win_w - x - 16);
+    g_hSetPerseusWarnDev = settings_mk_label(g_hSettingsWnd, hInst,
+        "Warning: Perseus output format expects exactly 125k/250k/500k/1M/2M sps -",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    g_hSetJaguarWarnDev2 = settings_mk_label(g_hSettingsWnd, hInst,
+        "other rates may misread as the wrong duration in some software.",
+        x, y0, win_w - x - 16);
+    g_hSetPerseusWarnDev2 = settings_mk_label(g_hSettingsWnd, hInst,
+        "other rates may misread as the wrong duration in some software.",
+        x, y0, win_w - x - 16);
+    y0 += row;
+
     /* Frequency-range helper: given a start/end range in MHz (matching the
      * Frequency field's own units above), computes and applies the
      * smallest sufficient bandwidth, the lowest sample rate that offers
@@ -16007,7 +19839,7 @@ static void open_settings_dialog(HWND parent)
      * a shorter-than-needed control just clips anything past its own
      * height rather than showing it, so the control itself needs the
      * room for the longest message (the dual-tuner-mode one, which adds
-     * a reminder about Tuner B) ever to be fully visible. */
+     * a reminder about Tuner 2) ever to be fully visible. */
     g_hSetRangeHint = CreateWindowExA(0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                         x, y0, win_w - x - 16, 54, g_hSettingsWnd, NULL, hInst, NULL);
     if (g_hFontUI) SendMessageA(g_hSetRangeHint, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
@@ -16057,22 +19889,6 @@ static void open_settings_dialog(HWND parent)
                        ctl_x + 98, y0 + 1, 150);
     y0 += row;
 
-    settings_mk_label(g_hSettingsWnd, hInst, "Decimation", x, y0, label_w);
-    g_hSetDecim = CreateWindowExA(0, "COMBOBOX", "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
-                ctl_x, y0 - 2, ctl_w, 22 + 120,
-                g_hSettingsWnd, (HMENU)(INT_PTR)IDC_SET_DECIM, hInst, NULL);
-    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"1 (off)");
-    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"2");
-    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"4");
-    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"8");
-    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"16");
-    SendMessageA(g_hSetDecim, CB_ADDSTRING, 0, (LPARAM)"32");
-    if (g_hFontUI) SendMessageA(g_hSetDecim, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
-    settings_apply_dark_theme(g_hSetDecim);
-    settings_tag_tab(g_hSetDecim);
-    y0 += row;
-
     settings_mk_label(g_hSettingsWnd, hInst, "Output Format", x, y0, label_w);
     g_hSetFormat = CreateWindowExA(0, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -16083,9 +19899,46 @@ static void open_settings_dialog(HWND parent)
     SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"SDRuno");
     SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"SDRconnect");
     SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"Winrad");
+    SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"Perseus");
+    SendMessageA(g_hSetFormat, CB_ADDSTRING, 0, (LPARAM)"Jaguar");
     if (g_hFontUI) SendMessageA(g_hSetFormat, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
     settings_apply_dark_theme(g_hSetFormat);
     settings_tag_tab(g_hSetFormat);
+    y0 += row;
+
+    /* Same warning as the Device tab's copy (see the comment on
+     * settings_update_format_dependent_state()), shown right next to the
+     * format choice itself since that's the more natural place to catch
+     * it if the rate was already set correctly beforehand. Jaguar's and
+     * Perseus's copies share the same position for the same reason as
+     * the Device tab's copies do - see the comment there.               */
+    g_hSetJaguarWarnRec = settings_mk_label(g_hSettingsWnd, hInst,
+        "Warning: Jaguar output format expects exactly 1.6 or 2.0 Msps -",
+        x, y0, win_w - x - 16);
+    g_hSetPerseusWarnRec = settings_mk_label(g_hSettingsWnd, hInst,
+        "Warning: Perseus output format expects exactly 125k/250k/500k/1M/2M sps -",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    g_hSetJaguarWarnRec2 = settings_mk_label(g_hSettingsWnd, hInst,
+        "other rates may misread as the wrong duration in some software.",
+        x, y0, win_w - x - 16);
+    g_hSetPerseusWarnRec2 = settings_mk_label(g_hSettingsWnd, hInst,
+        "other rates may misread as the wrong duration in some software.",
+        x, y0, win_w - x - 16);
+    y0 += row;
+
+    /* Same-CF dual ("COHERENT" on the Receiver tab) only records as one
+     * interleaved file in Linrad or WavViewDX - shown/hidden live by
+     * settings_update_coherent_indicator(), covering the Receiver tab's
+     * tuner/frequency fields and this tab's own format choice with the
+     * same check.                                                       */
+    g_hSetCoherentFormatWarn = settings_mk_label(g_hSettingsWnd, hInst,
+        "Warning: same-CF dual (COHERENT) only records as one file in Linrad or",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    g_hSetCoherentFormatWarn2 = settings_mk_label(g_hSettingsWnd, hInst,
+        "WavViewDX - pick different frequencies, a single tuner, or one of those.",
+        x, y0, win_w - x - 16);
     y0 += row;
 
     /* SDRuno and SDR Connect only: how to handle a recording that would
@@ -16115,16 +19968,6 @@ static void open_settings_dialog(HWND parent)
 
     g_hSetSpinupEn = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_SPINUP_EN,
                                         "Disk Spin-Up Before Recording", x, y0, 260);
-    g_hSetSpinupBytes = CreateWindowExA(0, "COMBOBOX", "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
-                x + 270, y0 - 2, 100, 22 + 80,
-                g_hSettingsWnd, (HMENU)(INT_PTR)IDC_SET_SPINUP_BYTES, hInst, NULL);
-    SendMessageA(g_hSetSpinupBytes, CB_ADDSTRING, 0, (LPARAM)"1 MB");
-    SendMessageA(g_hSetSpinupBytes, CB_ADDSTRING, 0, (LPARAM)"4 MB");
-    SendMessageA(g_hSetSpinupBytes, CB_ADDSTRING, 0, (LPARAM)"8 MB");
-    if (g_hFontUI) SendMessageA(g_hSetSpinupBytes, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
-    settings_apply_dark_theme(g_hSetSpinupBytes);
-    settings_tag_tab(g_hSetSpinupBytes);
     y0 += row;
 
     y_rec = y0;
@@ -16140,6 +19983,41 @@ static void open_settings_dialog(HWND parent)
      * actively recording, which meant there was no way to reach it then. */
     g_hSetMonVisible = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_MON_VISIBLE,
                                           "Show Monitor Controls", x, y0, 260);
+    y0 += row;
+
+    g_hSetShowOffset = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_SHOW_OFFSET,
+                                          "Show Carrier Offset once locked", x, y0, 260);
+    y0 += row;
+
+    settings_mk_label(g_hSettingsWnd, hInst, "Calibration (Hz)", x, y0, label_w);
+    g_hSetCarrierCalib = settings_mk_edit(g_hSettingsWnd, hInst, IDC_SET_CARRIER_CALIB,
+                                           ctl_x, y0 - 2, ctl_w);
+    g_hBtnAutoCal = CreateWindowExA(0, "BUTTON", "Auto Calibrate",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                ctl_x + ctl_w + 10, y0 - 2, 130, 24,
+                g_hSettingsWnd, (HMENU)(INT_PTR)IDC_BTN_AUTO_CAL, hInst, NULL);
+    if (g_hFontUI) SendMessageA(g_hBtnAutoCal, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    settings_tag_tab(g_hBtnAutoCal);
+    y0 += row;
+    settings_mk_label(g_hSettingsWnd, hInst,
+        "Auto Calibrate: tune to a steady, known-frequency reference (e.g. a GPSDO), wait for",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    settings_mk_label(g_hSettingsWnd, hInst,
+        "the OFFSET display to settle, then click - fills in the correction needed to bring",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    settings_mk_label(g_hSettingsWnd, hInst,
+        "that reading to exactly .00000. Small +/- correction against a known reference (e.g.",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    settings_mk_label(g_hSettingsWnd, hInst,
+        "+0.0007 or -0.00092) - only ever adjusts the OFFSET display, never the actual IQ",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    settings_mk_label(g_hSettingsWnd, hInst,
+        "recording or the measurement itself.",
+        x, y0, win_w - x - 16);
     y0 += row;
 
     settings_mk_label(g_hSettingsWnd, hInst, "S-Meter Mode", x, y0, label_w);
@@ -16251,10 +20129,27 @@ static void open_settings_dialog(HWND parent)
     apply_time_edit_subclass(g_hSetSchedDuration, 8, 1, 0);  /* duration - hours unrestricted */
     y0 += row;
 
-    settings_mk_label(g_hSettingsWnd, hInst, "Frequency A (MHz)", x, y0, label_w);
+    settings_mk_label(g_hSettingsWnd, hInst, "Frequency 1 (MHz)", x, y0, label_w);
     g_hSetSchedFreq = settings_mk_edit(g_hSettingsWnd, hInst, IDC_SET_SCHED_FREQ, ctl_x, y0 - 2, 90);
-    settings_mk_label(g_hSettingsWnd, hInst, "Frequency B (MHz)", ctl_x + 100, y0, 140);
+    settings_mk_label(g_hSettingsWnd, hInst, "Frequency 2 (MHz)", ctl_x + 100, y0, 140);
     g_hSetSchedFreqB = settings_mk_edit(g_hSettingsWnd, hInst, IDC_SET_SCHED_FREQ_B, ctl_x + 250, y0 - 2, 90);
+    y0 += row;
+
+    g_hSetSchedFreqSync = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_SCHED_FREQ_SYNC,
+        "Use current Receiver tab frequencies for this entry", x, y0, 320);
+    y0 += row;
+
+    g_hSetSchedMsNote1 = settings_mk_label(g_hSettingsWnd, hInst,
+        "Note: different Tuner 1/Tuner 2 frequencies (Master/Slave) only take effect",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    g_hSetSchedMsNote2 = settings_mk_label(g_hSettingsWnd, hInst,
+        "starting with the first entry - switching into or out of",
+        x, y0, win_w - x - 16);
+    y0 += row;
+    g_hSetSchedMsNote3 = settings_mk_label(g_hSettingsWnd, hInst,
+        "Master/Slave partway through a schedule isn't supported yet.",
+        x, y0, win_w - x - 16);
     y0 += row;
 
     settings_mk_label(g_hSettingsWnd, hInst, "Antenna", x, y0, label_w);
@@ -16323,8 +20218,7 @@ static void open_settings_dialog(HWND parent)
     y0 += row;
 
     settings_mk_label(g_hSettingsWnd, hInst,
-        "Takes effect the next time DuoDX starts - the same as sample rate, "
-        "dual channel, and HDR (Section 5, Section 7, Section 12.3).",
+        "Takes effect next time DuoDX starts.",
         x, y0, win_w - x - 16);
     y0 += row;
 
@@ -16372,6 +20266,30 @@ static void open_settings_dialog(HWND parent)
 
     g_hSetShowSun = settings_mk_check(g_hSettingsWnd, hInst, IDC_SET_SHOW_SUN,
                                        "Show Sunrise/Sunset on main window", x, y0, 300);
+    y0 += row;
+
+    /* Extra gap before the two links below, so they read as a separate
+     * footer rather than just another row of settings.                   */
+    y0 += row;
+
+    g_hSetGithubLink = settings_mk_label(g_hSettingsWnd, hInst,
+        "Check for updates: https://github.com/45south/DuoDX-recorder/releases",
+        x, y0, win_w - x - 16);
+    {
+        LONG_PTR gwl = GetWindowLongPtrA(g_hSetGithubLink, GWL_STYLE);
+        SetWindowLongPtrA(g_hSetGithubLink, GWL_STYLE, gwl | SS_NOTIFY);
+        SetWindowLongPtrA(g_hSetGithubLink, GWLP_ID, IDC_SET_GITHUB_LINK);
+    }
+    y0 += row;
+
+    g_hSetEmailLink = settings_mk_label(g_hSettingsWnd, hInst,
+        "Bug reports and comments: daveheadland@outlook.com",
+        x, y0, win_w - x - 16);
+    {
+        LONG_PTR gwl = GetWindowLongPtrA(g_hSetEmailLink, GWL_STYLE);
+        SetWindowLongPtrA(g_hSetEmailLink, GWL_STYLE, gwl | SS_NOTIFY);
+        SetWindowLongPtrA(g_hSetEmailLink, GWLP_ID, IDC_SET_EMAIL_LINK);
+    }
     y0 += row;
 
     y_misc = y0;
@@ -16422,8 +20340,25 @@ static void open_settings_dialog(HWND parent)
                      SWP_NOMOVE | SWP_NOZORDER);
     }
 
-    settings_select_tab(0);
+    /* settings_load_controls() first, then settings_select_tab() - not
+     * the reverse. Confirmed as the actual cause of Bias-T occasionally
+     * showing available when it shouldn't (reported after the hwVer==0
+     * fix, so evidently a second, independent bug): settings_select_tab()
+     * triggers settings_update_format_dependent_state() ->
+     * settings_update_dual_enable_state() -> settings_update_bias_t_
+     * state(), which reads the Tuner 1/2 checkboxes and the antenna
+     * combo - all still at their bare freshly-created state (unchecked,
+     * empty) if this runs before settings_load_controls() has populated
+     * them from the real config. Whatever settings_bias_t_available()
+     * computes from that wrong snapshot then sticks, since nothing
+     * afterward re-runs the check on a plain dialog open - only an
+     * explicit tab switch or a Tuner/antenna change does. Opens to
+     * whichever tab was last active this session (starts at 0, the
+     * Receiver tab, on the very first open - and naturally resets back
+     * to 0 on app restart since this is a plain in-memory static, never
+     * written to the ini).                                                */
     settings_load_controls();
+    settings_select_tab(g_settings_active_tab);
 
     ShowWindow(g_hSettingsWnd, SW_SHOW);
     EnableWindow(parent, FALSE);
@@ -16500,6 +20435,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
      * and the RSPduo Master/Slave slave process below, since that's a
      * second invocation of this same WinMain (see cmdline_is_slave_b). */
     SetUnhandledExceptionFilter(crash_exception_filter);
+
+    /* Must run before the slave-b branch below, not after it - the slave
+     * process takes that branch and returns without ever reaching the
+     * rest of this function, but it still runs stream_callback_single()
+     * and writer_thread_func() for its own Tuner 2 stream (identical
+     * shared code to the master's own Tuner 1 path), both of which use
+     * these same locks. Entering an uninitialised CRITICAL_SECTION is
+     * undefined behaviour and reliably crashed the slave process almost
+     * immediately after streaming started - every single Master/Slave
+     * session, listen-only or recording - which is exactly what was
+     * happening: this used to run after the branch below, so the master
+     * process always initialised these correctly (it never takes that
+     * branch) while the slave process never did.                       */
+    InitializeCriticalSection(&g_ui_lock);
+    InitializeCriticalSection(&g_next_lock);
+    InitializeCriticalSection(&g_peak_lock);
 
     if (cmdline_is_slave_b(lpCmdLine)) {
         char outfile[MAX_PATH_LEN];
@@ -16625,6 +20576,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
     g_hFontUI  = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_hFontTiny = CreateFontA(-11, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
     g_hFontVal = CreateFontA(-15, 0, 0, 0, FW_BOLD, 0, 0, 0,
                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
@@ -16640,6 +20594,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
 
     /* Buttons (owner-drawn, positioned by layout_children) */
     g_hBtnToggle = mk_button(g_hwnd, IDC_BTN_TOGGLE, gui_record_btn_idle_label());
+    EnableWindow(g_hBtnToggle, !(g_state.cfg.schedule_only || g_state.cfg.hourly_enable));
     g_hBtnAgc    = mk_button(g_hwnd, IDC_BTN_AGC,    "AGC");
     g_hBtnSchedToggle = mk_button(g_hwnd, IDC_BTN_SCHED_TOGGLE,
                                    (g_state.cfg.schedule_only || g_state.cfg.hourly_enable)
@@ -16724,7 +20679,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
     if (startup_duo_fix_applied)
         LOG_WARN("dual_channel/rspduo_single_tuner=B in duodx.ini looked "
                  "left over from a different (RSPduo) device - reset to "
-                 "single-tuner A for this one.");
+                 "single-tuner 1 for this one.");
 
     /* 1-second timer to tick the live clock while idle. */
     SetTimer(g_hwnd, ID_TIMER_CLOCK, 1000, NULL);
@@ -16733,6 +20688,26 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
 
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) {
+        /* Page Up/Down step the frequency by the active tuning step
+         * (Section 10) from anywhere in the main window, not just while
+         * the frequency digits themselves have focus - useful for
+         * stepping through channels without needing the mouse positioned
+         * over the digits first. Only intercepted while a step is
+         * actually active (Default leaves Page Up/Down doing nothing, as
+         * before); no control in the app uses either key for anything
+         * else, so this is safe to catch globally rather than needing to
+         * route it through whichever control currently has focus.       */
+        if (m.message == WM_KEYDOWN && g_freqStepHz > 0.0 &&
+                (m.wParam == VK_PRIOR || m.wParam == VK_NEXT) &&
+                (m.hwnd == g_hwnd || IsChild(g_hwnd, m.hwnd))) {
+            double freq_now;
+            EnterCriticalSection(&g_monitor.settings_lock);
+            freq_now = *monitor_active_freq_ptr();
+            LeaveCriticalSection(&g_monitor.settings_lock);
+            freqstep_apply(freqstep_snap_active(freq_now) +
+                            (m.wParam == VK_PRIOR ? g_freqStepHz : -g_freqStepHz));
+            continue;
+        }
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }
@@ -16742,6 +20717,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
     monitor_shutdown();
 
     if (g_hFontUI)  DeleteObject(g_hFontUI);
+    if (g_hFontTiny) DeleteObject(g_hFontTiny);
     if (g_hFontVal) DeleteObject(g_hFontVal);
     if (g_hFontBig) DeleteObject(g_hFontBig);
     if (g_hFontLog) DeleteObject(g_hFontLog);
