@@ -43,9 +43,6 @@
                          * dynamically at crash time, so no -ldbghelp needed. */
 #include <malloc.h>     /* _resetstkoflw() - reclaims stack space on a stack
                          * overflow so the crash handler itself has room to run. */
-#include <shellapi.h>   /* ShellExecuteA - opens the GitHub link and mailto: link
-                         * on the Miscellaneous tab in the user's default browser/
-                         * mail client. Requires -lshell32 at link time. */
 
 #include "sdrplay_api.h"
 /* RSP1B was added in API 3.14; older headers may not define this ID. */
@@ -57,7 +54,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "3.1.0"
+#define VERSION                 "3.1.1"
 #define SPINUP_BYTES_FIXED      (1024 * 1024)  /* 1 MB - see the spinup_bytes
                                    field comment for why this doesn't need
                                    to be user-configurable.                */
@@ -744,8 +741,6 @@ static HANDLE g_http_delayed_stop_handle = NULL; /* non-NULL while a previous
 #define IDC_SET_SHOW_OFFSET 1208
 #define IDC_SET_CARRIER_CALIB 1211
 #define IDC_BTN_AUTO_CAL 1212
-#define IDC_SET_GITHUB_LINK 1216
-#define IDC_SET_EMAIL_LINK  1217
 #define IDC_SET_COLOR_SCHEME  1179
 #define IDC_SET_VERBOSE       1180
 #define IDC_SET_LOG_AUTOSAVE  1181
@@ -1176,6 +1171,12 @@ static HFONT  g_hFontTiny   = NULL;   /* the small "ANTENNA" label above the
                                        * tall to fit above a button that's
                                        * already been kept deliberately
                                        * short (Section 13.1)               */
+static HFONT  g_hFontAntBtn = NULL;   /* one point smaller than g_hFontUI,
+                                       * for the antenna selector button's
+                                       * own text (A/B/C/50 ohm/Hi-Z) -
+                                       * distinct from g_hFontTiny above,
+                                       * which is much smaller and reserved
+                                       * for the "ANTENNA" label itself.    */
 static HFONT  g_hFontVal    = NULL;   /* bold values / counters              */
 static HFONT  g_hFontBig    = NULL;   /* big 7-seg-ish counters              */
 static HFONT  g_hFontCarrier = NULL;  /* carrier readout digits - sized to
@@ -1641,7 +1642,6 @@ static HWND g_hMonVolVal     = NULL;
 static HWND g_hBtnHpfEnable  = NULL;
 static HWND g_hHpfSlider     = NULL;
 static HWND g_hHpfVal        = NULL;
-static HWND g_hSMeter        = NULL;
 /* Bounding rect of the OFFSET readout, cached by paint_window() each time
  * it draws it (or cleared when it isn't shown) - lets WM_LBUTTONDOWN hit-
  * test against exactly what's on screen without a second, separately-
@@ -1649,6 +1649,25 @@ static HWND g_hSMeter        = NULL;
  * sync with the paint code over time.                                    */
 static RECT g_carrierOffsetRect;
 static int  g_carrierOffsetRectValid = 0;
+/* Section 3.3 - click SIGNAL/STRENGTH to toggle the two main meters
+ * between wideband dBFS (always available) and each tuner's own
+ * narrowband dBm at its actual tuned frequency (Monitor must be on).
+ * Same click-rect-cached-at-paint-time pattern as the OFFSET readout
+ * above, for the same reason - the label is painted directly on the
+ * main window, not a separate control, so there's nothing else to
+ * WM_LBUTTONDOWN against.                                                */
+static int   g_signal_meter_mode = 1;   /* 0 = dBFS, 1 = dBm (narrowband) - defaults
+                                          * to S-METER: nb_mode still requires Monitor
+                                          * to actually be on (see its own check in
+                                          * paint_window()), so this only takes visible
+                                          * effect once Monitor is switched on - before
+                                          * that the meter reads LEVEL regardless, since
+                                          * S-METER has nothing to show yet.            */
+static RECT  g_signalLabelRect;
+static int   g_signalLabelRectValid = 0;
+/* Published narrowband dBm per tuner (index 0/1, matching every other
+ * per-tuner array in this file) - see narrowband_meter_feed().          */
+static volatile float g_narrow_dbm_pub[2] = { -200.0f, -200.0f };
 static int  g_monitorVolPercent = 15;  /* Windows waveOut volume, 0-100,
                                           * kept here so re-opening the audio
                                           * device (monitor toggled off/on)
@@ -1660,6 +1679,7 @@ static void monitor_shutdown(void);
 static DWORD WINAPI monitor_thread_func(LPVOID param);
 static const char *gui_record_btn_idle_label(void);
 static void monitor_feed(const int16_t *xi, const int16_t *xq, unsigned int n);
+static void narrowband_meter_feed(int t, const int16_t *xi, const int16_t *xq, unsigned int n);
 typedef struct {
     const char *key;
     char        value[80];
@@ -1675,6 +1695,7 @@ static int  launch_slave_b_process(AppState *state, const char *outfile_b,
                                     int duration_sec, int listen_only);
 static void stop_slave_b_process(AppState *state);
 static void verify_slave_b_recording(AppState *state);
+static void verify_slave_b_recording_ex(AppState *state, int do_verify);
 static void setup_slave_channel_b(AppState *state);
 static void apply_slave_biast_b(AppState *state);
 static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param);
@@ -1707,14 +1728,12 @@ static LRESULT CALLBACK bwdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 static HWND bwdigits_create(HWND parent, HINSTANCE hInst);
 static LRESULT CALLBACK notchdigits_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static HWND notchdigits_create(HWND parent, HINSTANCE hInst);
-static LRESULT CALLBACK smeter_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-static float smeter_s9_dbm_for_current_tuner(void);
+static float smeter_s9_dbm_for_tuner(int t);
 static void carrier_fft(DCplx *a, int n, int invert);
 static double carrier_bin_to_hz(double bin, int n, double fs);
 static double carrier_find_peak(const double *pwr, int n, double fs, double search_hz,
                                  double *out_peak_to_floor_db);
 static int carrier_blocks_for_signal(void);
-static HWND smeter_create(HWND parent, HINSTANCE hInst);
 static int  monitor_draw_button(LPDRAWITEMSTRUCT di);
 static int  tuner_ab_draw_button(LPDRAWITEMSTRUCT di, int is_b);
 static int  notch_draw_button(LPDRAWITEMSTRUCT di);
@@ -2558,9 +2577,6 @@ static DWORD WINAPI gui_monitor_thread_func(LPVOID param)
             EnableWindow(g_hBtnSchedToggle, sched_should_enable);
         }
         monitor_sync_button_label();
-
-        if (g_hSMeter && g_monitor.enabled)
-            InvalidateRect(g_hSMeter, NULL, FALSE);
 
         Sleep(state->cfg.monitor_interval_ms > 0
               ? state->cfg.monitor_interval_ms : 250);
@@ -4026,6 +4042,13 @@ static void stream_callback_single(
          * NCO math for the wrong centre frequency. Stay silent instead. */
         if (!state->master_slave_active || g_monitor.tuner_sel == 0)
             monitor_feed(&xi[offset], &xq[offset], batch);
+        /* Section 3.3's signal-strength meter, unlike monitor_feed()
+         * above, isn't gated on tuner_sel - it runs for whichever tuner
+         * this data genuinely is (state->device.tuner), regardless of
+         * which one the live monitor happens to have selected for
+         * listening, so both meters can show a real reading at once.    */
+        narrowband_meter_feed(state->device.tuner == sdrplay_api_Tuner_B ? 1 : 0,
+                               &xi[offset], &xq[offset], batch);
         offset += batch;
     }
     #undef CHUNK
@@ -4175,6 +4198,14 @@ static void stream_callback_dual_b(
                          (unsigned int)merge_count);
         else
             monitor_feed(xi, xq, (unsigned int)merge_count);
+
+        /* Section 3.3's signal-strength meter - both tuners, always,
+         * regardless of which one (if either) is selected for listening
+         * above. Both A and B are available right here at the merge
+         * point, same as the wideband peak tracking a few lines up.      */
+        narrowband_meter_feed(0, state->pending_a_i, state->pending_a_q,
+                               (unsigned int)merge_count);
+        narrowband_meter_feed(1, xi, xq, (unsigned int)merge_count);
     }
 
     state->pending_a_valid = 0;
@@ -4199,12 +4230,28 @@ static void event_callback(
          * the channel parameter structs. The keyboard thread owns gain state
          * via private local variables; writing into the structs from this
          * callback thread races with those variables and causes erratic gain
-         * behaviour regardless of any AGC guard condition.               */
-        if (tuner == sdrplay_api_Tuner_B)
+         * behaviour regardless of any AGC guard condition.
+         *
+         * Braces are load-bearing here, not style - without them, the
+         * dangling-else meant "if (g_gain_b_shmem_view) ..." was its own,
+         * unconditional statement (running for EITHER tuner), and the else
+         * attached to THAT if, not the tuner check above it. In practice:
+         * g_curr_gain_a only ever got set when g_gain_b_shmem_view was
+         * NULL - which it never is once Master/Slave's shared-memory
+         * bridge exists, meaning the master process's own g_curr_gain_a
+         * silently never updated at all in a genuine Master/Slave
+         * session, staying stuck at its 0.0 initial value regardless of
+         * the real gain in use. That fed straight into both the existing
+         * S-meter and the new narrowband dBm calculation's gain
+         * compensation for Tuner 1 - a plausible contributor to some of
+         * the confusing Tuner 1 readings chased earlier, on top of the
+         * other confirmed causes.                                        */
+        if (tuner == sdrplay_api_Tuner_B) {
             g_curr_gain_b = params->gainParams.currGain;
             if (g_gain_b_shmem_view) *g_gain_b_shmem_view = params->gainParams.currGain;
-        else
+        } else {
             g_curr_gain_a = params->gainParams.currGain;
+        }
         if (state->cfg.verbose) {
             /* AGC continuously nudges gain by design - with AGC on for
              * this tuner, this event fires every few seconds indefinitely
@@ -8278,9 +8325,13 @@ repeat_schedule:
             LOG_INFO("Master/Slave: stopping the listen-only Tuner 2 "
                      "process so recording can start on a fresh one.");
             stop_slave_b_process(&g_state);
-            verify_slave_b_recording(&g_state);  /* no-op here (listen-only,
-                no output_file_b yet) but resets the mapping cleanly for the
-                fresh slave about to be launched below. */
+            /* do_verify=0 - see verify_slave_b_recording_ex()'s own
+             * comment on why this specific call site needs it: nothing
+             * was ever recorded during the listen-only phase, but the
+             * plain verify_slave_b_recording() would have incorrectly
+             * tried anyway. Still resets the mapping cleanly for the
+             * fresh slave about to be launched below.                   */
+            verify_slave_b_recording_ex(&g_state, 0);
             g_state.master_slave_active = 1;
         }
         if (!launch_slave_b_process(&g_state, g_state.output_file_b,
@@ -10096,8 +10147,16 @@ static void draw_led(HDC dc, int cx, int cy, int radius, COLORREF col, int glow)
 #define METER_RANGE_DB   60.0f   /* meter spans -60 dBFS (0%) to 0 dBFS (100%) */
 #define METER_AMBER_DB  -18.0f
 #define METER_RED_DB     -6.0f
+/* Narrowband signal-strength mode's own range (Section 3.3) - a
+ * generous span covering everything from near the noise floor to a
+ * very strong local signal, in round numbers rather than tied to any
+ * particular reference (S9 etc.) since this is a plain bar, not a
+ * calibrated S-meter.                                                   */
+#define METER_DBM_LO    -130.0f
+#define METER_DBM_HI     -30.0f
 
-static void draw_meter(HDC dc, RECT r, float dbfs, int overload, int graduated)
+static void draw_meter(HDC dc, RECT r, float level_db, float lo_db, float hi_db,
+                        float s9_db, int silent, int overload, int graduated)
 {
     /* Track background */
     HBRUSH bg = CreateSolidBrush(COL_BAR_BG);
@@ -10112,21 +10171,25 @@ static void draw_meter(HDC dc, RECT r, float dbfs, int overload, int graduated)
 
     const int segs = 20;
     int active;
-    if (dbfs <= -90.0f) {
-        active = 0;                 /* silence */
+    if (silent) {
+        active = 0;
     } else {
-        float norm = (dbfs + METER_RANGE_DB) / METER_RANGE_DB;  /* -60 dB -> 0 .. 0 dB -> 1 */
+        float norm = (level_db - lo_db) / (hi_db - lo_db);
         if (norm < 0.0f) norm = 0.0f;
         if (norm > 1.0f) norm = 1.0f;
         active = (int)(norm * segs + 0.5f);
     }
     if (active > segs) active = segs;
 
-    /* Same -60..0 dBFS -> 0..1 normalisation as the level itself, applied
-     * to the two threshold dB values above so every meter style reads
-     * off the same underlying scale as what's actually lit.             */
-    const float amber_frac = (METER_AMBER_DB + METER_RANGE_DB) / METER_RANGE_DB;
-    const float red_frac   = (METER_RED_DB   + METER_RANGE_DB) / METER_RANGE_DB;
+    /* Same lo..hi -> 0..1 normalisation as the level itself, applied to
+     * the two dBFS threshold values above so every dBFS-mode meter style
+     * reads off the same underlying scale as what's actually lit.
+     * s9_frac is the equivalent for graduated==3 (narrowband signal
+     * strength) - a plain two-colour threshold at S9, not one of these
+     * blends.                                                            */
+    const float amber_frac = (METER_AMBER_DB - lo_db) / (hi_db - lo_db);
+    const float red_frac   = (METER_RED_DB   - lo_db) / (hi_db - lo_db);
+    const float s9_frac    = (s9_db - lo_db) / (hi_db - lo_db);
 
     int pad = 2;
     int innerW = (r.right - r.left) - pad * 2;
@@ -10147,10 +10210,23 @@ static void draw_meter(HDC dc, RECT r, float dbfs, int overload, int graduated)
     int y = r.top + pad;
 
     for (int i = 0; i < segs; i++) {
-        /* Segment colour: zone, graduated blend, or greyscale by style. */
+        /* Segment colour: zone, graduated blend, greyscale, or narrowband
+         * signal-strength (green-to-orange, no red - a strong signal
+         * isn't a fault the way a hot ADC level is, so this mode has no
+         * "danger" colour of its own; the dedicated overload indicator
+         * below still lights up in this mode exactly as it does in every
+         * other one, since it's driven by the same underlying ADC
+         * overload flag regardless of which scale the bar itself is
+         * showing).                                                      */
         float t = (float)i / (float)(segs - 1);
         COLORREF c;
-        if (graduated == 1) {
+        if (graduated == 3) {
+            /* Two-colour threshold at S9, not a gradient - bright green
+             * up to S9, orange above it, so the transition actually
+             * means something (crossing S9) rather than just being
+             * "further along the bar."                                  */
+            c = (t < s9_frac) ? RGB(50, 220, 70) : RGB(255, 150, 30);
+        } else if (graduated == 1) {
             if (t < amber_frac) {
                 float s = t / amber_frac;
                 c = RGB((int)(40  + (255-40 ) * s * 0.75f),
@@ -10409,6 +10485,167 @@ static MCplx mon_notch_process(MonNotch *ns, MCplx x)
     ns->x1 = x;
     ns->y1 = y;
     return y;
+}
+
+/* narrowband_meter_feed - Section 3.3's per-tuner signal-strength meter.
+ * Runs continuously for BOTH tuners whenever Monitor is on, independent
+ * of which one (if either) the live monitor happens to have selected for
+ * listening - unlike monitor_feed() itself, which only ever processes
+ * whichever tuner is currently selected.
+ *
+ * This is a second, independent instance of the SAME proven pipeline the
+ * established narrowband S-meter (Section 13.6) uses - NCO shift to the
+ * tuner's own dial frequency, two-stage decimation, then a selectivity
+ * filter, reusing mon_decim_stage_design/process and mon_sel_filter_
+ * design/process directly rather than a separate reimplementation. Three
+ * increasingly targeted standalone attempts at a simpler bespoke filter
+ * (a single-pole IIR, then a 4-stage cascade, then a self-measured
+ * calibration correction on top of that) each fixed one real, confirmed
+ * problem but never actually matched the established meter's own
+ * accuracy - the last of those turned out to be masking a much larger
+ * issue rather than fixing it: this filter's raw output barely
+ * distinguished between genuinely different signals in the first place,
+ * which no calibration offset could ever properly correct for. On
+ * inspection, the standalone filter was also missing something the
+ * established pipeline always does: an NCO shift to the tuner's actual
+ * dial frequency. Zero-IF/Low-IF sessions can be tuned anywhere within a
+ * wide captured passband without re-tuning the hardware each time - the
+ * standalone filter, having no NCO of its own, was always measuring
+ * whatever sat exactly at the hardware's own fixed centre frequency,
+ * not wherever the dial had actually been moved to. Reusing the real
+ * pipeline sidesteps both that and the earlier DC-bias/selectivity
+ * issues at once, since it's the same code already doing this correctly
+ * for whichever tuner is selected - there was no good reason to keep
+ * chasing a simplified reimplementation's own bugs one at a time rather
+ * than just running two genuine instances of what already works.
+ *
+ * Deliberately still fixed at AM6's bandwidth (6 kHz) rather than
+ * tracking the live monitor's own selected mode/bandwidth - there's no
+ * "selected mode" for a tuner nobody's actively listening to, and mode-
+ * matching both instances to whatever's selected for the OTHER tuner
+ * would be a bigger, separate piece of work (the "fuller, independently
+ * configurable" option raised and set aside when this feature was first
+ * scoped) rather than what's needed to fix accuracy specifically.
+ *
+ * t is 0 or 1 (Tuner 1/2), matching every other per-tuner array in this
+ * file. Same real-time contract as monitor_feed(): no malloc, no locks,
+ * no blocking.                                                          */
+typedef struct {
+    MCplx         nco_rot, nco_step;
+    MonDecimStage st1, st2;
+    MonSelFilter  sel;
+    double        work_rate_hz;
+    double        last_native, last_freq, last_center;
+    float         smeter_peak_accum;
+    DWORD         smeter_publish_tick;
+} NarrowMeterState;
+
+static NarrowMeterState g_narrow2[2];
+
+static void narrowband_meter_feed(int t, const int16_t *xi, const int16_t *xq, unsigned int n)
+{
+    unsigned int i;
+    double native, freq, center;
+    NarrowMeterState *ns = &g_narrow2[t];
+
+    if (!g_monitor.enabled) return;
+
+    native = g_state.live_expected_output_rate_hz;
+    if (native < 1000.0) native = DEFAULT_SAMPLE_RATE_HZ;
+    /* Same fallback chain monitor_center_for_tuner()/monitor_active_freq_
+     * ptr() use elsewhere for exactly this purpose - not calling those
+     * directly since they're defined later in the file than this
+     * function and expect settings_lock held, which a real-time callback
+     * thread can't safely take.                                         */
+    center = (t == 1 && g_state.cfg.freq_b_hz > 0.0) ? g_state.cfg.freq_b_hz
+                                                      : g_state.cfg.frequency_hz;
+    if (center <= 0.0) center = DEFAULT_FREQUENCY_HZ;
+    freq = (t == 1) ? g_monitor.freq_hz_b : g_monitor.freq_hz;
+    if (freq <= 0.0) freq = center;
+
+    if (fabs(native - ns->last_native) > 1.0) {
+        /* Identical design math to the established pipeline's own decim
+         * stage setup (monitor_update_params()) - same two-stage split
+         * via sqrt factorisation, same 0.42x-Nyquist cutoff margin -
+         * just always targeting MON_WORK_RATE_NARROW/AM6 rather than
+         * whatever the live monitor's own mode currently calls for.      */
+        double work_rate = MON_WORK_RATE_NARROW;
+        int dtotal = (int)llround(native / work_rate);
+        int d1, d2;
+        double actual_work_rate;
+        if (dtotal < 1) dtotal = 1;
+        d1 = (int)floor(sqrt((double)dtotal));
+        if (d1 < 1) d1 = 1;
+        d2 = dtotal / d1;
+        if (d2 < 1) d2 = 1;
+        actual_work_rate = native / (double)(d1 * d2);
+        mon_decim_stage_design(&ns->st1, 0.42 * (native / d1) / 2.0, native, d1);
+        mon_decim_stage_design(&ns->st2, 0.42 * actual_work_rate / 2.0,
+                                native / d1, d2);
+        ns->work_rate_hz = actual_work_rate;
+        mon_sel_filter_design(&ns->sel, MON_MODE_AM6, 6.0, ns->work_rate_hz);
+        ns->last_native = native;
+        ns->last_freq = -1.0;   /* force the NCO block below to also re-run */
+    }
+    if (fabs(freq - ns->last_freq) > 1e-6 || fabs(center - ns->last_center) > 1e-6) {
+        /* Same delta = freq - center NCO math as the established
+         * pipeline (monitor_update_params()) - this is the piece the
+         * earlier standalone filter was missing entirely.                */
+        double delta = freq - center;
+        double w = 2.0 * MON_PI * delta / native;
+        ns->nco_step.re = (float)cos(-w);
+        ns->nco_step.im = (float)sin(-w);
+        ns->nco_rot.re  = 1.0f;
+        ns->nco_rot.im  = 0.0f;
+        ns->last_freq   = freq;
+        ns->last_center = center;
+    }
+
+    for (i = 0; i < n; i++) {
+        MCplx raw, mixed, d1out, d2out, sel;
+        float mag;
+
+        raw.re = (float)xi[i];
+        raw.im = (float)xq[i];
+
+        mixed = mcplx_mul(raw, ns->nco_rot);
+        ns->nco_rot = mcplx_mul(ns->nco_rot, ns->nco_step);
+        mag = sqrtf(ns->nco_rot.re * ns->nco_rot.re + ns->nco_rot.im * ns->nco_rot.im);
+        if (mag > 1e-6f) {
+            ns->nco_rot.re /= mag;
+            ns->nco_rot.im /= mag;
+        }
+
+        if (!mon_decim_stage_process(&ns->st1, mixed, &d1out)) continue;
+        if (!mon_decim_stage_process(&ns->st2, d1out, &d2out)) continue;
+
+        sel = mon_sel_filter_process(&ns->sel, d2out);
+
+        {
+            float smag = sqrtf(sel.re * sel.re + sel.im * sel.im);
+            if (smag > ns->smeter_peak_accum) ns->smeter_peak_accum = smag;
+        }
+    }
+
+    {
+        DWORD now_tick = GetTickCount();
+        if (now_tick - ns->smeter_publish_tick >= 150) {
+            /* Identical dBFS-to-dBm conversion to the established
+             * S-meter (Section 13.6) - same gain source, same shared
+             * calibration offset. No self-calibration/masking needed
+             * any more: this is now a genuine, independently-correct
+             * measurement, not an approximation being nudged toward a
+             * borrowed reference.                                       */
+            float dbfs = (ns->smeter_peak_accum > 1.0f)
+                       ? 20.0f * log10f(ns->smeter_peak_accum / 32767.0f)
+                       : -120.0f;
+            double gain = (t == 1) ? g_curr_gain_b : g_curr_gain_a;
+            float dbm = dbfs - (float)gain + (float)g_state.cfg.monitor_smeter_cal_offset;
+            g_narrow_dbm_pub[t] = dbm;
+            ns->smeter_publish_tick = now_tick;
+            ns->smeter_peak_accum = 0.0f;
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -11267,8 +11504,6 @@ static void monitor_create_controls(HWND parent, HINSTANCE hInst)
     g_hMonKhzLbl = CreateWindowExA(0, "STATIC", "kHz", WS_CHILD | WS_VISIBLE | SS_LEFT,
                     0, 0, 10, 10, parent, NULL, hInst, NULL);
 
-    g_hSMeter = smeter_create(parent, hInst);
-
     g_hBtnNotchEnable = mk_button(parent, IDC_BTN_NOTCH_ENABLE, "IF Notch");
     g_hNotchDigits = notchdigits_create(parent, hInst);
     g_hNotchKhzLbl = CreateWindowExA(0, "STATIC", "kHz", WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -11510,11 +11745,28 @@ static void monitor_layout(HWND hwnd, int right_edge, int bar_y, int bar_h)
     x += w_notch_digits + gap_tight;
     MoveWindow(g_hNotchKhzLbl, x, bar_y + (row1_h - 16) / 2, w_notch_khz, 16, TRUE);
 
-    /* Row 2: Vol, then Low Cut, then the S-meter - same tight/group gap
-     * pattern as row 1. Low Cut's slider gets a fixed width now rather
-     * than stretching to the right edge, since the S-meter needs to sit
-     * after it and fill the remaining space itself instead.              */
-    x = 14 + ant_total;
+    /* Row 2: Vol, then Low Cut - same tight/group gap pattern as row 1.
+     * Both sliders are fixed-width (180/140) rather than stretching to
+     * fill the row - the space after Low Cut used to be claimed by the
+     * old narrowband S-meter widget (removed - Section 3.3's dual
+     * meters on the main SIGNAL/LEVEL display replace it). With that
+     * gone, the whole Vol+Low Cut group is centred within the same
+     * available width row 1 uses (14+ant_total .. right_edge-16) rather
+     * than left-aligned with a growing blank gap on the right as the
+     * window widens - particularly at a maximised width, where a fixed-
+     * width group stuck on the left read as oddly off-balance against
+     * row 1 spanning the full width above it. group_width is the exact
+     * sum of every width/gap the positioning pass below actually uses,
+     * kept as literally the same numbers so this can't quietly drift out
+     * of sync with the real layout.                                     */
+    {
+        int avail_left  = 14 + ant_total;
+        int avail_right = right_edge - 16;
+        int group_width = w_vol_lbl + gap_tight + 180 + 8 + w_vol_val + gap_group + 8
+                         + w_hpf_lbl + 8 + 140 + 8 + w_hpf_val;
+        x = avail_left + (avail_right - avail_left - group_width) / 2;
+        if (x < avail_left) x = avail_left;   /* window narrower than the group itself */
+    }
     MoveWindow(g_hMonVolLbl, x, row2_y + (row2_h - 16) / 2, w_vol_lbl, 16, TRUE);
     x += w_vol_lbl + gap_tight;
 
@@ -11535,16 +11787,6 @@ static void monitor_layout(HWND hwnd, int right_edge, int bar_y, int bar_h)
     MoveWindow(g_hHpfSlider, x, row2_y + 4, slider_w, slider_h, TRUE);
     x += slider_w + 8;
     MoveWindow(g_hHpfVal, x, row2_y + (row2_h - 16) / 2, w_hpf_val, 16, TRUE);
-    x += w_hpf_val + gap_group;
-
-    slider_right = right_edge - 16;
-    slider_w = slider_right - x;
-    if (slider_w < 80) slider_w = 80;
-    {
-        int smeter_h = 14;
-        int smeter_y = row2_y + (row2_h - smeter_h) / 2;
-        MoveWindow(g_hSMeter, x, smeter_y, slider_w, smeter_h, TRUE);
-    }
 }
 
 /* -------------------------------------------------------------------------
@@ -11731,9 +11973,28 @@ static double freqstep_snap(double freq_hz, double step_hz)
  * numbers stations, for instance, are often worked in 3 kHz steps but
  * from an odd starting point (8867, 8870, 8873 kHz - none of those are
  * exact multiples of 3 kHz counted from 0), so Custom instead measures
- * from wherever the operator actually was when they set it up.          */
+ * from wherever the operator actually was when they set it up.
+ *
+ * Per-tuner (indexed by g_monitor.tuner_sel, matching every other
+ * per-tuner array in this file) rather than one shared anchor - Custom
+ * step is deliberately a shared TYPE/size across both tuners (picking
+ * 3 kHz Custom applies regardless of which tuner you're on), but each
+ * tuner's own irregular grid has nothing to do with the other's, so a
+ * single shared anchor meant Tuner 2 silently inherited whatever grid
+ * Tuner 1 happened to be anchored to. Confirmed by the exact arithmetic
+ * this produces: 8867 kHz on Tuner 1 (3 kHz step) followed by Tuner 2
+ * aiming for 13261 kHz landed on 13262 instead - (13261-8867)/3 isn't a
+ * whole number, but (13262-8867)/3 = 1465 is, meaning Tuner 2 was
+ * snapping to Tuner 1's grid, not its own. g_freqStepAnchored tracks
+ * which tuners have actually had their own anchor established yet -
+ * the first wheel/Page Up-Down/menu-reselect on a given tuner while
+ * Custom is active auto-anchors it there and then, rather than silently
+ * defaulting to a 0 Hz anchor (which would just reintroduce the
+ * original 0-referenced problem, one tuner at a time) or requiring an
+ * explicit Custom re-selection before that tuner can be used at all.   */
 static int    g_freqStepIsCustom  = 0;
-static double g_freqStepAnchorHz  = 0.0;
+static double g_freqStepAnchorHz[2] = { 0.0, 0.0 };
+static int    g_freqStepAnchored[2] = { 0, 0 };
 
 /* Single place all three step-consumers (menu selection, mouse wheel,
  * Page Up/Down) snap through, so Custom's different-anchor behaviour
@@ -11742,8 +12003,14 @@ static double freqstep_snap_active(double freq_hz)
 {
     if (g_freqStepHz <= 0.0) return freq_hz;
     if (g_freqStepIsCustom) {
-        double n = floor((freq_hz - g_freqStepAnchorHz) / g_freqStepHz + 0.5);
-        return g_freqStepAnchorHz + n * g_freqStepHz;
+        int t = g_monitor.tuner_sel;
+        double n;
+        if (!g_freqStepAnchored[t]) {
+            g_freqStepAnchorHz[t] = freq_hz;
+            g_freqStepAnchored[t] = 1;
+        }
+        n = floor((freq_hz - g_freqStepAnchorHz[t]) / g_freqStepHz + 0.5);
+        return g_freqStepAnchorHz[t] + n * g_freqStepHz;
     }
     return freqstep_snap(freq_hz, g_freqStepHz);
 }
@@ -12159,7 +12426,16 @@ static void freqdigits_show_step_menu(HWND hwnd, int screen_x, int screen_y)
         EnterCriticalSection(&g_monitor.settings_lock);
         cur_freq = *monitor_active_freq_ptr();
         LeaveCriticalSection(&g_monitor.settings_lock);
-        if (g_freqStepIsCustom) g_freqStepAnchorHz = cur_freq;
+        if (g_freqStepIsCustom) {
+            /* Explicit (re-)selection always re-anchors the CURRENT tuner
+             * specifically - g_monitor.tuner_sel here, not both at once -
+             * to wherever it's tuned right now, overriding any anchor
+             * that tuner already had (whether auto-established earlier
+             * or from a previous explicit selection). The other tuner's
+             * own anchor, if it has one, is untouched.                   */
+            g_freqStepAnchorHz[g_monitor.tuner_sel] = cur_freq;
+            g_freqStepAnchored[g_monitor.tuner_sel] = 1;
+        }
         freqstep_apply(freqstep_snap_active(cur_freq));
     }
 
@@ -12922,7 +13198,6 @@ static HWND notchdigits_create(HWND parent, HINSTANCE hInst)
  * signal source (Settings > Monitor). Uninitialised (offset = 0), this is
  * a relative-but-gain-compensated reading, not a calibrated absolute one.
  * ------------------------------------------------------------------------- */
-#define SMETER_SEGS       40
 /* S9 isn't one fixed dBm figure - it's a band-dependent convention (IARU
  * Region 1 VHF Managers' Handbook): S9 = 50 uV across 50 ohm = -73 dBm on
  * HF/MW, but only 5 uV = -93 dBm at 30 MHz and above, since VHF/UHF noise
@@ -12937,23 +13212,15 @@ static HWND notchdigits_create(HWND parent, HINSTANCE hInst)
 #define SMETER_S9_HF_DBM       (-73.0f)   /* below 30 MHz */
 #define SMETER_S9_VHF_DBM      (-93.0f)   /* 30 MHz and above */
 #define SMETER_VHF_THRESHOLD_HZ  30000000.0
-/* A straight linear dBm-to-position mapping puts S9 at (54 dB of S0-S9)
- * / (114 dB of S0-S9+60) = ~47% along the bar - so S9 and above (all
- * "strong signal" territory) claims over half the meter, while ordinary
- * S1-S9 reception, which is most real-world reception, is squeezed into
- * less than half. Traditional analog S-meter faceplates deliberately
- * don't map linearly for this reason: S0-S9 gets the majority of the
- * scale's resolution, S9-and-up gets a smaller remainder just enough to
- * show roughly how far over. SMETER_S9_TARGET_FRAC is where S9 should
- * land along the bar (0..1).                                            */
-#define SMETER_S9_TARGET_FRAC  0.75f
 
-/* Picks the S9 reference for whichever tuner the live monitor is
- * currently on, per the band convention above.                         */
-static float smeter_s9_dbm_for_current_tuner(void)
+/* Same HF/VHF S9 reference as smeter_s9_dbm_for_current_tuner() above,
+ * but for a specific tuner (0/1) rather than whichever one the live
+ * monitor happens to have selected - Section 3.3's dual meters need
+ * each tuner's own S9 threshold independently, since Tuner 1 and 2 can
+ * genuinely be on different bands (HF vs VHF) at once.                  */
+static float smeter_s9_dbm_for_tuner(int t)
 {
-    double freq_hz = (g_monitor.tuner_sel == 1) ? g_monitor.freq_hz_b
-                                                 : g_monitor.freq_hz;
+    double freq_hz = (t == 1) ? g_monitor.freq_hz_b : g_monitor.freq_hz;
     return (freq_hz >= SMETER_VHF_THRESHOLD_HZ) ? SMETER_S9_VHF_DBM
                                                  : SMETER_S9_HF_DBM;
 }
@@ -12968,7 +13235,15 @@ static float smeter_s9_dbm_for_current_tuner(void)
  * raw accumulated samples.                                                */
 static int carrier_blocks_for_signal(void)
 {
-    float s9_dbm = smeter_s9_dbm_for_current_tuner();
+    /* smeter_s9_dbm_for_current_tuner() (a thin g_monitor.tuner_sel
+     * wrapper around smeter_s9_dbm_for_tuner()) was removed along with
+     * the old S-meter widget it was written for - this was its only
+     * other caller, missed at the time since it's a different function
+     * entirely from the one the widget itself used (smeter_warp()).
+     * Calling smeter_s9_dbm_for_tuner() directly with tuner_sel here is
+     * exactly what the removed wrapper did internally, so this is the
+     * same behaviour, not a change to it.                               */
+    float s9_dbm = smeter_s9_dbm_for_tuner(g_monitor.tuner_sel);
     float below_s9 = s9_dbm - g_monitor.smeter_dbm_pub;  /* + = weaker than S9 */
     if (below_s9 <= 0.0f)  return  8;    /* >= S9          : ~1s  */
     if (below_s9 <= 12.0f) return 16;    /* S7 - S9        : ~2s  */
@@ -13087,176 +13362,6 @@ static double carrier_find_peak(const double *pwr, int n, double fs, double sear
 
     return carrier_bin_to_hz(peak_bin + delta, n, fs);
 }
-
-/* Maps a dBm reading to a 0..1 bar-fill fraction via two straight-line
- * segments meeting at s9_dbm, rather than one continuous curve -
- * deliberately, so each end can be reasoned about and tuned
- * independently:
- *   S0..S9  -> 0 .. SMETER_S9_TARGET_FRAC, linear. Each 6 dB S-unit gets
- *              equal width this way, the same as how S-units are
- *              actually defined and how analog faceplates tick them -
- *              a near-floor reading (e.g. an RSPdx's typical ~-120 dBm
- *              with no antenna on HF, only just above S0) lands close to
- *              the left edge, around where S1 sits, rather than a third
- *              of the way across as a single global curve (e.g. a
- *              power/log-style curve fitted only to hit S9 in the right
- *              place) would leave it - that shape has no independent
- *              control over the low end at all, only the one point it's
- *              fitted to.
- *   S9..S9+60 -> SMETER_S9_TARGET_FRAC .. 1, linear. Coarse "how far
- *              over S9" indication in the remaining quarter.            */
-static float smeter_warp(float dbm, float s9_dbm)
-{
-    float min_dbm = s9_dbm - 54.0f;   /* S0: 9 S-units of 6 dB below S9 */
-    float max_dbm = s9_dbm + 60.0f;   /* S9+60 */
-    float norm;
-    if (dbm <= min_dbm) return 0.0f;
-    if (dbm >= max_dbm) return 1.0f;
-    if (dbm <= s9_dbm) {
-        norm = (dbm - min_dbm) / (s9_dbm - min_dbm);
-        return norm * SMETER_S9_TARGET_FRAC;
-    } else {
-        norm = (dbm - s9_dbm) / (max_dbm - s9_dbm);
-        return SMETER_S9_TARGET_FRAC + norm * (1.0f - SMETER_S9_TARGET_FRAC);
-    }
-}
-
-static LRESULT CALLBACK smeter_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    if (msg == WM_ERASEBKGND)
-        return 1;   /* WM_PAINT fills the whole client area - avoids flicker */
-
-    /* Right-click for carrier offset calibration - the S-meter is a
-     * reasonable home for this: it's monitor-audio-only, never touches
-     * the recorded IQ data or the SDRplay API, but previously lived
-     * exclusively in the Settings dialog, which is fully disabled the
-     * whole time an actual recording is running (same reasoning that
-     * already moved Low Cut/Vol/Notch out to the main window - see
-     * IDC_BTN_HPF_ENABLE's own comment). Reusing this control rather
-     * than adding a new one avoids touching monitor_layout()'s already
-     * tightly-packed row calculations.                                   */
-    if (msg == WM_CONTEXTMENU) {
-        POINT pt;
-        pt.x = (int)(short)LOWORD(lp);
-        pt.y = (int)(short)HIWORD(lp);
-        if (pt.x == -1 && pt.y == -1) {
-            RECT rc;
-            GetWindowRect(hwnd, &rc);
-            pt.x = rc.left + 8;
-            pt.y = rc.top + 8;
-        }
-        show_carrier_calib_menu(GetParent(hwnd), pt.x, pt.y);
-        return 0;
-    }
-
-    if (msg == WM_PAINT) {
-        PAINTSTRUCT ps;
-        HDC dc;
-        RECT rc, meter_r, readout_r;
-        HGDIOBJ of;
-        HPEN pen;
-        HGDIOBJ ob, op;
-        int is_active, active_segs, s9_seg, readout_w, pad, gap;
-        int innerW, segW, x, y, h, i;
-        float dbm, norm, s9_dbm;
-        char readout[16];
-
-        dc = BeginPaint(hwnd, &ps);
-        GetClientRect(hwnd, &rc);
-        FillRect(dc, &rc, g_hbrPanel);
-
-        is_active = g_monitor.enabled ? 1 : 0;
-        s9_dbm    = smeter_s9_dbm_for_current_tuner();
-        dbm       = is_active ? g_monitor.smeter_dbm_pub : -200.0f;  /* well below
-                                                                      * any S0, so
-                                                                      * this always
-                                                                      * reads empty */
-
-        norm = smeter_warp(dbm, s9_dbm);
-        active_segs = (int)(norm * SMETER_SEGS + 0.5f);
-
-        s9_seg = (int)(SMETER_S9_TARGET_FRAC * SMETER_SEGS + 0.5f);
-
-        readout_w = 56;
-        meter_r = rc;
-        meter_r.right -= readout_w;
-        readout_r = rc;
-        readout_r.left = meter_r.right + 4;
-
-        pad = 2;
-        gap = 1;
-        innerW = (meter_r.right - meter_r.left) - pad * 2;
-        segW = (innerW - gap * (SMETER_SEGS - 1)) / SMETER_SEGS;
-        if (segW < 1) segW = 1;
-        x = meter_r.left + pad;
-        y = meter_r.top + 2;
-        h = (meter_r.bottom - meter_r.top) - 4;
-        if (h < 2) h = 2;
-
-        for (i = 0; i < SMETER_SEGS; i++) {
-            RECT segr;
-            COLORREF c;
-            HBRUSH b;
-            segr.left = x;
-            segr.top = y;
-            segr.right = x + segW;
-            segr.bottom = y + h;
-            if (i < active_segs)
-                /* Dark, muted lit colours - deliberately not bright/neon,
-                 * so this reads as informative rather than distracting. */
-                c = (i >= s9_seg) ? RGB(215, 130, 40) : RGB(60, 165, 85);
-            else
-                c = RGB(30, 33, 40);   /* unlit segment */
-            b = CreateSolidBrush(c);
-            FillRect(dc, &segr, b);
-            DeleteObject(b);
-            x += segW + gap;
-        }
-
-        SetBkMode(dc, TRANSPARENT);
-        of = SelectObject(dc, g_hFontUI);
-        if (is_active)
-            snprintf(readout, sizeof(readout), "%ddBm", (int)(dbm + (dbm < 0 ? -0.5f : 0.5f)));
-        else
-            readout[0] = '\0';
-        SetTextColor(dc, COL_TEXT_DIM);
-        DrawTextA(dc, readout, -1, &readout_r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(dc, of);
-
-        pen = CreatePen(PS_SOLID, 1, COL_PANEL_EDGE);
-        op = SelectObject(dc, pen);
-        ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, meter_r.left, meter_r.top, meter_r.right, meter_r.bottom);
-        SelectObject(dc, ob);
-        SelectObject(dc, op);
-        DeleteObject(pen);
-
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-
-    return DefWindowProcA(hwnd, msg, wp, lp);
-}
-
-static HWND smeter_create(HWND parent, HINSTANCE hInst)
-{
-    static int class_registered = 0;
-    if (!class_registered) {
-        WNDCLASSA wc;
-        memset(&wc, 0, sizeof(wc));
-        wc.lpfnWndProc   = smeter_wndproc;
-        wc.hInstance     = hInst;
-        wc.lpszClassName = "DuoDXSMeter";
-        wc.hCursor       = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
-        RegisterClassA(&wc);
-        class_registered = 1;
-    }
-    return CreateWindowExA(0, "DuoDXSMeter", "",
-                WS_CHILD | WS_VISIBLE,
-                0, 0, 10, 10, parent, (HMENU)(INT_PTR)IDC_SMETER,
-                hInst, NULL);
-}
-
 
 /* Short text for the MODE: readout specifically (Section 10) - the full
  * MON_MODE_INFO name (e.g. "AM 6kHz") stays exactly as-is for the preset
@@ -14198,7 +14303,28 @@ static void paint_window(HWND hwnd)
         RECT p = { 12, panelTop, cr.right - 12, panelTop + 86 };
         draw_panel(dc, p);
 
-        draw_text(dc, 22, panelTop + 8, "SIGNAL", COL_TEXT_DIM, g_hFontUI);
+        /* Section 3.3 - click this label to toggle both meters between the
+         * wideband ADC/RF level they've always shown (dBFS) and each
+         * tuner's own narrowband signal strength at its actual tuned
+         * frequency (dBm) - only meaningful, and only offered, while
+         * Monitor is on, since that's what the narrowband reading is
+         * actually computed from (see narrowband_meter_feed()). The
+         * label itself doubles as the mode indicator, rather than a
+         * separate one. LEVEL/S-METER rather than the original SIGNAL/
+         * STRENGTH - those read as near-synonyms at a glance; S-METER
+         * also doubles as a hint at what that mode actually shows, since
+         * it's the same S-unit/S9 terminology already used elsewhere in
+         * the app (Section 13.6).                                        */
+        {
+            int nb_active = g_signal_meter_mode && g_monitor.enabled;
+            draw_text(dc, 22, panelTop + 8, nb_active ? "S-METER" : "LEVEL",
+                      COL_TEXT_DIM, g_hFontUI);
+            g_signalLabelRect.left   = 14;
+            g_signalLabelRect.top    = panelTop + 2;
+            g_signalLabelRect.right  = 14 + 90;
+            g_signalLabelRect.bottom = panelTop + 22;
+            g_signalLabelRectValid = 1;
+        }
 
         /* Single-tuner data always lands in the "A slot" (s.peak_a/
          * s.overload_a) regardless of which physical tuner it actually
@@ -14210,21 +14336,52 @@ static void paint_window(HWND hwnd)
          * shows a signal changing.                                      */
         int single_b_active = !g_state.cfg.dual_channel &&
                                !strcmp(g_state.cfg.rspduo_single_tuner, "B");
+        /* Falls back to dBFS automatically the instant Monitor turns off,
+         * rather than freezing on a stale narrowband reading nothing is
+         * updating any more - toggle_signal_meter_mode() (the click
+         * handler) already guards against entering this mode without
+         * Monitor on in the first place; this is the corresponding guard
+         * for leaving it, if Monitor gets switched off while it's active.*/
+        int nb_mode = g_signal_meter_mode && g_monitor.enabled;
 
         /* Channel 1 */
         draw_text(dc, 22, panelTop + 30, "1", COL_TEXT, g_hFontVal);
         RECT ma = { 44, panelTop + 30, cr.right - 120, panelTop + 48 };
-        draw_meter(dc, ma,
-                   (!single_b_active && (s.recording || s.listening)) ? s.peak_a : -90.0f,
-                   !single_b_active && s.overload_a, g_meter_style);
         {
+            int active_a = !single_b_active && (s.recording || s.listening);
             char db[24];
-            if (single_b_active)
-                snprintf(db, sizeof(db), "  (unused)");
-            else if (s.peak_a <= -90.0f || !(s.recording || s.listening))
-                snprintf(db, sizeof(db), "  --- dBFS");
-            else
-                snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_a);
+            if (nb_mode) {
+                /* Whichever tuner the live monitor is actually selected
+                 * on still reuses its already-published smeter_dbm_pub
+                 * directly, as a belt-and-suspenders guarantee of an
+                 * exact match against the established S-meter for
+                 * whichever tuner is directly comparable - though now
+                 * that narrowband_meter_feed() is a genuine second
+                 * instance of that same pipeline (NCO, decimation,
+                 * selectivity filter - not a separate reimplementation),
+                 * the two should converge to the same reading regardless.
+                 * The other tuner gets its own independent reading from
+                 * that second instance directly - no calibration offset
+                 * needed any more, since it's no longer approximating
+                 * anything.                                              */
+                float dbm_a = (g_monitor.tuner_sel == 0) ? g_monitor.smeter_dbm_pub
+                                                          : g_narrow_dbm_pub[0];
+                int silent_a = !active_a || dbm_a <= -190.0f;
+                draw_meter(dc, ma, dbm_a, METER_DBM_LO, METER_DBM_HI,
+                           smeter_s9_dbm_for_tuner(0),
+                           silent_a, !single_b_active && s.overload_a, 3);
+                if (single_b_active)      snprintf(db, sizeof(db), "  (unused)");
+                else if (silent_a)        snprintf(db, sizeof(db), "  --- dBm");
+                else                      snprintf(db, sizeof(db), "%+6.1f dBm", dbm_a);
+            } else {
+                draw_meter(dc, ma, active_a ? s.peak_a : -90.0f,
+                           -METER_RANGE_DB, 0.0f, 0.0f,
+                           !active_a || s.peak_a <= -90.0f,
+                           !single_b_active && s.overload_a, g_meter_style);
+                if (single_b_active)                        snprintf(db, sizeof(db), "  (unused)");
+                else if (s.peak_a <= -90.0f || !active_a)    snprintf(db, sizeof(db), "  --- dBFS");
+                else                                         snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_a);
+            }
             draw_text(dc, cr.right - 110, panelTop + 30, db,
                       (!single_b_active && s.overload_a) ? COL_SEG_RED : COL_TEXT, g_hFontVal);
         }
@@ -14233,31 +14390,69 @@ static void paint_window(HWND hwnd)
          * single-tuner mode has selected B (see single_b_active above).  */
         draw_text(dc, 22, panelTop + 56, "2", COL_TEXT, g_hFontVal);
         RECT mb = { 44, panelTop + 56, cr.right - 120, panelTop + 74 };
-        draw_meter(dc, mb,
-                   single_b_active ? ((s.recording || s.listening) ? s.peak_a : -90.0f)
-                                    : (((s.dual || s.master_slave) && (s.recording || s.listening)) ? s.peak_b : -90.0f),
-                   s.overload_b, g_meter_style);
         {
+            int active_b = single_b_active ? (s.recording || s.listening)
+                                            : ((s.dual || s.master_slave) && (s.recording || s.listening));
             char db[24];
-            if (single_b_active) {
-                if (s.peak_a <= -90.0f || !(s.recording || s.listening))
-                    snprintf(db, sizeof(db), "  --- dBFS");
+            if (nb_mode) {
+                /* single_b_active's own narrowband reading still lives in
+                 * slot 0 (g_narrow_dbm_pub[0]) - same "A slot" convention
+                 * as the wideband dBFS peak already uses, since it's the
+                 * same underlying single-tuner data either way. In that
+                 * case the live monitor pipeline processes this tuner's
+                 * stream unconditionally (stream_callback_single() feeds
+                 * it regardless of tuner_sel whenever master_slave_active
+                 * is false, which it always is for a genuine single-
+                 * tuner-B session), so smeter_dbm_pub is trustworthy here
+                 * regardless of which tuner the monitor selector happens
+                 * to show - same reasoning as row 1's own tuner_sel
+                 * check, just without needing the check itself.          */
+                float dbm_b;
+                if (single_b_active)
+                    dbm_b = g_monitor.smeter_dbm_pub;
+                else if (g_monitor.tuner_sel == 1)
+                    dbm_b = g_monitor.smeter_dbm_pub;
                 else
-                    snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_a);
-            } else if (!s.dual && !s.master_slave) {
-                /* Single-tuner mode, Tuner 1 currently selected - same
-                 * "(unused)" wording as channel A's own single_b_active
-                 * case above uses when B is selected instead, rather
-                 * than the "(single)" this used to say here specifically
-                 * - two different words for the same situation (this
-                 * row's tuner isn't the one currently selected) depending
-                 * on which physical tuner happened to be active read as
-                 * inconsistent switching between Tuner 1 and Tuner 2.    */
-                snprintf(db, sizeof(db), "  (unused)");
-            } else if (s.peak_b <= -90.0f || !(s.recording || s.listening)) {
-                snprintf(db, sizeof(db), "  --- dBFS");
+                    dbm_b = g_narrow_dbm_pub[1];
+                int silent_b = !active_b || dbm_b <= -190.0f;
+                draw_meter(dc, mb, dbm_b, METER_DBM_LO, METER_DBM_HI,
+                           single_b_active ? smeter_s9_dbm_for_tuner(0)
+                                            : smeter_s9_dbm_for_tuner(1),
+                           silent_b, s.overload_b, 3);
+                if (!single_b_active && !s.dual && !s.master_slave)
+                    snprintf(db, sizeof(db), "  (unused)");
+                else if (silent_b)
+                    snprintf(db, sizeof(db), "  --- dBm");
+                else
+                    snprintf(db, sizeof(db), "%+6.1f dBm", dbm_b);
             } else {
-                snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_b);
+                draw_meter(dc, mb,
+                           single_b_active ? (active_b ? s.peak_a : -90.0f)
+                                            : (active_b ? s.peak_b : -90.0f),
+                           -METER_RANGE_DB, 0.0f, 0.0f,
+                           single_b_active ? (!active_b || s.peak_a <= -90.0f)
+                                            : (!active_b || s.peak_b <= -90.0f),
+                           s.overload_b, g_meter_style);
+                if (single_b_active) {
+                    if (s.peak_a <= -90.0f || !active_b)
+                        snprintf(db, sizeof(db), "  --- dBFS");
+                    else
+                        snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_a);
+                } else if (!s.dual && !s.master_slave) {
+                    /* Single-tuner mode, Tuner 1 currently selected - same
+                     * "(unused)" wording as channel A's own single_b_active
+                     * case above uses when B is selected instead, rather
+                     * than the "(single)" this used to say here specifically
+                     * - two different words for the same situation (this
+                     * row's tuner isn't the one currently selected) depending
+                     * on which physical tuner happened to be active read as
+                     * inconsistent switching between Tuner 1 and Tuner 2.    */
+                    snprintf(db, sizeof(db), "  (unused)");
+                } else if (s.peak_b <= -90.0f || !active_b) {
+                    snprintf(db, sizeof(db), "  --- dBFS");
+                } else {
+                    snprintf(db, sizeof(db), "%+5.1f dBFS", s.peak_b);
+                }
             }
             draw_text(dc, cr.right - 110, panelTop + 56, db,
                       s.overload_b ? COL_SEG_RED : COL_TEXT,
@@ -14344,10 +14539,12 @@ static void paint_window(HWND hwnd)
         ix += draw_text_base(dc, ix, baseline, s.hdr_on ? "ON" : "OFF",
                              s.hdr_on ? on_col : off_col, g_hFontUI);
 
-        /* Duration indicator — shown while recording or finished.
-         * Reads the configured duration from g_state.cfg (safe since it
-         * is only written at config-load time, before recording starts). */
-        if (s.recording || s.finished) {
+        /* Duration indicator - permanently shown, matching AGC/HDR
+         * (previously only appeared once recording started or
+         * finished). Reads the configured duration from g_state.cfg
+         * (safe since it is only written at config-load time, before
+         * recording starts, and doesn't change mid-session).            */
+        {
             ix += 18;
             char dur_buf[32];
             int ds = g_state.cfg.duration_sec;
@@ -14549,7 +14746,6 @@ static void gui_refresh_monitor_bar_visibility(void)
     if (g_hMonMode)         ShowWindow(g_hMonMode,         cmd);
     if (g_hBwDigits)        ShowWindow(g_hBwDigits,        cmd);
     if (g_hMonKhzLbl)       ShowWindow(g_hMonKhzLbl,       cmd);
-    if (g_hSMeter)          ShowWindow(g_hSMeter,          cmd);
     if (g_hBtnNotchEnable)  ShowWindow(g_hBtnNotchEnable,  cmd);
     if (g_hNotchDigits)     ShowWindow(g_hNotchDigits,     cmd);
     if (g_hNotchKhzLbl)     ShowWindow(g_hNotchKhzLbl,     cmd);
@@ -14704,7 +14900,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             GetWindowTextA(di->hwndItem, txt, sizeof(txt));
             SetBkMode(di->hDC, TRANSPARENT);
             SetTextColor(di->hDC, dis ? COL_TEXT_DIM : COL_TEXT);
-            HGDIOBJ of = SelectObject(di->hDC, g_hFontUI);
+            HGDIOBJ of = SelectObject(di->hDC,
+                (di->CtlID == IDC_BTN_ANT && g_hFontAntBtn) ? g_hFontAntBtn : g_hFontUI);
             DrawTextA(di->hDC, txt, -1, &di->rcItem,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(di->hDC, of);
@@ -14731,6 +14928,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             POINT screen_pt = pt;
             ClientToScreen(hwnd, &screen_pt);
             show_carrier_calib_menu(hwnd, screen_pt.x, screen_pt.y);
+            return 0;
+        }
+        /* LEVEL/S-METER click (Section 3.3) - only actually toggles
+         * into narrowband mode while Monitor is on, since that's the
+         * only time narrowband_meter_feed() is running to produce a real
+         * reading; clicking it with Monitor off is a silent no-op rather
+         * than an error, since the label itself already reads "LEVEL"
+         * in that state as the visible cue nothing would change.         */
+        if (g_signalLabelRectValid && PtInRect(&g_signalLabelRect, pt)) {
+            if (g_monitor.enabled) {
+                g_signal_meter_mode = !g_signal_meter_mode;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             return 0;
         }
         break;
@@ -15704,11 +15914,22 @@ static void stop_slave_b_process(AppState *state)
  * complete" summary, rather than it always landing wherever the slave
  * happened to be stopped - which was during stream teardown, well before
  * either of those.                                                       */
-static void verify_slave_b_recording(AppState *state)
+/* do_verify=0 skips the verify-and-log step, keeping only the mapping
+ * reset - needed at the listen-only-to-recording handoff (see that call
+ * site's own comment): output_file_b is already pointing at the NEW
+ * recording's filename by that point, not empty as originally assumed
+ * there, and the verify-shmem struct can still be reporting ready/
+ * samples_written>0 left over from the listen-only phase. Together
+ * those meant the guard below incorrectly passed and tried to verify a
+ * file the new slave process hadn't been launched to create yet -
+ * confirmed from a real log: "could not open ... (error 2)" for the
+ * exact filename the new slave then successfully wrote to on the very
+ * next line. Every other call site still wants the genuine verify.      */
+static void verify_slave_b_recording_ex(AppState *state, int do_verify)
 {
     if (!g_verify_b_shmem_view)
         return;
-    if (g_verify_b_shmem_view->ready &&
+    if (do_verify && g_verify_b_shmem_view->ready &&
             g_verify_b_shmem_view->samples_written > 0 &&
             state->output_file_b[0]) {
         Config cfg_b = state->cfg;
@@ -15724,6 +15945,11 @@ static void verify_slave_b_recording(AppState *state)
         CloseHandle(g_verify_b_shmem);
         g_verify_b_shmem = NULL;
     }
+}
+
+static void verify_slave_b_recording(AppState *state)
+{
+    verify_slave_b_recording_ex(state, 1);
 }
 
 /* -------------------------------------------------------------------------
@@ -15853,6 +16079,14 @@ static DWORD WINAPI slave_b_monitor_reader_thread(LPVOID param)
 
             if (g_monitor.tuner_sel == 1)
                 monitor_feed(di, dq, nframes);
+
+            /* Section 3.3's signal-strength meter - unlike monitor_feed()
+             * above, not gated on tuner_sel: Tuner 2's raw data already
+             * arrives here continuously regardless of which tuner (if
+             * either) is selected for listening, exactly like the
+             * wideband peak tracking just above, so there's no reason
+             * this needs to wait for Tuner 2 to be selected either.      */
+            narrowband_meter_feed(1, di, dq, nframes);
         }
     }
 
@@ -16416,8 +16650,6 @@ static HWND   g_hSetPerseusWarnDev2 = NULL;
 static HWND   g_hSetLatitude     = NULL;
 static HWND   g_hSetLongitude    = NULL;
 static HWND   g_hSetShowSun      = NULL;
-static HWND   g_hSetGithubLink   = NULL;
-static HWND   g_hSetEmailLink    = NULL;
 static HWND   g_hSetShowOffset   = NULL;
 static HWND   g_hSetCarrierCalib = NULL;
 static HWND   g_hBtnAutoCal      = NULL;
@@ -18613,11 +18845,6 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         HDC dc = (HDC)wp;
         if ((HWND)lp == g_hSetHdrHint)
             SetTextColor(dc, g_settings_hdr_freq_valid ? COL_SEG_GREEN : COL_SEG_RED);
-        else if ((HWND)lp == g_hSetGithubLink || (HWND)lp == g_hSetEmailLink)
-            /* Reads as a clickable link rather than plain text - same
-             * cyan already used for "values" elsewhere in this dialog
-             * (COL_ACCENT), which also has the right connotation here. */
-            SetTextColor(dc, COL_ACCENT);
         else if ((HWND)lp == g_hSetDualT1Freq || (HWND)lp == g_hSetFreqB ||
                  (HWND)lp == g_hSetSchedFreq  || (HWND)lp == g_hSetSchedFreqB)
             /* CF fields (Receiver tab Tuner 1/2, and Scheduler's mirrored
@@ -18875,18 +19102,6 @@ static LRESULT CALLBACK settings_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 SendMessageA(g_hSetBiasT, BM_SETCHECK, BST_UNCHECKED, 0);
                 return 0;
             }
-            return 0;
-        case IDC_SET_GITHUB_LINK:
-            if (HIWORD(wp) == STN_CLICKED)
-                ShellExecuteA(g_hSettingsWnd, "open",
-                              "https://github.com/45south/DuoDX-recorder/releases",
-                              NULL, NULL, SW_SHOWNORMAL);
-            return 0;
-        case IDC_SET_EMAIL_LINK:
-            if (HIWORD(wp) == STN_CLICKED)
-                ShellExecuteA(g_hSettingsWnd, "open",
-                              "mailto:daveheadland@outlook.com",
-                              NULL, NULL, SW_SHOWNORMAL);
             return 0;
         case IDC_SET_HDR:
             if (HIWORD(wp) == BN_CLICKED) {
@@ -20268,30 +20483,6 @@ static void open_settings_dialog(HWND parent)
                                        "Show Sunrise/Sunset on main window", x, y0, 300);
     y0 += row;
 
-    /* Extra gap before the two links below, so they read as a separate
-     * footer rather than just another row of settings.                   */
-    y0 += row;
-
-    g_hSetGithubLink = settings_mk_label(g_hSettingsWnd, hInst,
-        "Check for updates: https://github.com/45south/DuoDX-recorder/releases",
-        x, y0, win_w - x - 16);
-    {
-        LONG_PTR gwl = GetWindowLongPtrA(g_hSetGithubLink, GWL_STYLE);
-        SetWindowLongPtrA(g_hSetGithubLink, GWL_STYLE, gwl | SS_NOTIFY);
-        SetWindowLongPtrA(g_hSetGithubLink, GWLP_ID, IDC_SET_GITHUB_LINK);
-    }
-    y0 += row;
-
-    g_hSetEmailLink = settings_mk_label(g_hSettingsWnd, hInst,
-        "Bug reports and comments: daveheadland@outlook.com",
-        x, y0, win_w - x - 16);
-    {
-        LONG_PTR gwl = GetWindowLongPtrA(g_hSetEmailLink, GWL_STYLE);
-        SetWindowLongPtrA(g_hSetEmailLink, GWL_STYLE, gwl | SS_NOTIFY);
-        SetWindowLongPtrA(g_hSetEmailLink, GWLP_ID, IDC_SET_EMAIL_LINK);
-    }
-    y0 += row;
-
     y_misc = y0;
 
     g_settings_build_tab = 0; /* restore harmless default; no more controls created below */
@@ -20576,7 +20767,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
     g_hFontUI  = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-    g_hFontTiny = CreateFontA(-11, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+    g_hFontTiny = CreateFontA(-10, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_hFontAntBtn = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
     g_hFontVal = CreateFontA(-15, 0, 0, 0, FW_BOLD, 0, 0, 0,
@@ -20718,6 +20912,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow)
 
     if (g_hFontUI)  DeleteObject(g_hFontUI);
     if (g_hFontTiny) DeleteObject(g_hFontTiny);
+    if (g_hFontAntBtn) DeleteObject(g_hFontAntBtn);
     if (g_hFontVal) DeleteObject(g_hFontVal);
     if (g_hFontBig) DeleteObject(g_hFontBig);
     if (g_hFontLog) DeleteObject(g_hFontLog);
