@@ -54,7 +54,7 @@
  * Constants and configuration defaults
  * ========================================================================= */
 
-#define VERSION                 "3.1.1"
+#define VERSION                 "3.1.2"
 #define SPINUP_BYTES_FIXED      (1024 * 1024)  /* 1 MB - see the spinup_bytes
                                    field comment for why this doesn't need
                                    to be user-configurable.                */
@@ -247,6 +247,20 @@ typedef struct {
                                     * against a known signal source (or
                                     * another calibrated tool, e.g. SDRuno's
                                     * own dBm readout) to be meaningful.     */
+    char     monitor_audio_device[64]; /* Live Monitor's audio OUTPUT
+                                    * device (speakers, headphones, a
+                                    * virtual cable, etc.) by name, not
+                                    * index - waveOut device indices
+                                    * aren't stable across reboots or
+                                    * devices being plugged/unplugged, so
+                                    * this is resolved back to whichever
+                                    * index currently matches at the
+                                    * moment the device is actually
+                                    * opened (monitor_audio_resolve_
+                                    * device()). Empty = system default
+                                    * (WAVE_MAPPER), same "blank means
+                                    * default" convention as device_serial
+                                    * above.                                */
     double   freq_b_hz;         /* RSPduo tuner B frequency (dual mode) */
     int      ring_buffer_sec;   /* Override ring buffer duration */
     int      monitor_interval_ms; /* Status bar update interval (ms) */
@@ -786,6 +800,7 @@ static HANDLE g_http_delayed_stop_handle = NULL; /* non-NULL while a previous
 #define IDC_SET_MON_INTERVAL  1138
 #define IDC_SET_SMETER_MODE   1139
 #define IDC_SET_SMETER_CAL    1140
+#define IDC_SET_AUDIO_DEVICE  1218
 #define IDC_SET_USE_UTC       1139
 #define IDC_SET_SHOW_CLOCK    1140
 #define IDC_SET_METER_STYLE   1141
@@ -4697,6 +4712,7 @@ static void config_set_defaults(Config *cfg)
     cfg->hdr_bw_khz     = 1700;
     cfg->ppm            = 0.0;
     cfg->device_serial[0] = '\0'; /* empty = use first device found */
+    cfg->monitor_audio_device[0] = '\0'; /* empty = system default output */
     cfg->decimation     = 1;      /* no additional decimation */
 
     cfg->expected_output_rate_hz = 0.0; /* set by validate_config */
@@ -4909,6 +4925,8 @@ static void config_load_ini(Config *cfg, const char *path)
         else if (!strcmp(key, "hdr_bw_khz"))    cfg->hdr_bw_khz     = atoi(val);
         else if (!strcmp(key, "ppm"))           cfg->ppm            = atof(val);
         else if (!strcmp(key, "device_serial")) strncpy(cfg->device_serial, val, 63);
+        else if (!strcmp(key, "monitor_audio_device"))
+            strncpy(cfg->monitor_audio_device, val, sizeof(cfg->monitor_audio_device) - 1);
         else if (!strcmp(key, "decimation"))    cfg->decimation     = atoi(val);
         else if (!strcmp(key, "output_format")) {
             if (!strcmp(val, "wavviewdx") || !strcmp(val, "WavViewDX"))
@@ -10537,6 +10555,8 @@ typedef struct {
     double        work_rate_hz;
     double        last_native, last_freq, last_center;
     float         smeter_peak_accum;
+    float         smeter_avg_pow;
+    int           smeter_avg_primed;
     DWORD         smeter_publish_tick;
 } NarrowMeterState;
 
@@ -10622,8 +10642,32 @@ static void narrowband_meter_feed(int t, const int16_t *xi, const int16_t *xq, u
         sel = mon_sel_filter_process(&ns->sel, d2out);
 
         {
-            float smag = sqrtf(sel.re * sel.re + sel.im * sel.im);
+            /* Peak AND averaged tracking, exactly matching the
+             * established S-meter's own two accumulators (Section 13.6)
+             * - confirmed via a real ini file comparison as the actual
+             * cause of the reported ~20 dB gap: this function only ever
+             * tracked peak, completely ignoring monitor_smeter_mode,
+             * while the established pipeline the selected tuner borrows
+             * from respects it. With monitor_smeter_mode=1 (Averaged)
+             * configured, the selected tuner's reading came from the
+             * averaged accumulator (typically well below peak for a
+             * modulated signal), while the non-selected tuner's reading
+             * - always this function's own peak-only figure - read
+             * meaningfully higher, and which tuner had which readout
+             * flipped with selection, matching the report exactly. Both
+             * accumulators are kept current regardless of the setting,
+             * same as the established pipeline, so switching the mode
+             * never needs a reset - it just starts reading from the
+             * other one.                                                 */
+            float smag2 = sel.re * sel.re + sel.im * sel.im;
+            float smag = sqrtf(smag2);
             if (smag > ns->smeter_peak_accum) ns->smeter_peak_accum = smag;
+            if (!ns->smeter_avg_primed) {
+                ns->smeter_avg_pow = smag2;
+                ns->smeter_avg_primed = 1;
+            } else {
+                ns->smeter_avg_pow += 0.001f * (smag2 - ns->smeter_avg_pow);
+            }
         }
     }
 
@@ -10632,12 +10676,16 @@ static void narrowband_meter_feed(int t, const int16_t *xi, const int16_t *xq, u
         if (now_tick - ns->smeter_publish_tick >= 150) {
             /* Identical dBFS-to-dBm conversion to the established
              * S-meter (Section 13.6) - same gain source, same shared
-             * calibration offset. No self-calibration/masking needed
-             * any more: this is now a genuine, independently-correct
+             * calibration offset, same monitor_smeter_mode Peak/
+             * Averaged choice. No self-calibration/masking needed any
+             * more: this is now a genuine, independently-correct
              * measurement, not an approximation being nudged toward a
              * borrowed reference.                                       */
-            float dbfs = (ns->smeter_peak_accum > 1.0f)
-                       ? 20.0f * log10f(ns->smeter_peak_accum / 32767.0f)
+            float use_mag = g_state.cfg.monitor_smeter_mode
+                           ? sqrtf(ns->smeter_avg_pow)
+                           : ns->smeter_peak_accum;
+            float dbfs = (use_mag > 1.0f)
+                       ? 20.0f * log10f(use_mag / 32767.0f)
                        : -120.0f;
             double gain = (t == 1) ? g_curr_gain_b : g_curr_gain_a;
             float dbm = dbfs - (float)gain + (float)g_state.cfg.monitor_smeter_cal_offset;
@@ -10882,6 +10930,62 @@ static void monitor_update_params(void)
 }
 
 /* -------------------------------------------------------------------------
+ * Audio output device enumeration and selection (Settings > Monitor).
+ * waveOut device IDs are only ever "whatever index Windows currently
+ * assigns," not a persistent identity - they can and do shift across
+ * reboots or when USB audio devices are plugged/unplugged, so the
+ * chosen device is stored by name in duodx.ini and re-resolved to
+ * whatever index currently matches it each time the device is opened,
+ * rather than storing the index directly.
+ *
+ * waveOutGetDevCapsA's szPname field is a fixed 32-byte buffer
+ * (MAXPNAMELEN) - a real limitation of this older API, not something
+ * fixable without moving to the considerably larger WASAPI/
+ * MMDeviceEnumerator COM interface. In practice most device names fit,
+ * but a long virtual-cable or USB interface name could still get
+ * truncated; two devices that happen to share the same truncated first
+ * 31 characters would be indistinguishable here (an edge case rather
+ * than the common case).                                                */
+static int monitor_audio_device_count(void)
+{
+    return (int)waveOutGetNumDevs();
+}
+
+static void monitor_audio_device_name(int idx, char *buf, size_t bufsize)
+{
+    WAVEOUTCAPSA caps;
+    if (waveOutGetDevCapsA((UINT)idx, &caps, sizeof(caps)) != MMSYSERR_NOERROR) {
+        buf[0] = '\0';
+        return;
+    }
+    strncpy(buf, caps.szPname, bufsize - 1);
+    buf[bufsize - 1] = '\0';
+}
+
+/* Resolves the configured device name (Config.monitor_audio_device) back
+ * to a live waveOut device ID - WAVE_MAPPER (system default) if nothing
+ * is configured, or if the configured device can no longer be found
+ * (e.g. a USB headset that was unplugged since it was last selected) -
+ * falling back safely rather than failing to open audio at all.         */
+static UINT monitor_audio_resolve_device(void)
+{
+    int i, n;
+    if (g_state.cfg.monitor_audio_device[0] == '\0')
+        return WAVE_MAPPER;
+    n = monitor_audio_device_count();
+    for (i = 0; i < n; i++) {
+        char name[MAXPNAMELEN];
+        monitor_audio_device_name(i, name, sizeof(name));
+        if (name[0] && !strcmp(name, g_state.cfg.monitor_audio_device))
+            return (UINT)i;
+    }
+    LOG_WARN("Monitor: configured audio output device '%s' not found - "
+             "using the system default instead.",
+             g_state.cfg.monitor_audio_device);
+    return WAVE_MAPPER;
+}
+
+/* -------------------------------------------------------------------------
  * Audio output - waveOut, double/triple buffered, filled sample-by-sample
  * by the resampler below.
  * ------------------------------------------------------------------------- */
@@ -10903,7 +11007,7 @@ static void monitor_audio_open(void)
     if (!g_monitor.audio_done_event)
         g_monitor.audio_done_event = CreateEventA(NULL, FALSE, FALSE, NULL);
 
-    if (waveOutOpen(&g_monitor.hwo, WAVE_MAPPER, &wfx,
+    if (waveOutOpen(&g_monitor.hwo, monitor_audio_resolve_device(), &wfx,
                      (DWORD_PTR)g_monitor.audio_done_event, 0,
                      CALLBACK_EVENT) != MMSYSERR_NOERROR) {
         LOG_WARN("Monitor: could not open an audio output device.");
@@ -16714,6 +16818,7 @@ static HWND   g_hSetRingSec   = NULL;
 static HWND   g_hSetSpinupEn  = NULL;
 static HWND   g_hSetMonInterval = NULL;
 static HWND   g_hSetSMeterMode  = NULL;
+static HWND   g_hSetAudioDevice = NULL;
 static HWND   g_hSetSMeterCal   = NULL;
 static HWND   g_hSetUseUtc    = NULL;
 static HWND   g_hSetShowClock = NULL;
@@ -17883,6 +17988,21 @@ static void settings_load_controls(void)
                  (WPARAM)(g_settings_cfg.monitor_smeter_mode ? 1 : 0), 0);
     snprintf(buf, sizeof(buf), "%.6g", g_settings_cfg.monitor_smeter_cal_offset);
     SetWindowTextA(g_hSetSMeterCal, buf);
+    {
+        /* "System Default" (index 0) whenever nothing is configured, or
+         * whenever the configured device can no longer be found in this
+         * fresh enumeration (same fallback monitor_audio_resolve_
+         * device() uses at actual open time) - never leaves the combo on
+         * a blank/unmatched selection.                                  */
+        int idx = 0;
+        if (g_settings_cfg.monitor_audio_device[0]) {
+            LRESULT found = SendMessageA(g_hSetAudioDevice, CB_FINDSTRINGEXACT,
+                                          (WPARAM)-1,
+                                          (LPARAM)g_settings_cfg.monitor_audio_device);
+            if (found != CB_ERR) idx = (int)found;
+        }
+        SendMessageA(g_hSetAudioDevice, CB_SETCURSEL, (WPARAM)idx, 0);
+    }
     SendMessageA(g_hSetUseUtc, BM_SETCHECK,
                  g_settings_cfg.use_utc ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(g_hSetShowClock, BM_SETCHECK,
@@ -18295,6 +18415,21 @@ static void settings_save(void)
     entries[n].key = "monitor_smeter_cal_offset";
     snprintf(entries[n].value, sizeof(entries[n].value), "%.6g", atof(buf));
     n++;
+
+    {
+        /* Index 0 is always "System Default" - written as an empty
+         * string (monitor_audio_resolve_device()'s WAVE_MAPPER case),
+         * not the literal text "System Default", so it isn't ever
+         * mistaken for an actual device name that happens to be called
+         * that.                                                         */
+        LRESULT asel = SendMessageA(g_hSetAudioDevice, CB_GETCURSEL, 0, 0);
+        entries[n].key = "monitor_audio_device";
+        if (asel > 0)
+            GetWindowTextA(g_hSetAudioDevice, entries[n].value, sizeof(entries[n].value));
+        else
+            entries[n].value[0] = '\0';
+        n++;
+    }
 
     entries[n].key = "use_utc";
     snprintf(entries[n].value, sizeof(entries[n].value), "%d",
@@ -20267,6 +20402,33 @@ static void open_settings_dialog(HWND parent)
     if (g_hFontUI) SendMessageA(g_hSetMonInterval, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
     settings_apply_dark_theme(g_hSetMonInterval);
     settings_tag_tab(g_hSetMonInterval);
+    y0 += row;
+
+    /* Whatever the OS currently reports via waveOutGetDevCapsA() -
+     * speakers, headphones, a virtual cable, anything else installed -
+     * enumerated fresh each time this dialog opens rather than cached,
+     * so a device plugged in since the last time Settings was open
+     * shows up without restarting the app. "System Default" (index 0
+     * here) maps to an empty monitor_audio_device string, i.e.
+     * WAVE_MAPPER - see monitor_audio_resolve_device()'s own comment.   */
+    settings_mk_label(g_hSettingsWnd, hInst, "Audio Output Device", x, y0, label_w);
+    g_hSetAudioDevice = CreateWindowExA(0, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
+                ctl_x, y0 - 2, win_w - ctl_x - 16, 22 + 200,
+                g_hSettingsWnd, (HMENU)(INT_PTR)IDC_SET_AUDIO_DEVICE, hInst, NULL);
+    SendMessageA(g_hSetAudioDevice, CB_ADDSTRING, 0, (LPARAM)"System Default");
+    {
+        int i, n = monitor_audio_device_count();
+        for (i = 0; i < n; i++) {
+            char name[MAXPNAMELEN];
+            monitor_audio_device_name(i, name, sizeof(name));
+            if (name[0])
+                SendMessageA(g_hSetAudioDevice, CB_ADDSTRING, 0, (LPARAM)name);
+        }
+    }
+    if (g_hFontUI) SendMessageA(g_hSetAudioDevice, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+    settings_apply_dark_theme(g_hSetAudioDevice);
+    settings_tag_tab(g_hSetAudioDevice);
     y0 += row;
 
     y_mon = y0;
